@@ -1,0 +1,7 @@
+numpy
+scipy
+scikit-image
+matplotlib
+networkx
+scikit-learn
+colorcet
