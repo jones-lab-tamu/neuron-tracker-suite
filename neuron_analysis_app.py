@@ -939,10 +939,11 @@ class GroupScatterViewer:
     def __init__(self, fig, ax, roi_data, relative_phases, period_hours):
         self.fig = fig
         self.ax = ax
+        self.period_hours = period_hours
         ax.set_title("Group Phase Distribution")
 
         if len(roi_data) > 0:
-            ax.scatter(
+            self.scatter = ax.scatter(
                 roi_data[:, 0],
                 roi_data[:, 1],
                 c=relative_phases,
@@ -950,10 +951,31 @@ class GroupScatterViewer:
                 s=10,
                 alpha=0.8,
             )
+            
+            cbar = fig.colorbar(self.scatter, ax=ax)
+            cbar.set_label("Mean Relative Peak Time (hours)")
+
+            ax_slider = fig.add_axes([0.25, 0.02, 0.65, 0.03])
+            max_range = self.period_hours / 2.0
+            self.range_slider = Slider(
+                ax=ax_slider,
+                label="Phase Range (+/- hrs)",
+                valmin=1.0,
+                valmax=max_range,
+                valinit=max_range,
+            )
+            self.range_slider.on_changed(self.update_clim)
+            self.update_clim(max_range)
+
         ax.set_aspect("equal", adjustable="box")
         ax.invert_yaxis()
         ax.set_xticks([])
         ax.set_yticks([])
+
+    def update_clim(self, val):
+        if hasattr(self, "scatter"):
+            self.scatter.set_clim(-val, val)
+            self.fig.canvas.draw_idle()
 
 
 class GroupAverageMapViewer:
@@ -984,9 +1006,9 @@ class GroupAverageMapViewer:
                 if np.any(mask):
                     phases_bin = relative_phases[mask]
                     shifted = phases_bin + (period_hours / 2.0)
-                    rad = (shifted / period_hours) * (2 * pi)
+                    rad = (shifted / period_hours) * (2 * np.pi)
                     mean_rad = circmean(rad)
-                    mean_shifted = (mean_rad / (2 * pi)) * period_hours
+                    mean_shifted = (mean_rad / (2 * np.pi)) * period_hours
                     binned[j, i] = mean_shifted - (period_hours / 2.0)
 
         if do_smooth:
@@ -995,9 +1017,9 @@ class GroupAverageMapViewer:
                 if valid.size == 0:
                     return np.nan
                 shifted = valid + (period_hours / 2.0)
-                rad = (shifted / period_hours) * (2 * pi)
+                rad = (shifted / period_hours) * (2 * np.pi)
                 mean_rad = circmean(rad)
-                mean_shifted = (mean_rad / (2 * pi)) * period_hours
+                mean_shifted = (mean_rad / (2 * np.pi)) * period_hours
                 return mean_shifted - (period_hours / 2.0)
 
             padded = np.pad(
@@ -1016,7 +1038,7 @@ class GroupAverageMapViewer:
             smoothed = smoothed[1:-1, 1:-1]
             binned[np.isnan(binned)] = smoothed[np.isnan(binned)]
 
-        im = ax.imshow(
+        self.im = ax.imshow(
             binned,
             origin="lower",
             extent=[x_min, x_max, y_min, y_max],
@@ -1027,9 +1049,25 @@ class GroupAverageMapViewer:
         ax.set_xticks([])
         ax.set_yticks([])
 
-        cbar = fig.colorbar(im, ax=ax)
+        cbar = fig.colorbar(self.im, ax=ax)
         cbar.set_label("Mean Relative Peak Time (hours)")
-        im.set_clim(-period_hours / 2.0, period_hours / 2.0)
+        
+        ax_slider = fig.add_axes([0.25, 0.02, 0.65, 0.03])
+        max_range = self.period_hours / 2.0
+        self.range_slider = Slider(
+            ax=ax_slider,
+            label="Phase Range (+/- hrs)",
+            valmin=1.0,
+            valmax=max_range,
+            valinit=max_range,
+        )
+        self.range_slider.on_changed(self.update_clim)
+        self.update_clim(max_range)
+
+    def update_clim(self, val):
+        if hasattr(self, "im"):
+            self.im.set_clim(-val, val)
+            self.fig.canvas.draw_idle()
 
 
 class InterpolatedMapViewer:
