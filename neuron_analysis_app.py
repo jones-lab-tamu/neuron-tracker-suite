@@ -1492,7 +1492,8 @@ class MainWindow(QtWidgets.QMainWindow):
         add_mode("single", "Single Animal", True)
         add_mode("register", "Atlas Registration", False)
         add_mode("apply_warp", "Apply Warp to Data", False)
-        add_mode("group_view", "Group Data Viewer", False)
+        # This is the change: The group viewer is now enabled by default.
+        add_mode("group_view", "Group Data Viewer", True)
 
         self.mode_buttons["single"].setChecked(True)
         self.ctrl_layout.addWidget(box)
