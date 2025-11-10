@@ -1739,19 +1739,27 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addStretch(1)
 
     def _build_vis_tabs(self):
+        # Single-animal tabs
         self.heatmap_tab = QtWidgets.QWidget()
         self.com_tab = QtWidgets.QWidget()
         self.traj_tab = QtWidgets.QWidget()
         self.phase_tab = QtWidgets.QWidget()
         self.interp_tab = QtWidgets.QWidget()
+        # Group-specific tabs
+        self.group_scatter_tab = QtWidgets.QWidget()
+        self.group_avg_tab = QtWidgets.QWidget()
 
-        for tab, name in [
+        tabs_to_add = [
             (self.heatmap_tab, "Heatmap"),
             (self.com_tab, "Center of Mass"),
             (self.traj_tab, "Trajectory Inspector"),
             (self.phase_tab, "Phase Map"),
             (self.interp_tab, "Interpolated Map"),
-        ]:
+            (self.group_scatter_tab, "Group Scatter"),
+            (self.group_avg_tab, "Group Average Map"),
+        ]
+
+        for tab, name in tabs_to_add:
             self.vis_tabs.addTab(tab, name)
             layout = QtWidgets.QVBoxLayout(tab)
             label = QtWidgets.QLabel(
@@ -1760,7 +1768,7 @@ class MainWindow(QtWidgets.QMainWindow):
             label.setAlignment(QtCore.Qt.AlignCenter)
             layout.addWidget(label)
 
-        # Initially disabled; enabled when data available
+        # Initially disable all tabs
         for i in range(self.vis_tabs.count()):
             self.vis_tabs.setTabEnabled(i, False)
 
@@ -2177,9 +2185,17 @@ class MainWindow(QtWidgets.QMainWindow):
         bg = self.unfiltered_data["background"]
         self.vmin, self.vmax = float(bg.min()), float(bg.max())
 
-        # Enable all tabs for single-animal view
-        for i in range(self.vis_tabs.count()):
-            self.vis_tabs.setTabEnabled(i, True)
+        # Enable single-animal tabs and disable group tabs
+        single_animal_tabs = [
+            self.heatmap_tab, self.com_tab, self.traj_tab,
+            self.phase_tab, self.interp_tab
+        ]
+        group_tabs = [self.group_scatter_tab, self.group_avg_tab]
+        
+        for tab in single_animal_tabs:
+            self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), True)
+        for tab in group_tabs:
+            self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), False)
 
         # Heatmap tab
         fig_h, _ = add_mpl_to_tab(self.heatmap_tab)
@@ -2528,6 +2544,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         all_rois = []
         all_rel = []
+        
+        # Define tab sets for visibility control
+        single_animal_tabs = [
+            self.heatmap_tab, self.com_tab, self.traj_tab,
+            self.phase_tab, self.interp_tab
+        ]
+        group_tabs = [self.group_scatter_tab, self.group_avg_tab]
 
         try:
             # Common phase params
@@ -2542,56 +2565,38 @@ class MainWindow(QtWidgets.QMainWindow):
             if "minutes_per_frame" not in phase_args:
                 raise ValueError("Minutes per Frame must be set.")
 
+            # This loop remains the same as the previous fix
             for i, roi_file in enumerate(files):
                 self.log_message(
                     f"  [{i + 1}/{count}] {os.path.basename(roi_file)}"
                 )
-                
-                # Construct paths to all necessary files
                 traces_file = roi_file.replace("_roi_warped.csv", "_traces.csv")
                 unfiltered_roi_file = roi_file.replace("_roi_warped.csv", "_roi.csv")
                 filtered_roi_file = roi_file.replace("_roi_warped.csv", "_roi_filtered.csv")
-
-                # Check for file existence
                 required_files = [traces_file, unfiltered_roi_file, filtered_roi_file]
                 if not all(os.path.exists(f) for f in required_files):
-                    self.log_message(
-                        "    Warning: missing one or more required files "
-                        "(_traces.csv, _roi.csv, _roi_filtered.csv); skipping."
-                    )
+                    self.log_message("    Warning: missing required files; skipping.")
                     continue
-
-                # Load data
                 warped_rois = np.loadtxt(roi_file, delimiter=",")
                 traces = np.loadtxt(traces_file, delimiter=",")
                 unfiltered_rois = np.loadtxt(unfiltered_roi_file, delimiter=",")
                 filtered_rois = np.loadtxt(filtered_roi_file, delimiter=",")
-
-                # Find the indices of the filtered ROIs within the original, unfiltered list
                 indices = []
                 for point in filtered_rois:
-                    # Find the row index in unfiltered_rois that exactly matches the point
                     diff = np.sum((unfiltered_rois - point)**2, axis=1)
                     idx = np.argmin(diff)
-                    if diff[idx] < 1e-9: # Check for a near-perfect match
+                    if diff[idx] < 1e-9:
                         indices.append(idx)
-                
                 if len(indices) != len(filtered_rois):
-                    self.log_message("    Warning: Could not reliably match filtered to unfiltered ROIs; skipping.")
+                    self.log_message("    Warning: Could not match filtered to unfiltered ROIs; skipping.")
                     continue
-
-                # Select the correct traces using the found indices
-                # The +1 accounts for the time column (column 0) in the traces file
                 trace_indices_to_keep = np.array(indices) + 1
                 filtered_traces_data = traces[:, np.concatenate(([0], trace_indices_to_keep))]
-
-                # Calculate phases on the correctly filtered data
                 phases, period, _ = calculate_phases_fft(filtered_traces_data, **phase_args)
                 phases_rad = (phases % period) * (2 * np.pi / period)
                 mean_rad = circmean(phases_rad)
                 mean_h = mean_rad * (period / (2 * np.pi))
                 rel = (phases - mean_h + period / 2) % period - period / 2
-
                 all_rois.append(warped_rois)
                 all_rel.append(rel)
 
@@ -2600,48 +2605,31 @@ class MainWindow(QtWidgets.QMainWindow):
 
             pooled_rois = np.vstack(all_rois)
             pooled_rel = np.concatenate(all_rel)
-
-            # Check for final consistency before plotting
             if len(pooled_rois) != len(pooled_rel):
-                raise RuntimeError(
-                    f"Final data inconsistency: {len(pooled_rois)} ROIs "
-                    f"but {len(pooled_rel)} phase values."
-                )
+                raise RuntimeError(f"Final data inconsistency: {len(pooled_rois)} ROIs, {len(pooled_rel)} phases.")
 
             grid_res = int(self.group_grid_res_edit.text())
             do_smooth = self.group_smooth_check.isChecked()
 
-            # Reuse first two tabs: scatter & average
-            fig_s, _ = add_mpl_to_tab(self.heatmap_tab)
+            # Plot to the new, dedicated tabs
+            fig_s, _ = add_mpl_to_tab(self.group_scatter_tab)
             self.visualization_widgets["group_scatter"] = GroupScatterViewer(
-                fig_s,
-                fig_s.add_subplot(111),
-                pooled_rois,
-                pooled_rel,
-                period,
+                fig_s, fig_s.add_subplot(111), pooled_rois, pooled_rel, period
             )
 
-            fig_g, _ = add_mpl_to_tab(self.com_tab)
+            fig_g, _ = add_mpl_to_tab(self.group_avg_tab)
             self.visualization_widgets["group_average"] = GroupAverageMapViewer(
-                fig_g,
-                fig_g.add_subplot(111),
-                pooled_rois,
-                pooled_rel,
-                period,
-                grid_res,
-                do_smooth,
+                fig_g, fig_g.add_subplot(111), pooled_rois, pooled_rel, period, grid_res, do_smooth
             )
 
-            # Disable other single-animal tabs for clarity if desired
-            self.vis_tabs.setTabEnabled(
-                self.vis_tabs.indexOf(self.traj_tab), False
-            )
-            self.vis_tabs.setTabEnabled(
-                self.vis_tabs.indexOf(self.phase_tab), False
-            )
-            self.vis_tabs.setTabEnabled(
-                self.vis_tabs.indexOf(self.interp_tab), False
-            )
+            # Enable group tabs and disable single-animal tabs
+            for tab in group_tabs:
+                self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), True)
+            for tab in single_animal_tabs:
+                self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), False)
+            
+            # Switch view to the first group tab
+            self.vis_tabs.setCurrentWidget(self.group_scatter_tab)
 
             self._mark_step_ready("group_view")
             self.log_message("Group visualizations generated.")
@@ -2650,6 +2638,9 @@ class MainWindow(QtWidgets.QMainWindow):
             import traceback
             self.log_message(f"Error generating group visualizations: {e}")
             self.log_message(traceback.format_exc())
+            # Ensure group tabs are disabled on failure
+            for tab in group_tabs:
+                self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), False)
 
     # --------------------------------------------------------
 
