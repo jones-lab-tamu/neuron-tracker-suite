@@ -1802,14 +1802,67 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log_text.verticalScrollBar().maximum()
         )
 
+    def _reset_state(self):
+        """Clears all data and resets the UI to its initial state."""
+        self.log_message("Resetting workspace for new analysis...")
+
+        # Clear all in-memory data structures
+        self.unfiltered_data.clear()
+        self.loaded_data.clear()
+        self.filtered_indices = None
+        self.rois = None
+        self.vmin = None
+        self.vmax = None
+        self.visualization_widgets.clear()
+
+        # Reset visualization tabs to their placeholder state
+        for i in range(self.vis_tabs.count()):
+            tab = self.vis_tabs.widget(i)
+            layout = tab.layout()
+            
+            # If a layout already exists, clear it. Otherwise, create one.
+            if layout is not None:
+                clear_layout(layout)
+            else:
+                layout = QtWidgets.QVBoxLayout(tab)
+
+            label = QtWidgets.QLabel(
+                f"{self.vis_tabs.tabText(i)} will appear here after analysis."
+            )
+            label.setAlignment(QtCore.Qt.AlignCenter)
+            layout.addWidget(label)
+            self.vis_tabs.setTabEnabled(i, False)
+
+        # Disable buttons that depend on loaded data
+        self.btn_define_roi.setEnabled(False)
+        self.btn_clear_roi.setEnabled(False)
+        self.btn_regen_phase.setEnabled(False)
+        self.btn_export_plot.setEnabled(False)
+        self.btn_run_analysis.setEnabled(False)
+        self.btn_load_results.setEnabled(False)
+
+        # Clear status labels
+        self.status_traces_label.setText("Traces: —")
+        self.status_roi_label.setText("ROI: —")
+        self.status_traj_label.setText("Trajectories: —")
+        
+        self.progress_bar.setValue(0)
+
     # ------------ Single-animal flow ------------
 
     def load_movie(self):
+        # First, reset the entire application state
+        self._reset_state()
+
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select Movie", "", "TIFF files (*.tif *.tiff);;All files (*.*)"
         )
         if not path:
+            # If user cancels, clear the file paths as well
+            self.input_file_edit.clear()
+            self.output_base_edit.clear()
             return
+            
         self.input_file_edit.setText(path)
         base, _ = os.path.splitext(path)
         self.output_base_edit.setText(base)
