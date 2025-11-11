@@ -20,10 +20,9 @@ This project requires Python 3. The necessary external libraries can be installe
 1.  Open a terminal or command prompt.
 2.  Navigate to the directory containing the project files.
 3.  Run the following command:
-    ```    pip install -r requirements.txt
+    ```    
+	pip install -r requirements.txt
     ```
-    *Note: The Cosinor analysis feature depends on `scipy`, which is included in the requirements file.*
-
 ---
 
 ## Core Workflows
