@@ -1242,14 +1242,18 @@ class InterpolatedMapViewer:
 def calculate_phases_fft(traces_data, minutes_per_frame,
                          period_min=None, period_max=None):
     intensities = traces_data[:, 1:]
-    if intensities.shape[1] == 0:
+    if intensities.shape[1] < 2: # Need at least 2 time points
         return np.array([]), 0.0, np.array([])
 
     hours_per_frame = minutes_per_frame / 60.0
     sampling_rate = 1.0 / hours_per_frame
 
     nyquist = 0.5 * sampling_rate
-    cutoff = 1.0 / 40.0
+    cutoff = 1.0 / 40.0 # High-pass filter cutoff in Hz (1 cycle per 40 hours)
+    if cutoff >= nyquist:
+        # If cutoff is too high for the sampling rate, use a smaller fraction
+        cutoff = nyquist / 2.0
+        
     b, a = signal.butter(3, cutoff / nyquist, btype="high", analog=False)
     filtered = signal.filtfilt(b, a, intensities, axis=0)
 
@@ -1260,18 +1264,18 @@ def calculate_phases_fft(traces_data, minutes_per_frame,
     pos_idx = np.where(freqs > 0)
     pos_freqs = freqs[pos_idx]
     pos_fft = fft_pop[pos_idx]
+    power_spectrum_pop = np.abs(pos_fft)
 
     if period_min and period_max:
-        f_low = 1.0 / period_max
-        f_high = 1.0 / period_min
+        f_low, f_high = 1.0 / period_max, 1.0 / period_min
         mask = (pos_freqs >= f_low) & (pos_freqs <= f_high)
         if not np.any(mask):
             raise ValueError("No FFT frequencies found in specified period range.")
-        search_fft = pos_fft[mask]
-        sub_idx = np.argmax(np.abs(search_fft))
+        search_power = power_spectrum_pop[mask]
+        sub_idx = np.argmax(search_power)
         peak_idx = np.where(mask)[0][sub_idx]
     else:
-        peak_idx = np.argmax(np.abs(pos_fft))
+        peak_idx = np.argmax(power_spectrum_pop)
 
     dominant_freq = pos_freqs[peak_idx]
     if dominant_freq == 0:
@@ -1280,17 +1284,48 @@ def calculate_phases_fft(traces_data, minutes_per_frame,
     period_hours = 1.0 / dominant_freq
 
     phases = []
-    rhythm_scores = []
+    rhythm_snr_scores = []
 
     for i in range(filtered.shape[1]):
         fft_cell = np.fft.fft(filtered[:, i])
         cell_fft_pos = fft_cell[pos_idx]
+        
+        # Calculate phase (remains the same)
         phase_angle = np.angle(cell_fft_pos[peak_idx])
         phase_hours = -phase_angle / (2 * np.pi * dominant_freq)
         phases.append(phase_hours)
-        rhythm_scores.append(abs(cell_fft_pos[peak_idx]))
+        
+        # --- New Rhythmicity Score: Signal-to-Noise Ratio ---
+        power_spectrum_cell = np.abs(cell_fft_pos)
+        
+        # Define signal band: +/- 1 frequency bin around the peak
+        signal_bins = slice(max(0, peak_idx - 1), peak_idx + 2)
+        signal_power = np.mean(power_spectrum_cell[signal_bins])
+        
+        # Define noise band: +/- 10 bins, excluding the signal band
+        noise_start = max(0, peak_idx - 10)
+        noise_end = peak_idx + 11
+        
+        # Create a mask to exclude the signal band from the noise calculation
+        noise_mask = np.ones(len(power_spectrum_cell), dtype=bool)
+        noise_mask[signal_bins] = False
+        
+        noise_indices = np.arange(len(power_spectrum_cell))[noise_start:noise_end]
+        valid_noise_indices = noise_indices[noise_mask[noise_start:noise_end]]
+        
+        if len(valid_noise_indices) > 0:
+            noise_power = np.mean(power_spectrum_cell[valid_noise_indices])
+        else:
+            noise_power = 1e-9 # Avoid division by zero if spectrum is too narrow
 
-    return np.array(phases), period_hours, np.array(rhythm_scores)
+        if noise_power > 0:
+            snr = signal_power / noise_power
+        else:
+            snr = np.inf # Effectively a perfect rhythm
+            
+        rhythm_snr_scores.append(snr)
+
+    return np.array(phases), period_hours, np.array(rhythm_snr_scores)
 
 
 # ------------------------------------------------------------
@@ -1614,13 +1649,14 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(param_box)
         phase_box = QtWidgets.QGroupBox("Phase Map Parameters")
         phase_layout = QtWidgets.QFormLayout(phase_box)
+
         self._add_phase_field(phase_layout, "minutes_per_frame", 15.0)
         self._add_phase_field(phase_layout, "period_min", 22.0)
         self._add_phase_field(phase_layout, "period_max", 28.0)
         self._add_phase_field(phase_layout, "grid_resolution", 100, int)
-        self._add_phase_field(phase_layout, "rhythm_threshold", 0.0)
-        
-        # Add the new checkbox
+        self._add_phase_field(phase_layout, "rhythm_threshold", 2.0)
+
+        self.emphasize_rhythm_check = QtWidgets.QCheckBox("Emphasize rhythmic cells in all plots")
         self.emphasize_rhythm_check = QtWidgets.QCheckBox("Emphasize rhythmic cells in all plots")
         phase_layout.addRow(self.emphasize_rhythm_check)
 
