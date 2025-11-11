@@ -653,22 +653,25 @@ class HeatmapViewer:
 
 
 class ContrastViewer:
-    def __init__(self, fig, ax, bg_image, com_points, on_change_callback):
+    def __init__(self, fig, ax, bg_image, com_points, on_change_callback, on_select_callback):
         self.fig = fig
         self.ax = ax
+        self.com_points = com_points
         self.on_change_callback = on_change_callback
+        self.on_select_callback = on_select_callback
+        self.highlight_artist = None
 
         self.image_artist = ax.imshow(bg_image, cmap="gray")
         if len(com_points) > 0:
-            ax.plot(
+            self.scatter = ax.plot(
                 com_points[:, 0],
                 com_points[:, 1],
                 ".",
                 color="red",
-                markersize=3,
+                markersize=5,
                 alpha=0.8,
-            )
-        ax.set_title("Center of Mass of All Trajectories")
+            )[0]
+        ax.set_title("Center of Mass (Click to Select Trajectory)")
 
         ax_contrast = fig.add_axes([0.25, 0.06, 0.65, 0.03])
         ax_brightness = fig.add_axes([0.25, 0.02, 0.65, 0.03])
@@ -676,24 +679,42 @@ class ContrastViewer:
         min_val = float(bg_image.min())
         max_val = float(bg_image.max())
 
-        self.contrast_slider = Slider(
-            ax=ax_contrast,
-            label="Contrast",
-            valmin=min_val,
-            valmax=max_val,
-            valinit=max_val,
-        )
-        self.brightness_slider = Slider(
-            ax=ax_brightness,
-            label="Brightness",
-            valmin=min_val,
-            valmax=max_val,
-            valinit=min_val,
-        )
+        self.contrast_slider = Slider(ax=ax_contrast, label="Contrast", valmin=min_val, valmax=max_val, valinit=max_val)
+        self.brightness_slider = Slider(ax=ax_brightness, label="Brightness", valmin=min_val, valmax=max_val, valinit=min_val)
 
         self.contrast_slider.on_changed(self.update)
         self.brightness_slider.on_changed(self.update)
+        self.fig.canvas.mpl_connect('button_press_event', self.on_click)
         self.update(None)
+
+    def on_click(self, event):
+        if event.inaxes != self.ax or not hasattr(self, 'scatter'):
+            return
+        
+        # Find the closest point to the click
+        distances = np.sqrt((self.com_points[:, 0] - event.xdata)**2 + (self.com_points[:, 1] - event.ydata)**2)
+        selected_index = np.argmin(distances)
+        
+        # A reasonable threshold to avoid selecting distant points
+        if distances[selected_index] < 20:
+            self.highlight_point(selected_index)
+            if self.on_select_callback:
+                self.on_select_callback(selected_index)
+
+    def highlight_point(self, index):
+        if self.highlight_artist:
+            self.highlight_artist.remove()
+            self.highlight_artist = None
+        
+        # Corrected logic: Check against self.com_points
+        if index is not None and 0 <= index < len(self.com_points):
+            point = self.com_points[index]
+            self.highlight_artist = self.ax.plot(
+                point[0], point[1], 'o', markersize=12,
+                markerfacecolor='none', markeredgecolor='cyan', markeredgewidth=2
+            )[0]
+        
+        self.fig.canvas.draw_idle()
 
     def update(self, _):
         vmin = self.brightness_slider.val
@@ -707,27 +728,51 @@ class ContrastViewer:
 
 
 class TrajectoryInspector:
-    def __init__(self, fig, ax, trajectories, bg_image):
+    def __init__(self, fig, ax, trajectories, movie_stack):
         self.fig = fig
         self.ax = ax
         self.trajectories = trajectories
-        self.bg_image = bg_image
-
+        self.movie_stack = movie_stack
+        self.num_frames = len(movie_stack)
         self.num_trajectories = len(trajectories)
         self.index = 0
         self.vmin = None
         self.vmax = None
         self.bg_artist = None
 
-        ax_prev = fig.add_axes([0.7, 0.025, 0.1, 0.04])
-        ax_next = fig.add_axes([0.81, 0.025, 0.1, 0.04])
+        # --- Create Widgets ---
+        # Previous/Next buttons for trajectory index
+        ax_prev = fig.add_axes([0.7, 0.05, 0.1, 0.04])
+        ax_next = fig.add_axes([0.81, 0.05, 0.1, 0.04])
         from matplotlib.widgets import Button
         self.btn_prev = Button(ax_prev, "Previous")
         self.btn_next = Button(ax_next, "Next")
         self.btn_prev.on_clicked(self.prev_trajectory)
         self.btn_next.on_clicked(self.next_trajectory)
 
+        # Slider for frame navigation
+        ax_slider = fig.add_axes([0.15, 0.01, 0.7, 0.03])
+        self.frame_slider = Slider(
+            ax=ax_slider,
+            label='Frame',
+            valmin=0,
+            valmax=self.num_frames - 1,
+            valinit=0,
+            valstep=1
+        )
+        self.frame_slider.on_changed(self.on_frame_change)
+        
         self.update()
+
+    def on_frame_change(self, frame_index):
+        """Callback for when the frame slider is moved."""
+        self.update()
+
+    def set_trajectory(self, index):
+        """Public method to set the currently displayed trajectory by its index."""
+        if 0 <= index < self.num_trajectories:
+            self.index = index
+            self.update()
 
     def update_contrast(self, vmin, vmax):
         self.vmin = vmin
@@ -743,49 +788,61 @@ class TrajectoryInspector:
 
     def prev_trajectory(self, _):
         if self.num_trajectories > 0:
-            self.index = (self.index - 1) % self.num_trajectories
+            self.index = (self.index - 1 + self.num_trajectories) % self.num_trajectories
             self.update()
 
     def update(self):
         self.ax.clear()
+        current_frame = int(self.frame_slider.val)
+
         self.bg_artist = self.ax.imshow(
-            self.bg_image,
+            self.movie_stack[current_frame],
             cmap="gray",
-            alpha=0.7,
             vmin=self.vmin,
             vmax=self.vmax,
         )
+        
         if self.num_trajectories > 0:
             traj = self.trajectories[self.index]
-            self.ax.scatter(
-                traj[:, 1],
-                traj[:, 0],
-                c=np.arange(traj.shape[0]),
-                cmap="viridis",
-                s=10,
+            
+            # Plot the full trajectory path as a faint line
+            self.ax.plot(
+                traj[:, 1], traj[:, 0], '-', color='cyan', linewidth=1, alpha=0.7
             )
+            
+            # Plot a prominent but non-obscuring marker at the current frame's position
+            current_pos = traj[current_frame]
+            self.ax.plot(
+                current_pos[1], current_pos[0], 'o', 
+                markersize=10, 
+                markerfacecolor=(1, 1, 0, 0.5), # Yellow with 50% transparency
+                markeredgecolor='yellow',
+                markeredgewidth=1.5
+            )
+            
             self.ax.set_title(
-                f"Trajectory {self.index + 1} / {self.num_trajectories}"
+                f"Trajectory {self.index + 1} / {self.num_trajectories} (Frame {current_frame + 1}/{self.num_frames})"
             )
         else:
             self.ax.set_title("No Trajectories to Display")
 
-        self.ax.set_xlim(0, self.bg_image.shape[1])
-        self.ax.set_ylim(self.bg_image.shape[0], 0)
+        self.ax.set_xlim(0, self.movie_stack[0].shape[1])
+        self.ax.set_ylim(self.movie_stack[0].shape[0], 0)
         self.fig.canvas.draw_idle()
 
 
 class PhaseMapViewer:
     def __init__(self, fig, ax, bg_image, roi_data,
                  relative_phases, period_hours,
-                 vmin=None, vmax=None):
+                 on_select_callback, vmin=None, vmax=None):
         self.fig = fig
         self.ax = ax
+        self.roi_data = roi_data
         self.period_hours = period_hours
+        self.on_select_callback = on_select_callback
+        self.highlight_artist = None
 
-        self.bg_artist = ax.imshow(
-            bg_image, cmap="gray", vmin=vmin, vmax=vmax
-        )
+        self.bg_artist = ax.imshow(bg_image, cmap="gray", vmin=vmin, vmax=vmax)
 
         if len(roi_data) > 0:
             self.scatter = ax.scatter(
@@ -797,28 +854,46 @@ class PhaseMapViewer:
                 edgecolor="black",
                 linewidth=0.5,
             )
-            self.cbar = fig.colorbar(
-                self.scatter, ax=ax, fraction=0.046, pad=0.04
-            )
-            self.cbar.set_label(
-                "Relative Peak Time (hours)", fontsize=10
-            )
+            self.cbar = fig.colorbar(self.scatter, ax=ax, fraction=0.046, pad=0.04)
+            self.cbar.set_label("Relative Peak Time (hours)", fontsize=10)
 
             ax_slider = fig.add_axes([0.25, 0.02, 0.65, 0.03])
             max_range = self.period_hours / 2.0
-            self.range_slider = Slider(
-                ax=ax_slider,
-                label="Phase Range (+/- hrs)",
-                valmin=1.0,
-                valmax=max_range,
-                valinit=max_range,
-            )
+            self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- hrs)", valmin=1.0, valmax=max_range, valinit=max_range)
             self.range_slider.on_changed(self.update_clim)
             self.update_clim(max_range)
 
-        ax.set_title("Spatiotemporal Phase Map")
+        ax.set_title("Spatiotemporal Phase Map (Click to Select Trajectory)")
         ax.set_xticks([])
         ax.set_yticks([])
+        self.fig.canvas.mpl_connect('button_press_event', self.on_click)
+
+    def on_click(self, event):
+        if event.inaxes != self.ax or not hasattr(self, 'scatter'):
+            return
+        
+        distances = np.sqrt((self.roi_data[:, 0] - event.xdata)**2 + (self.roi_data[:, 1] - event.ydata)**2)
+        selected_index = np.argmin(distances)
+        
+        if distances[selected_index] < 20:
+            self.highlight_point(selected_index)
+            if self.on_select_callback:
+                # IMPORTANT: The phase map data is filtered. We need to find the
+                # original index of the selected cell to update the TrajectoryInspector.
+                # We assume the `roi_data` here is a subset of the full `loaded_data['roi']`.
+                # This requires the main app to handle the index mapping.
+                self.on_select_callback(selected_index)
+
+    def highlight_point(self, index):
+        if self.highlight_artist:
+            self.highlight_artist.remove()
+        
+        point = self.roi_data[index]
+        self.highlight_artist = self.ax.plot(
+            point[0], point[1], 'o', markersize=15,
+            markerfacecolor='none', markeredgecolor='white', markeredgewidth=2
+        )[0]
+        self.fig.canvas.draw_idle()
 
     def update_contrast(self, vmin, vmax):
         if self.bg_artist is not None:
@@ -1838,7 +1913,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """Receives the loaded movie data from the worker thread."""
         self.log_message("Movie loaded successfully.")
         
-        # Extract the middle frame for the background image
+        # Store the entire movie stack for the trajectory inspector
+        self.state.unfiltered_data["movie"] = movie_data
+        # Also keep a single background frame for other, static plots
         self.state.unfiltered_data["background"] = movie_data[len(movie_data) // 2]
         
         # Re-enable UI
@@ -1938,6 +2015,51 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ------------ Visualization population ------------
 
+    def on_roi_selected(self, original_index):
+        """Callback for when a point is clicked in a spatial plot."""
+        self.log_message(f"ROI {original_index + 1} selected.")
+        
+        # Update the trajectory inspector
+        traj_viewer = self.visualization_widgets.get(self.traj_tab)
+        if traj_viewer:
+            traj_viewer.set_trajectory(original_index)
+            self.vis_tabs.setCurrentWidget(self.traj_tab)
+
+        # Highlight the point in other relevant viewers
+        com_viewer = self.visualization_widgets.get(self.com_tab)
+        if com_viewer:
+            com_viewer.highlight_point(original_index)
+        
+        phase_viewer = self.visualization_widgets.get(self.phase_tab)
+        if phase_viewer:
+            # Phase map data is filtered by rhythmicity. We need to find if the
+            # selected original_index exists in the phase map's data and, if so,
+            # what its new index is.
+            
+            # Re-calculate the list of original indices that are in the phase map
+            try:
+                rhythm = calculate_phases_fft(self.state.loaded_data["traces"], minutes_per_frame=float(self.phase_params["minutes_per_frame"][0].text()))[2]
+                thr = float(self.phase_params["rhythm_threshold"][0].text())
+                rhythmic_indices_relative = np.where(rhythm >= thr)[0]
+
+                if self.filtered_indices is not None:
+                    rhythmic_indices_original = self.filtered_indices[rhythmic_indices_relative]
+                else:
+                    rhythmic_indices_original = rhythmic_indices_relative
+                
+                # Now find the position of our selected point in that list
+                match = np.where(rhythmic_indices_original == original_index)[0]
+                if len(match) > 0:
+                    phase_map_index = match[0]
+                    phase_viewer.highlight_point(phase_map_index)
+                else:
+                    # The selected point was not rhythmic, so it's not on the phase map.
+                    # Clear any existing highlight on the phase map.
+                    phase_viewer.highlight_point(None) 
+            except Exception:
+                # Could fail if params are not set; fail silently.
+                pass
+
     def on_contrast_change(self, vmin, vmax):
         self.vmin = vmin
         self.vmax = vmax
@@ -1956,6 +2078,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.log_message("Generating interactive plots...")
         bg = self.state.unfiltered_data["background"]
+        movie = self.state.unfiltered_data.get("movie") # Get the full movie stack
+
+        if movie is None:
+            self.log_message("Error: Full movie stack not found in state.")
+            return
+
         self.vmin, self.vmax = float(bg.min()), float(bg.max())
         single_animal_tabs = [self.heatmap_tab, self.com_tab, self.traj_tab, self.phase_tab, self.interp_tab]
         group_tabs = [self.group_scatter_tab, self.group_avg_tab]
@@ -1967,11 +2095,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.visualization_widgets[self.heatmap_tab] = viewer_h
         
         fig_c, _ = add_mpl_to_tab(self.com_tab)
-        viewer_c = ContrastViewer(fig_c, fig_c.add_subplot(111), bg, self.state.loaded_data["roi"], self.on_contrast_change)
+        viewer_c = ContrastViewer(fig_c, fig_c.add_subplot(111), bg, self.state.loaded_data["roi"], self.on_contrast_change, self.on_roi_selected)
         self.visualization_widgets[self.com_tab] = viewer_c
         
+        # Pass the entire movie stack to the TrajectoryInspector
         fig_t, _ = add_mpl_to_tab(self.traj_tab)
-        viewer_t = TrajectoryInspector(fig_t, fig_t.add_subplot(111), self.state.loaded_data["trajectories"], bg)
+        viewer_t = TrajectoryInspector(fig_t, fig_t.add_subplot(111), self.state.loaded_data["trajectories"], movie)
         self.visualization_widgets[self.traj_tab] = viewer_t
         
         self.regenerate_phase_maps()
@@ -1990,18 +2119,33 @@ class MainWindow(QtWidgets.QMainWindow):
                 phase_args[name] = t(v)
             phases, period, rhythm = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
             thr = float(self.phase_params["rhythm_threshold"][0].text())
-            idx = np.where(rhythm >= thr)[0]
-            self.log_message(f"{len(idx)} cells pass rhythmicity threshold {thr}.")
-            roi = self.state.loaded_data["roi"][idx]
-            ph = phases[idx]
+            
+            # These are the indices relative to the currently loaded (potentially filtered) data
+            rhythmic_indices_relative = np.where(rhythm >= thr)[0]
+            self.log_message(f"{len(rhythmic_indices_relative)} cells pass rhythmicity threshold {thr}.")
+            
+            # Map these back to the original, unfiltered indices
+            if self.filtered_indices is not None:
+                rhythmic_indices_original = self.filtered_indices[rhythmic_indices_relative]
+            else:
+                rhythmic_indices_original = rhythmic_indices_relative
+
+            roi = self.state.loaded_data["roi"][rhythmic_indices_relative]
+            ph = phases[rhythmic_indices_relative]
             if len(ph) == 0: raise ValueError("No cells passed rhythmicity filter.")
+            
             ph_rad = (ph % period) * (2 * np.pi / period)
             mean_rad = circmean(ph_rad)
             mean_h = mean_rad * (period / (2 * np.pi))
             rel = (ph - mean_h + period / 2) % period - period / 2
             
+            # The callback needs to know the original index
+            def phase_map_callback(selected_phase_index):
+                original_index = rhythmic_indices_original[selected_phase_index]
+                self.on_roi_selected(original_index)
+
             fig_p, _ = add_mpl_to_tab(self.phase_tab)
-            viewer_p = PhaseMapViewer(fig_p, fig_p.add_subplot(111), self.state.unfiltered_data["background"], roi, rel, period, vmin=self.vmin, vmax=self.vmax)
+            viewer_p = PhaseMapViewer(fig_p, fig_p.add_subplot(111), self.state.unfiltered_data["background"], roi, rel, period, phase_map_callback, vmin=self.vmin, vmax=self.vmax)
             self.visualization_widgets[self.phase_tab] = viewer_p
             
             grid_res = int(self.phase_params["grid_resolution"][0].text())
