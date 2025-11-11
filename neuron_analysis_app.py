@@ -2559,38 +2559,67 @@ class MainWindow(QtWidgets.QMainWindow):
         single_animal_tabs = [self.heatmap_tab, self.com_tab, self.traj_tab, self.phase_tab, self.interp_tab]
         group_tabs = [self.group_scatter_tab, self.group_avg_tab]
         try:
+            valid_fft_keys = ["minutes_per_frame", "period_min", "period_max"]
             phase_args = {}
-            for name, (w, t) in self.phase_params.items():
-                v = w.text().strip()
-                if not v or name in ("grid_resolution", "rhythm_threshold"): continue
-                phase_args[name] = t(v)
-            if "minutes_per_frame" not in phase_args: raise ValueError("Minutes per Frame must be set.")
+            for key in valid_fft_keys:
+                if key in self.phase_params:
+                    widget, type_caster = self.phase_params[key]
+                    value_str = widget.text().strip()
+                    if value_str:
+                        phase_args[key] = type_caster(value_str)
+
+            if "minutes_per_frame" not in phase_args:
+                raise ValueError("Minutes per Frame must be set for group analysis.")
             
             all_rois, all_rel = [], []
             for i, roi_file in enumerate(self.state.group_data_paths):
                 self.log_message(f"  [{i + 1}/{len(self.state.group_data_paths)}] {os.path.basename(roi_file)}")
+                
                 traces_file = roi_file.replace("_roi_warped.csv", "_traces.csv")
                 unfiltered_roi_file = roi_file.replace("_roi_warped.csv", "_roi.csv")
                 filtered_roi_file = roi_file.replace("_roi_warped.csv", "_roi_filtered.csv")
-                required_files = [traces_file, unfiltered_roi_file, filtered_roi_file]
+                
+                required_files = [traces_file, unfiltered_roi_file, filtered_roi_file, roi_file]
                 if not all(os.path.exists(f) for f in required_files):
-                    self.log_message("    Warning: missing required files; skipping.")
+                    self.log_message("    Warning: missing one or more required files; skipping.")
                     continue
+
+                # --- New Safety Check for Data Consistency ---
                 warped_rois = np.loadtxt(roi_file, delimiter=",")
+                filtered_rois = np.loadtxt(filtered_roi_file, delimiter=",")
+                
+                # Ensure both files have a shape, even if empty
+                num_warped = warped_rois.shape[0] if warped_rois.ndim > 1 else (1 if warped_rois.size > 0 else 0)
+                num_filtered = filtered_rois.shape[0] if filtered_rois.ndim > 1 else (1 if filtered_rois.size > 0 else 0)
+
+                if num_warped != num_filtered:
+                    self.log_message(
+                        f"    ERROR: Data inconsistency detected for {os.path.basename(roi_file)}.\n"
+                        f"    '{os.path.basename(roi_file)}' has {num_warped} cells, but\n"
+                        f"    '{os.path.basename(filtered_roi_file)}' has {num_filtered} cells.\n"
+                        f"    This animal will be SKIPPED. Please re-run the 'Apply Warp' step for this dataset."
+                    )
+                    continue
+                # --- End Safety Check ---
+
                 traces = np.loadtxt(traces_file, delimiter=",")
                 unfiltered_rois = np.loadtxt(unfiltered_roi_file, delimiter=",")
-                filtered_rois = np.loadtxt(filtered_roi_file, delimiter=",")
+                
                 indices = []
-                for point in filtered_rois:
+                for point in filtered_rois.reshape(-1, 2): # Reshape to handle single-row case
                     diff = np.sum((unfiltered_rois - point)**2, axis=1)
                     idx = np.argmin(diff)
                     if diff[idx] < 1e-9: indices.append(idx)
-                if len(indices) != len(filtered_rois):
+                
+                if len(indices) != num_filtered:
                     self.log_message("    Warning: Could not match filtered to unfiltered ROIs; skipping.")
                     continue
+                    
                 trace_indices_to_keep = np.array(indices) + 1
                 filtered_traces_data = traces[:, np.concatenate(([0], trace_indices_to_keep))]
+                
                 phases, period, _ = calculate_phases_fft(filtered_traces_data, **phase_args)
+                
                 phases_rad = (phases % period) * (2 * np.pi / period)
                 mean_rad = circmean(phases_rad)
                 mean_h = mean_rad * (period / (2 * np.pi))
@@ -2598,10 +2627,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 all_rois.append(warped_rois)
                 all_rel.append(rel)
             
-            if not all_rois: raise ValueError("No valid group data loaded.")
+            if not all_rois: raise ValueError("No valid and consistent group data was loaded.")
+            
             pooled_rois = np.vstack(all_rois)
             pooled_rel = np.concatenate(all_rel)
-            if len(pooled_rois) != len(pooled_rel): raise RuntimeError(f"Final data inconsistency: {len(pooled_rois)} ROIs, {len(pooled_rel)} phases.")
+            
+            if len(pooled_rois) != len(pooled_rel): 
+                raise RuntimeError(f"Internal error after processing: {len(pooled_rois)} ROIs, {len(pooled_rel)} phases.")
             
             grid_res = int(self.group_grid_res_edit.text())
             do_smooth = self.group_smooth_check.isChecked()
