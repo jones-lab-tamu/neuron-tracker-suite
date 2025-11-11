@@ -582,73 +582,120 @@ class WarpInspectorWindow(QtWidgets.QDialog):
 # ------------------------------------------------------------
 
 class HeatmapViewer:
-    def __init__(self, fig, ax, traces_data, roi_data):
+    def __init__(self, fig, loaded_data, filtered_indices, phases, rhythm_scores):
         self.fig = fig
-        self.ax = ax
-        self.traces_data = traces_data
-        self.roi_data = roi_data
+        self.loaded_data = loaded_data
+        self.traces_data = loaded_data["traces"]
+        self.roi_data = loaded_data["roi"]
+        self.filtered_indices = filtered_indices
+        self.phases = phases
+        self.rhythm_scores = rhythm_scores
+        self.selected_index = None
 
-        self.prepare_data()
+        # --- Create Axes using GridSpec for better layout ---
+        gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.3)
+        self.ax_heatmap = self.fig.add_subplot(gs[0])
+        self.ax_trace = self.fig.add_subplot(gs[1])
+        
+        self._prepare_sort_indices()
+        self._prepare_normalized_data()
 
-        self.image_artist = self.ax.imshow(
+        self.image_artist = self.ax_heatmap.imshow(
             self.normalized_data.T,
             aspect="auto",
             cmap="viridis",
             interpolation="nearest",
         )
-        self.ax.set_title("Spatially Sorted Intensity Heatmap")
-        self.ax.set_xlabel("Time (frames)")
-
+        self.ax_heatmap.set_title("Spatially Sorted Intensity Heatmap")
         self.cbar = self.fig.colorbar(
-            self.image_artist, ax=self.ax, label="Normalized Intensity"
+            self.image_artist, ax=self.ax_heatmap, label="Normalized Intensity"
         )
 
+        # --- Radio Buttons for Sorting ---
         ax_radio = self.fig.add_axes([0.01, 0.7, 0.15, 0.15])
-        self.radio_buttons = RadioButtons(
-            ax_radio, ("Y-coord", "Raster", "PCA")
-        )
+        sort_options = ["Y-coordinate", "Phase", "Rhythmicity"]
+        # Disable options if data is missing
+        if self.phases is None: sort_options.remove("Phase")
+        if self.rhythm_scores is None: sort_options.remove("Rhythmicity")
+        
+        self.radio_buttons = RadioButtons(ax_radio, sort_options)
         self.radio_buttons.on_clicked(self.on_sort_change)
-        self.on_sort_change("Y-coord")
+        
+        # --- Trace Plot Setup ---
+        self.ax_trace.set_xlabel("Time (frames)")
+        self.ax_trace.set_ylabel("Intensity")
+        self.ax_trace.set_title("Selected Cell Trace")
+        self.trace_line = self.ax_trace.plot([], [])[0]
+        
+        self.on_sort_change(sort_options[0]) # Initial sort
 
-    def prepare_data(self):
+    def update_phase_data(self, phases, rhythm_scores):
+        """Allows MainWindow to push new phase data after regeneration."""
+        self.phases = phases
+        self.rhythm_scores = rhythm_scores
+        self._prepare_sort_indices()
+        # Re-sort the heatmap with the currently selected option
+        current_sort = self.radio_buttons.value_selected
+        self.on_sort_change(current_sort)
+
+    def _prepare_normalized_data(self):
         intensities = self.traces_data[:, 1:]
         if intensities.size == 0:
             self.normalized_data = np.zeros((1, 1))
-            self.y_sort_indices = np.array([0])
-            self.raster_sort_indices = np.array([0])
-            self.pca_sort_indices = np.array([0])
             return
-
-        self.y_sort_indices = np.argsort(self.roi_data[:, 1])
-        self.raster_sort_indices = np.lexsort(
-            (self.roi_data[:, 0], self.roi_data[:, 1])
-        )
-
-        if len(self.roi_data) > 1:
-            from sklearn.decomposition import PCA
-            pca = PCA(n_components=1)
-            proj = pca.fit_transform(self.roi_data)
-            self.pca_sort_indices = np.argsort(proj.flatten())
-        else:
-            self.pca_sort_indices = np.array([0])
-
         mins = intensities.min(axis=0)
         maxs = intensities.max(axis=0)
         denom = maxs - mins
         denom[denom == 0] = 1
         self.normalized_data = (intensities - mins) / denom
 
+    def _prepare_sort_indices(self):
+        self.sort_indices = {}
+        self.sort_indices["Y-coordinate"] = np.argsort(self.roi_data[:, 1])
+        if self.phases is not None:
+            self.sort_indices["Phase"] = np.argsort(self.phases)
+        if self.rhythm_scores is not None:
+            # Sort descending, so best scores are at the top
+            self.sort_indices["Rhythmicity"] = np.argsort(self.rhythm_scores)[::-1]
+
     def on_sort_change(self, label):
-        if self.normalized_data.size == 0:
-            return
-        idx_map = {
-            "Y-coord": self.y_sort_indices,
-            "Raster": self.raster_sort_indices,
-            "PCA": self.pca_sort_indices,
-        }
-        idx = idx_map.get(label, self.y_sort_indices)
+        if self.normalized_data.size == 0: return
+        
+        idx = self.sort_indices.get(label)
+        if idx is None: return
+        
         self.image_artist.set_data(self.normalized_data[:, idx].T)
-        self.ax.set_ylabel(f"Cells (sorted by {label})")
+        self.ax_heatmap.set_ylabel(f"Cells (sorted by {label})")
+        self.fig.canvas.draw_idle()
+
+    def update_selected_trace(self, original_index):
+        """Public method to update the line plot with a new cell's data."""
+        # Map the original, unfiltered index to the current loaded data index
+        if self.filtered_indices is not None:
+            try:
+                current_index = np.where(self.filtered_indices == original_index)[0][0]
+            except IndexError:
+                # The selected cell is not in the current filtered view
+                self.trace_line.set_data([], [])
+                self.ax_trace.set_title("Selected Cell Trace (Not in current filter)")
+                self.ax_trace.relim()
+                self.ax_trace.autoscale_view()
+                self.fig.canvas.draw_idle()
+                return
+        else:
+            current_index = original_index
+
+        if 0 <= current_index < self.traces_data.shape[1] - 1:
+            time = self.traces_data[:, 0]
+            intensity = self.traces_data[:, current_index + 1]
+            self.trace_line.set_data(time, intensity)
+            self.ax_trace.relim()
+            self.ax_trace.autoscale_view()
+            self.ax_trace.set_title(f"Trace for ROI {original_index + 1}")
+        else:
+            self.trace_line.set_data([], [])
+            self.ax_trace.set_title("Selected Cell Trace")
+
         self.fig.canvas.draw_idle()
 
 
@@ -2030,13 +2077,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if com_viewer:
             com_viewer.highlight_point(original_index)
         
+        # Update the heatmap's selected trace plot
+        heatmap_viewer = self.visualization_widgets.get(self.heatmap_tab)
+        if heatmap_viewer:
+            heatmap_viewer.update_selected_trace(original_index)
+
         phase_viewer = self.visualization_widgets.get(self.phase_tab)
         if phase_viewer:
-            # Phase map data is filtered by rhythmicity. We need to find if the
-            # selected original_index exists in the phase map's data and, if so,
-            # what its new index is.
-            
-            # Re-calculate the list of original indices that are in the phase map
             try:
                 rhythm = calculate_phases_fft(self.state.loaded_data["traces"], minutes_per_frame=float(self.phase_params["minutes_per_frame"][0].text()))[2]
                 thr = float(self.phase_params["rhythm_threshold"][0].text())
@@ -2047,17 +2094,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     rhythmic_indices_original = rhythmic_indices_relative
                 
-                # Now find the position of our selected point in that list
                 match = np.where(rhythmic_indices_original == original_index)[0]
                 if len(match) > 0:
                     phase_map_index = match[0]
                     phase_viewer.highlight_point(phase_map_index)
                 else:
-                    # The selected point was not rhythmic, so it's not on the phase map.
-                    # Clear any existing highlight on the phase map.
                     phase_viewer.highlight_point(None) 
             except Exception:
-                # Could fail if params are not set; fail silently.
                 pass
 
     def on_contrast_change(self, vmin, vmax):
@@ -2078,7 +2121,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.log_message("Generating interactive plots...")
         bg = self.state.unfiltered_data["background"]
-        movie = self.state.unfiltered_data.get("movie") # Get the full movie stack
+        movie = self.state.unfiltered_data.get("movie")
 
         if movie is None:
             self.log_message("Error: Full movie stack not found in state.")
@@ -2090,15 +2133,23 @@ class MainWindow(QtWidgets.QMainWindow):
         for tab in single_animal_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), True)
         for tab in group_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), False)
         
+        # --- Pre-calculate phase data for use in multiple viewers ---
+        phases, period, rhythm = None, None, None
+        try:
+            phase_args = {name: t(w.text()) for name, (w, t) in self.phase_params.items() if w.text() and name not in ("grid_resolution", "rhythm_threshold")}
+            phases, period, rhythm = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
+        except Exception as e:
+            self.log_message(f"Could not pre-calculate phase data: {e}")
+
+        # --- Create Viewers ---
         fig_h, _ = add_mpl_to_tab(self.heatmap_tab)
-        viewer_h = HeatmapViewer(fig_h, fig_h.add_subplot(111), self.state.loaded_data["traces"], self.state.loaded_data["roi"])
+        viewer_h = HeatmapViewer(fig_h, self.state.loaded_data, self.filtered_indices, phases, rhythm)
         self.visualization_widgets[self.heatmap_tab] = viewer_h
         
         fig_c, _ = add_mpl_to_tab(self.com_tab)
         viewer_c = ContrastViewer(fig_c, fig_c.add_subplot(111), bg, self.state.loaded_data["roi"], self.on_contrast_change, self.on_roi_selected)
         self.visualization_widgets[self.com_tab] = viewer_c
         
-        # Pass the entire movie stack to the TrajectoryInspector
         fig_t, _ = add_mpl_to_tab(self.traj_tab)
         viewer_t = TrajectoryInspector(fig_t, fig_t.add_subplot(111), self.state.loaded_data["trajectories"], movie)
         self.visualization_widgets[self.traj_tab] = viewer_t
@@ -2117,14 +2168,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 v = w.text().strip()
                 if not v or name in ("grid_resolution", "rhythm_threshold"): continue
                 phase_args[name] = t(v)
-            phases, period, rhythm = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
-            thr = float(self.phase_params["rhythm_threshold"][0].text())
             
-            # These are the indices relative to the currently loaded (potentially filtered) data
+            # Recalculate phase data
+            phases, period, rhythm = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
+            
+            # --- UPDATE HEATMAP VIEWER ---
+            heatmap_viewer = self.visualization_widgets.get(self.heatmap_tab)
+            if heatmap_viewer:
+                self.log_message("Updating heatmap with new phase data...")
+                heatmap_viewer.update_phase_data(phases, rhythm)
+
+            thr = float(self.phase_params["rhythm_threshold"][0].text())
             rhythmic_indices_relative = np.where(rhythm >= thr)[0]
             self.log_message(f"{len(rhythmic_indices_relative)} cells pass rhythmicity threshold {thr}.")
             
-            # Map these back to the original, unfiltered indices
             if self.filtered_indices is not None:
                 rhythmic_indices_original = self.filtered_indices[rhythmic_indices_relative]
             else:
@@ -2139,7 +2196,6 @@ class MainWindow(QtWidgets.QMainWindow):
             mean_h = mean_rad * (period / (2 * np.pi))
             rel = (ph - mean_h + period / 2) % period - period / 2
             
-            # The callback needs to know the original index
             def phase_map_callback(selected_phase_index):
                 original_index = rhythmic_indices_original[selected_phase_index]
                 self.on_roi_selected(original_index)
