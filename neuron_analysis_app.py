@@ -578,108 +578,139 @@ class WarpInspectorWindow(QtWidgets.QDialog):
 
 # ------------------------------------------------------------
 # Visualization Viewers
-# (Ported 1:1 from the original Tk version)
 # ------------------------------------------------------------
 
 class HeatmapViewer:
-    def __init__(self, fig, loaded_data, filtered_indices, phases, rhythm_scores):
+    def __init__(self, fig, loaded_data, filtered_indices, phases, rhythm_scores, is_emphasized):
         self.fig = fig
         self.loaded_data = loaded_data
         self.traces_data = loaded_data["traces"]
         self.roi_data = loaded_data["roi"]
         self.filtered_indices = filtered_indices
-        self.phases = phases
-        self.rhythm_scores = rhythm_scores
+        self.is_emphasized = is_emphasized
+        self.rhythm_mask = None
         self.selected_index = None
+        self.emphasis_overlay = None # Artist for the gray overlay
 
-        # --- Create Axes using GridSpec for better layout ---
         gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.3)
         self.ax_heatmap = self.fig.add_subplot(gs[0])
         self.ax_trace = self.fig.add_subplot(gs[1])
         
-        self._prepare_sort_indices()
         self._prepare_normalized_data()
+        
+        self.image_artist = self.ax_heatmap.imshow(self.normalized_data.T, aspect="auto", cmap="viridis", interpolation="nearest")
+        self.ax_heatmap.set_title("Intensity Heatmap")
+        self.cbar = self.fig.colorbar(self.image_artist, ax=self.ax_heatmap, label="Normalized Intensity")
 
-        self.image_artist = self.ax_heatmap.imshow(
-            self.normalized_data.T,
-            aspect="auto",
-            cmap="viridis",
-            interpolation="nearest",
-        )
-        self.ax_heatmap.set_title("Spatially Sorted Intensity Heatmap")
-        self.cbar = self.fig.colorbar(
-            self.image_artist, ax=self.ax_heatmap, label="Normalized Intensity"
-        )
-
-        # --- Radio Buttons for Sorting ---
         ax_radio = self.fig.add_axes([0.01, 0.7, 0.15, 0.15])
         sort_options = ["Y-coordinate", "Phase", "Rhythmicity"]
-        # Disable options if data is missing
-        if self.phases is None: sort_options.remove("Phase")
-        if self.rhythm_scores is None: sort_options.remove("Rhythmicity")
+        if phases is None: sort_options.remove("Phase")
+        if rhythm_scores is None: sort_options.remove("Rhythmicity")
         
         self.radio_buttons = RadioButtons(ax_radio, sort_options)
         self.radio_buttons.on_clicked(self.on_sort_change)
         
-        # --- Trace Plot Setup ---
         self.ax_trace.set_xlabel("Time (frames)")
         self.ax_trace.set_ylabel("Intensity")
         self.ax_trace.set_title("Selected Cell Trace")
         self.trace_line = self.ax_trace.plot([], [])[0]
-        
-        self.on_sort_change(sort_options[0]) # Initial sort
 
-    def update_phase_data(self, phases, rhythm_scores):
-        """Allows MainWindow to push new phase data after regeneration."""
-        self.phases = phases
-        self.rhythm_scores = rhythm_scores
-        self._prepare_sort_indices()
-        # Re-sort the heatmap with the currently selected option
-        current_sort = self.radio_buttons.value_selected
-        self.on_sort_change(current_sort)
+        if rhythm_scores is not None:
+            thr = 0.0 
+            try:
+                main_win = self.fig.canvas.parent().window()
+                thr = float(main_win.phase_params["rhythm_threshold"][0].text())
+            except Exception: pass
+            self.rhythm_mask = rhythm_scores >= thr
+
+        self.update_phase_data(phases, rhythm_scores, self.rhythm_mask)
+        
+        if sort_options:
+            self.on_sort_change(sort_options[0])
 
     def _prepare_normalized_data(self):
         intensities = self.traces_data[:, 1:]
         if intensities.size == 0:
             self.normalized_data = np.zeros((1, 1))
             return
-        mins = intensities.min(axis=0)
-        maxs = intensities.max(axis=0)
+        mins, maxs = intensities.min(axis=0), intensities.max(axis=0)
         denom = maxs - mins
         denom[denom == 0] = 1
         self.normalized_data = (intensities - mins) / denom
 
-    def _prepare_sort_indices(self):
-        self.sort_indices = {}
-        self.sort_indices["Y-coordinate"] = np.argsort(self.roi_data[:, 1])
-        if self.phases is not None:
-            self.sort_indices["Phase"] = np.argsort(self.phases)
-        if self.rhythm_scores is not None:
-            # Sort descending, so best scores are at the top
-            self.sort_indices["Rhythmicity"] = np.argsort(self.rhythm_scores)[::-1]
-
     def on_sort_change(self, label):
         if self.normalized_data.size == 0: return
         
-        idx = self.sort_indices.get(label)
-        if idx is None: return
-        
-        self.image_artist.set_data(self.normalized_data[:, idx].T)
+        sort_values = self.sort_values.get(label)
+        if sort_values is None: return
+
+        if self.is_emphasized and self.rhythm_mask is not None:
+            final_indices = np.lexsort((sort_values, ~self.rhythm_mask))
+        else:
+            final_indices = np.argsort(sort_values)
+
+        self.image_artist.set_data(self.normalized_data[:, final_indices].T)
         self.ax_heatmap.set_ylabel(f"Cells (sorted by {label})")
+        
+        # --- Add/Remove Visual Emphasis Overlay ---
+        if self.emphasis_overlay:
+            self.emphasis_overlay.remove()
+            self.emphasis_overlay = None
+
+        if self.is_emphasized and self.rhythm_mask is not None:
+            num_rhythmic = np.sum(self.rhythm_mask)
+            total_cells = len(self.rhythm_mask)
+            
+            if num_rhythmic < total_cells:
+                from matplotlib.patches import Rectangle
+                # The overlay covers the block of non-rhythmic cells at the bottom
+                height = total_cells - num_rhythmic
+                # The y-coordinate system for imshow starts at -0.5 at the top
+                y_start = num_rhythmic - 0.5 
+                
+                self.emphasis_overlay = Rectangle(
+                    xy=(-0.5, y_start),
+                    width=self.normalized_data.shape[0],
+                    height=height,
+                    facecolor='black',
+                    alpha=0.6,
+                    edgecolor='none',
+                    zorder=10 # Ensure it's drawn on top of the heatmap
+                )
+                self.ax_heatmap.add_patch(self.emphasis_overlay)
+
         self.fig.canvas.draw_idle()
 
+    def update_phase_data(self, phases, rhythm_scores, rhythm_mask=None):
+        self.phases = phases
+        self.rhythm_scores = rhythm_scores
+        self.rhythm_mask = rhythm_mask
+        
+        self.sort_values = {}
+        self.sort_values["Y-coordinate"] = self.roi_data[:, 1]
+        if self.phases is not None:
+            self.sort_values["Phase"] = self.phases
+        if self.rhythm_scores is not None:
+            self.sort_values["Rhythmicity"] = -self.rhythm_scores
+
+        current_sort = self.radio_buttons.value_selected
+        if current_sort in self.sort_values:
+            self.on_sort_change(current_sort)
+
+    def update_rhythm_emphasis(self, rhythm_mask, is_emphasized):
+        self.is_emphasized = is_emphasized
+        self.rhythm_mask = rhythm_mask
+        current_sort = self.radio_buttons.value_selected
+        self.on_sort_change(current_sort)
+
     def update_selected_trace(self, original_index):
-        """Public method to update the line plot with a new cell's data."""
-        # Map the original, unfiltered index to the current loaded data index
         if self.filtered_indices is not None:
             try:
                 current_index = np.where(self.filtered_indices == original_index)[0][0]
             except IndexError:
-                # The selected cell is not in the current filtered view
                 self.trace_line.set_data([], [])
                 self.ax_trace.set_title("Selected Cell Trace (Not in current filter)")
-                self.ax_trace.relim()
-                self.ax_trace.autoscale_view()
+                self.ax_trace.relim(); self.ax_trace.autoscale_view()
                 self.fig.canvas.draw_idle()
                 return
         else:
@@ -689,13 +720,11 @@ class HeatmapViewer:
             time = self.traces_data[:, 0]
             intensity = self.traces_data[:, current_index + 1]
             self.trace_line.set_data(time, intensity)
-            self.ax_trace.relim()
-            self.ax_trace.autoscale_view()
+            self.ax_trace.relim(); self.ax_trace.autoscale_view()
             self.ax_trace.set_title(f"Trace for ROI {original_index + 1}")
         else:
             self.trace_line.set_data([], [])
             self.ax_trace.set_title("Selected Cell Trace")
-
         self.fig.canvas.draw_idle()
 
 
@@ -707,42 +736,55 @@ class ContrastViewer:
         self.on_change_callback = on_change_callback
         self.on_select_callback = on_select_callback
         self.highlight_artist = None
+        self.scatter_artists = []
 
         self.image_artist = ax.imshow(bg_image, cmap="gray")
-        if len(com_points) > 0:
-            self.scatter = ax.plot(
-                com_points[:, 0],
-                com_points[:, 1],
-                ".",
-                color="red",
-                markersize=5,
-                alpha=0.8,
-            )[0]
         ax.set_title("Center of Mass (Click to Select Trajectory)")
 
         ax_contrast = fig.add_axes([0.25, 0.06, 0.65, 0.03])
         ax_brightness = fig.add_axes([0.25, 0.02, 0.65, 0.03])
-
-        min_val = float(bg_image.min())
-        max_val = float(bg_image.max())
-
+        min_val, max_val = float(bg_image.min()), float(bg_image.max())
         self.contrast_slider = Slider(ax=ax_contrast, label="Contrast", valmin=min_val, valmax=max_val, valinit=max_val)
         self.brightness_slider = Slider(ax=ax_brightness, label="Brightness", valmin=min_val, valmax=max_val, valinit=min_val)
-
         self.contrast_slider.on_changed(self.update)
         self.brightness_slider.on_changed(self.update)
         self.fig.canvas.mpl_connect('button_press_event', self.on_click)
         self.update(None)
+        self._draw_scatter() # Initial drawing
+
+    def _draw_scatter(self, rhythm_mask=None, is_emphasized=False):
+        for artist in self.scatter_artists:
+            artist.remove()
+        self.scatter_artists.clear()
+
+        if len(self.com_points) == 0:
+            self.fig.canvas.draw_idle()
+            return
+
+        if is_emphasized and rhythm_mask is not None:
+            rhythmic_pts = self.com_points[rhythm_mask]
+            non_rhythmic_pts = self.com_points[~rhythm_mask]
+            
+            if len(rhythmic_pts) > 0:
+                s1 = self.ax.plot(rhythmic_pts[:, 0], rhythmic_pts[:, 1], ".", color="red", markersize=5, alpha=0.8)[0]
+                self.scatter_artists.append(s1)
+            if len(non_rhythmic_pts) > 0:
+                s2 = self.ax.plot(non_rhythmic_pts[:, 0], non_rhythmic_pts[:, 1], ".", color="gray", markersize=3, alpha=0.4)[0]
+                self.scatter_artists.append(s2)
+        else:
+            s = self.ax.plot(self.com_points[:, 0], self.com_points[:, 1], ".", color="red", markersize=5, alpha=0.8)[0]
+            self.scatter_artists.append(s)
+        
+        self.fig.canvas.draw_idle()
+
+    def update_rhythm_emphasis(self, rhythm_mask, is_emphasized):
+        self._draw_scatter(rhythm_mask, is_emphasized)
 
     def on_click(self, event):
-        if event.inaxes != self.ax or not hasattr(self, 'scatter'):
+        if event.inaxes != self.ax or len(self.com_points) == 0:
             return
-        
-        # Find the closest point to the click
         distances = np.sqrt((self.com_points[:, 0] - event.xdata)**2 + (self.com_points[:, 1] - event.ydata)**2)
         selected_index = np.argmin(distances)
-        
-        # A reasonable threshold to avoid selecting distant points
         if distances[selected_index] < 20:
             self.highlight_point(selected_index)
             if self.on_select_callback:
@@ -752,22 +794,15 @@ class ContrastViewer:
         if self.highlight_artist:
             self.highlight_artist.remove()
             self.highlight_artist = None
-        
-        # Corrected logic: Check against self.com_points
         if index is not None and 0 <= index < len(self.com_points):
             point = self.com_points[index]
-            self.highlight_artist = self.ax.plot(
-                point[0], point[1], 'o', markersize=12,
-                markerfacecolor='none', markeredgecolor='cyan', markeredgewidth=2
-            )[0]
-        
+            self.highlight_artist = self.ax.plot(point[0], point[1], 'o', markersize=12, markerfacecolor='none', markeredgecolor='cyan', markeredgewidth=2)[0]
         self.fig.canvas.draw_idle()
 
     def update(self, _):
         vmin = self.brightness_slider.val
         vmax = self.contrast_slider.val
-        if vmax <= vmin:
-            vmax = vmin + 1e-6
+        if vmax <= vmin: vmax = vmin + 1e-6
         self.image_artist.set_clim(vmin, vmax)
         self.fig.canvas.draw_idle()
         if self.on_change_callback:
@@ -1584,7 +1619,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._add_phase_field(phase_layout, "period_max", 28.0)
         self._add_phase_field(phase_layout, "grid_resolution", 100, int)
         self._add_phase_field(phase_layout, "rhythm_threshold", 0.0)
-        self.btn_regen_phase = QtWidgets.QPushButton("Regenerate Phase Maps")
+        
+        # Add the new checkbox
+        self.emphasize_rhythm_check = QtWidgets.QCheckBox("Emphasize rhythmic cells in all plots")
+        phase_layout.addRow(self.emphasize_rhythm_check)
+
+        self.btn_regen_phase = QtWidgets.QPushButton("Update Plots")
         self.btn_regen_phase.setEnabled(False)
         phase_layout.addRow(self.btn_regen_phase)
         layout.addWidget(phase_box)
@@ -1731,6 +1771,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_load_results.clicked.connect(self.load_results)
         self.btn_export_plot.clicked.connect(self.export_current_plot)
         self.btn_regen_phase.clicked.connect(self.regenerate_phase_maps)
+        
+        self.emphasize_rhythm_check.stateChanged.connect(self.regenerate_phase_maps)
+                
         self.btn_select_atlas.clicked.connect(self.select_atlas)
         self.btn_add_targets.clicked.connect(self.add_targets)
         self.btn_remove_target.clicked.connect(self.remove_target)
@@ -2122,7 +2165,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_message("Generating interactive plots...")
         bg = self.state.unfiltered_data["background"]
         movie = self.state.unfiltered_data.get("movie")
-
         if movie is None:
             self.log_message("Error: Full movie stack not found in state.")
             return
@@ -2133,7 +2175,6 @@ class MainWindow(QtWidgets.QMainWindow):
         for tab in single_animal_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), True)
         for tab in group_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), False)
         
-        # --- Pre-calculate phase data for use in multiple viewers ---
         phases, period, rhythm = None, None, None
         try:
             phase_args = {name: t(w.text()) for name, (w, t) in self.phase_params.items() if w.text() and name not in ("grid_resolution", "rhythm_threshold")}
@@ -2141,9 +2182,10 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.log_message(f"Could not pre-calculate phase data: {e}")
 
-        # --- Create Viewers ---
+        is_emphasized = self.emphasize_rhythm_check.isChecked()
+        
         fig_h, _ = add_mpl_to_tab(self.heatmap_tab)
-        viewer_h = HeatmapViewer(fig_h, self.state.loaded_data, self.filtered_indices, phases, rhythm)
+        viewer_h = HeatmapViewer(fig_h, self.state.loaded_data, self.filtered_indices, phases, rhythm, is_emphasized)
         self.visualization_widgets[self.heatmap_tab] = viewer_h
         
         fig_c, _ = add_mpl_to_tab(self.com_tab)
@@ -2154,32 +2196,38 @@ class MainWindow(QtWidgets.QMainWindow):
         viewer_t = TrajectoryInspector(fig_t, fig_t.add_subplot(111), self.state.loaded_data["trajectories"], movie)
         self.visualization_widgets[self.traj_tab] = viewer_t
         
-        self.regenerate_phase_maps()
+        self.regenerate_phase_maps() # This will now also update emphasis
         self.btn_export_plot.setEnabled(True)
 
     def regenerate_phase_maps(self):
         if not self.state.loaded_data or "traces" not in self.state.loaded_data:
+            if self.emphasize_rhythm_check.isChecked():
+                self.log_message("Load data before enabling rhythm emphasis.")
             return
-        self.log_message("Regenerating phase maps...")
+
+        self.log_message("Updating plots based on phase parameters...")
         for tab in (self.phase_tab, self.interp_tab): clear_layout(tab.layout())
         try:
-            phase_args = {}
-            for name, (w, t) in self.phase_params.items():
-                v = w.text().strip()
-                if not v or name in ("grid_resolution", "rhythm_threshold"): continue
-                phase_args[name] = t(v)
-            
-            # Recalculate phase data
+            phase_args = {name: t(w.text()) for name, (w, t) in self.phase_params.items() if w.text() and name not in ("grid_resolution", "rhythm_threshold")}
             phases, period, rhythm = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
             
-            # --- UPDATE HEATMAP VIEWER ---
+            thr = float(self.phase_params["rhythm_threshold"][0].text())
+            rhythm_mask = rhythm >= thr
+            is_emphasized = self.emphasize_rhythm_check.isChecked()
+
+            # --- UPDATE OTHER VIEWERS ---
             heatmap_viewer = self.visualization_widgets.get(self.heatmap_tab)
             if heatmap_viewer:
-                self.log_message("Updating heatmap with new phase data...")
-                heatmap_viewer.update_phase_data(phases, rhythm)
+                # This is the corrected call. It passes all new data to the heatmap.
+                heatmap_viewer.update_phase_data(phases, rhythm, rhythm_mask)
+                heatmap_viewer.update_rhythm_emphasis(rhythm_mask, is_emphasized)
+            
+            com_viewer = self.visualization_widgets.get(self.com_tab)
+            if com_viewer:
+                com_viewer.update_rhythm_emphasis(rhythm_mask, is_emphasized)
 
-            thr = float(self.phase_params["rhythm_threshold"][0].text())
-            rhythmic_indices_relative = np.where(rhythm >= thr)[0]
+            # --- REGENERATE PHASE MAPS (which only show rhythmic cells) ---
+            rhythmic_indices_relative = np.where(rhythm_mask)[0]
             self.log_message(f"{len(rhythmic_indices_relative)} cells pass rhythmicity threshold {thr}.")
             
             if self.filtered_indices is not None:
@@ -2212,9 +2260,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.phase_tab), True)
             self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.interp_tab), True)
             self.btn_regen_phase.setEnabled(True)
-            self.log_message("Phase maps updated.")
+            self.log_message("Phase-based plots updated.")
         except Exception as e:
-            self.log_message(f"Could not generate phase maps: {e}")
+            self.log_message(f"Could not update plots: {e}")
             self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.phase_tab), False)
             self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.interp_tab), False)
 
