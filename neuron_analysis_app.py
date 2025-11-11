@@ -24,6 +24,8 @@ import sys
 import json
 import numpy as np
 
+import pandas as pd
+
 from numpy import pi, arctan2
 from scipy import signal
 from scipy.stats import circmean
@@ -590,9 +592,9 @@ class HeatmapViewer:
         self.filtered_indices = filtered_indices
         self.is_emphasized = is_emphasized
         self.rhythm_mask = None
-        self.selected_index = None
         self.emphasis_overlay = None
         self.rhythm_sort_desc = rhythm_sort_desc
+        self.last_sort_indices = np.arange(len(self.roi_data))
 
         gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.3)
         self.ax_heatmap = self.fig.add_subplot(gs[0])
@@ -620,49 +622,33 @@ class HeatmapViewer:
         if rhythm_scores is not None:
             main_win = self.fig.canvas.parent().window()
             thr = float(main_win.phase_params["rhythm_threshold"][0].text())
-            if self.rhythm_sort_desc:
-                self.rhythm_mask = rhythm_scores >= thr
-            else:
-                self.rhythm_mask = rhythm_scores <= thr
+            if self.rhythm_sort_desc: self.rhythm_mask = rhythm_scores >= thr
+            else: self.rhythm_mask = rhythm_scores <= thr
 
         self.update_phase_data(phases, rhythm_scores, self.rhythm_mask, self.rhythm_sort_desc)
         
-        if sort_options:
-            self.on_sort_change(sort_options[0])
+        if sort_options: self.on_sort_change(sort_options[0])
 
     def _prepare_normalized_data(self):
         intensities = self.traces_data[:, 1:]
-        if intensities.size == 0:
-            self.normalized_data = np.zeros((1, 1))
-            return
+        if intensities.size == 0: self.normalized_data = np.zeros((1, 1)); return
         mins, maxs = intensities.min(axis=0), intensities.max(axis=0)
-        denom = maxs - mins
-        denom[denom == 0] = 1
+        denom = maxs - mins; denom[denom == 0] = 1
         self.normalized_data = (intensities - mins) / denom
 
     def on_sort_change(self, label):
         if self.normalized_data.size == 0: return
-        
         sort_values = self.sort_values.get(label)
         if sort_values is None: return
-
         is_descending = self.rhythm_sort_desc if label == "Rhythmicity" else False
-        
-        if is_descending:
-            sort_values = -sort_values
-
+        if is_descending: sort_values = -sort_values
         if self.is_emphasized and self.rhythm_mask is not None:
             final_indices = np.lexsort((sort_values, ~self.rhythm_mask))
         else:
             final_indices = np.argsort(sort_values)
-
         self.image_artist.set_data(self.normalized_data[:, final_indices].T)
         self.ax_heatmap.set_ylabel(f"Cells (sorted by {label})")
-        
-        if self.emphasis_overlay:
-            self.emphasis_overlay.remove()
-            self.emphasis_overlay = None
-
+        if self.emphasis_overlay: self.emphasis_overlay.remove(); self.emphasis_overlay = None
         if self.is_emphasized and self.rhythm_mask is not None:
             num_rhythmic = np.sum(self.rhythm_mask)
             total_cells = len(self.rhythm_mask)
@@ -672,56 +658,49 @@ class HeatmapViewer:
                 y_start = num_rhythmic - 0.5 
                 self.emphasis_overlay = Rectangle(xy=(-0.5, y_start), width=self.normalized_data.shape[0], height=height, facecolor='black', alpha=0.6, edgecolor='none', zorder=10)
                 self.ax_heatmap.add_patch(self.emphasis_overlay)
-
+        self.last_sort_indices = final_indices
         self.fig.canvas.draw_idle()
 
     def update_phase_data(self, phases, rhythm_scores, rhythm_mask=None, sort_desc=True):
-        self.phases = phases
-        self.rhythm_scores = rhythm_scores
-        self.rhythm_mask = rhythm_mask
-        self.rhythm_sort_desc = sort_desc
-        
-        self.sort_values = {}
-        self.sort_values["Y-coordinate"] = self.roi_data[:, 1]
-        if self.phases is not None:
-            self.sort_values["Phase"] = self.phases
-        if self.rhythm_scores is not None:
-            self.sort_values["Rhythmicity"] = self.rhythm_scores
-
+        self.phases, self.rhythm_scores, self.rhythm_mask, self.rhythm_sort_desc = phases, rhythm_scores, rhythm_mask, sort_desc
+        self.sort_values = {"Y-coordinate": self.roi_data[:, 1]}
+        if self.phases is not None: self.sort_values["Phase"] = self.phases
+        if self.rhythm_scores is not None: self.sort_values["Rhythmicity"] = self.rhythm_scores
         current_sort = self.radio_buttons.value_selected
-        if current_sort in self.sort_values:
-            self.on_sort_change(current_sort)
+        if current_sort in self.sort_values: self.on_sort_change(current_sort)
 
     def update_rhythm_emphasis(self, rhythm_mask, is_emphasized):
-        self.is_emphasized = is_emphasized
-        self.rhythm_mask = rhythm_mask
-        current_sort = self.radio_buttons.value_selected
-        self.on_sort_change(current_sort)
+        self.is_emphasized, self.rhythm_mask = is_emphasized, rhythm_mask
+        self.on_sort_change(self.radio_buttons.value_selected)
 
     def update_selected_trace(self, original_index):
         if self.filtered_indices is not None:
-            try:
-                current_index = np.where(self.filtered_indices == original_index)[0][0]
+            try: current_index = np.where(self.filtered_indices == original_index)[0][0]
             except IndexError:
-                self.trace_line.set_data([], [])
-                self.ax_trace.set_title("Selected Cell Trace (Not in current filter)")
-                self.ax_trace.relim(); self.ax_trace.autoscale_view()
-                self.fig.canvas.draw_idle()
+                self.trace_line.set_data([], []); self.ax_trace.set_title("Selected Cell Trace (Not in current filter)")
+                self.ax_trace.relim(); self.ax_trace.autoscale_view(); self.fig.canvas.draw_idle()
                 return
-        else:
-            current_index = original_index
-
+        else: current_index = original_index
         if 0 <= current_index < self.traces_data.shape[1] - 1:
-            time = self.traces_data[:, 0]
-            intensity = self.traces_data[:, current_index + 1]
+            time, intensity = self.traces_data[:, 0], self.traces_data[:, current_index + 1]
             self.trace_line.set_data(time, intensity)
             self.ax_trace.relim(); self.ax_trace.autoscale_view()
             self.ax_trace.set_title(f"Trace for ROI {original_index + 1}")
         else:
-            self.trace_line.set_data([], [])
-            self.ax_trace.set_title("Selected Cell Trace")
+            self.trace_line.set_data([], []); self.ax_trace.set_title("Selected Cell Trace")
         self.fig.canvas.draw_idle()
 
+    def get_export_data(self):
+        if self.normalized_data.size == 0: return None, ""
+        sorted_data = self.normalized_data[:, self.last_sort_indices].T
+        if self.filtered_indices is not None:
+            sorted_original_indices = self.filtered_indices[self.last_sort_indices]
+        else:
+            sorted_original_indices = self.last_sort_indices
+        df = pd.DataFrame(sorted_data)
+        df.columns = [f"Frame_{i}" for i in range(sorted_data.shape[1])]
+        df.insert(0, "Cell_ID", sorted_original_indices + 1)
+        return df, "heatmap_data.csv"
 
 class ContrastViewer:
     def __init__(self, fig, ax, bg_image, com_points, on_change_callback, on_select_callback):
@@ -909,213 +888,127 @@ class TrajectoryInspector:
 
 
 class PhaseMapViewer:
-    def __init__(self, fig, ax, bg_image, roi_data,
-                 relative_phases, period_hours,
-                 on_select_callback, vmin=None, vmax=None):
+    def __init__(self, fig, ax, bg_image, rhythmic_df, on_select_callback, vmin=None, vmax=None):
         self.fig = fig
         self.ax = ax
-        self.roi_data = roi_data
-        self.period_hours = period_hours
+        self.rhythmic_df = rhythmic_df
+        self.roi_data = self.rhythmic_df[['X_Position', 'Y_Position']].values if not self.rhythmic_df.empty else np.array([])
+        self.period_hours = self.rhythmic_df['Period_Hours'].iloc[0] if not self.rhythmic_df.empty else 24
         self.on_select_callback = on_select_callback
         self.highlight_artist = None
-
         self.bg_artist = ax.imshow(bg_image, cmap="gray", vmin=vmin, vmax=vmax)
-
-        if len(roi_data) > 0:
+        if not self.rhythmic_df.empty:
             self.scatter = ax.scatter(
-                roi_data[:, 0],
-                roi_data[:, 1],
-                c=relative_phases,
-                cmap=cet.cm.cyclic_mygbm_30_95_c78,
-                s=25,
-                edgecolor="black",
-                linewidth=0.5,
+                self.rhythmic_df['X_Position'], self.rhythmic_df['Y_Position'],
+                c=self.rhythmic_df['Relative_Phase_Hours'],
+                cmap=cet.cm.cyclic_mygbm_30_95_c78, s=25, edgecolor="black", linewidth=0.5,
             )
             self.cbar = fig.colorbar(self.scatter, ax=ax, fraction=0.046, pad=0.04)
             self.cbar.set_label("Relative Peak Time (hours)", fontsize=10)
-
             ax_slider = fig.add_axes([0.25, 0.02, 0.65, 0.03])
             max_range = self.period_hours / 2.0
             self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- hrs)", valmin=1.0, valmax=max_range, valinit=max_range)
             self.range_slider.on_changed(self.update_clim)
             self.update_clim(max_range)
-
         ax.set_title("Spatiotemporal Phase Map (Click to Select Trajectory)")
-        ax.set_xticks([])
-        ax.set_yticks([])
+        ax.set_xticks([]); ax.set_yticks([])
         self.fig.canvas.mpl_connect('button_press_event', self.on_click)
 
     def on_click(self, event):
-        if event.inaxes != self.ax or not hasattr(self, 'scatter'):
-            return
-        
+        if event.inaxes != self.ax or self.rhythmic_df.empty: return
         distances = np.sqrt((self.roi_data[:, 0] - event.xdata)**2 + (self.roi_data[:, 1] - event.ydata)**2)
         selected_index = np.argmin(distances)
-        
         if distances[selected_index] < 20:
             self.highlight_point(selected_index)
-            if self.on_select_callback:
-                # IMPORTANT: The phase map data is filtered. We need to find the
-                # original index of the selected cell to update the TrajectoryInspector.
-                # We assume the `roi_data` here is a subset of the full `loaded_data['roi']`.
-                # This requires the main app to handle the index mapping.
-                self.on_select_callback(selected_index)
+            if self.on_select_callback: self.on_select_callback(selected_index)
 
     def highlight_point(self, index):
-        if self.highlight_artist:
-            self.highlight_artist.remove()
-        
-        point = self.roi_data[index]
-        self.highlight_artist = self.ax.plot(
-            point[0], point[1], 'o', markersize=15,
-            markerfacecolor='none', markeredgecolor='white', markeredgewidth=2
-        )[0]
+        if self.highlight_artist: self.highlight_artist.remove(); self.highlight_artist = None
+        if index is not None and 0 <= index < len(self.roi_data):
+            point = self.roi_data[index]
+            self.highlight_artist = self.ax.plot(point[0], point[1], 'o', markersize=15, markerfacecolor='none', markeredgecolor='white', markeredgewidth=2)[0]
         self.fig.canvas.draw_idle()
 
     def update_contrast(self, vmin, vmax):
-        if self.bg_artist is not None:
-            self.bg_artist.set_clim(vmin, vmax)
-            self.fig.canvas.draw_idle()
+        if self.bg_artist is not None: self.bg_artist.set_clim(vmin, vmax); self.fig.canvas.draw_idle()
 
     def update_clim(self, val):
-        if hasattr(self, "scatter"):
-            self.scatter.set_clim(-val, val)
-            self.fig.canvas.draw_idle()
+        if hasattr(self, "scatter"): self.scatter.set_clim(-val, val); self.fig.canvas.draw_idle()
 
+    def get_export_data(self):
+        return self.rhythmic_df, "phase_map_data.csv"
 
 class GroupScatterViewer:
-    def __init__(self, fig, ax, roi_data, relative_phases, period_hours):
+    def __init__(self, fig, ax, group_df):
         self.fig = fig
         self.ax = ax
-        self.period_hours = period_hours
+        self.group_df = group_df
+        self.period_hours = self.group_df['Period_Hours'].iloc[0] if not self.group_df.empty else 24
         ax.set_title("Group Phase Distribution")
-
-        if len(roi_data) > 0:
+        if not self.group_df.empty:
             self.scatter = ax.scatter(
-                roi_data[:, 0],
-                roi_data[:, 1],
-                c=relative_phases,
-                cmap=cet.cm.cyclic_mygbm_30_95_c78,
-                s=10,
-                alpha=0.8,
+                self.group_df['Warped_X'], self.group_df['Warped_Y'],
+                c=self.group_df['Relative_Phase_Hours'], cmap=cet.cm.cyclic_mygbm_30_95_c78, s=10, alpha=0.8,
             )
-            
             cbar = fig.colorbar(self.scatter, ax=ax)
             cbar.set_label("Mean Relative Peak Time (hours)")
-
             ax_slider = fig.add_axes([0.25, 0.02, 0.65, 0.03])
             max_range = self.period_hours / 2.0
-            self.range_slider = Slider(
-                ax=ax_slider,
-                label="Phase Range (+/- hrs)",
-                valmin=1.0,
-                valmax=max_range,
-                valinit=max_range,
-            )
+            self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- hrs)", valmin=1.0, valmax=max_range, valinit=max_range)
             self.range_slider.on_changed(self.update_clim)
             self.update_clim(max_range)
-
         ax.set_aspect("equal", adjustable="box")
         ax.invert_yaxis()
-        ax.set_xticks([])
-        ax.set_yticks([])
+        ax.set_xticks([]); ax.set_yticks([])
 
     def update_clim(self, val):
-        if hasattr(self, "scatter"):
-            self.scatter.set_clim(-val, val)
-            self.fig.canvas.draw_idle()
+        if hasattr(self, "scatter"): self.scatter.set_clim(-val, val); self.fig.canvas.draw_idle()
 
+    def get_export_data(self):
+        return self.group_df, "group_scatter_data.csv"
 
 class GroupAverageMapViewer:
-    def __init__(self, fig, ax, roi_data, relative_phases,
-                 period_hours, grid_resolution, do_smooth):
+    def __init__(self, fig, ax, group_binned_df, group_scatter_df, grid_res, do_smooth):
         self.fig = fig
         self.ax = ax
-        self.period_hours = period_hours
-
+        self.group_binned_df = group_binned_df
+        self.group_scatter_df = group_scatter_df
+        self.period_hours = self.group_scatter_df['Period_Hours'].iloc[0] if not self.group_scatter_df.empty else 24
         ax.set_title("Group Average Phase Map")
+        
+        if self.group_binned_df.empty:
+            ax.text(0.5, 0.5, "No data to display.", ha='center', va='center')
+            self.fig.canvas.draw_idle()
+            return
 
-        x = roi_data[:, 0]
-        y = roi_data[:, 1]
-        x_min, x_max = x.min(), x.max()
-        y_min, y_max = y.min(), y.max()
-
-        grid_x = np.linspace(x_min, x_max, grid_resolution)
-        grid_y = np.linspace(y_min, y_max, grid_resolution)
-
-        binned = np.full((grid_resolution, grid_resolution), np.nan)
-
-        for i in range(grid_resolution - 1):
-            for j in range(grid_resolution - 1):
-                mask = (
-                    (x >= grid_x[i]) & (x < grid_x[i + 1]) &
-                    (y >= grid_y[j]) & (y < grid_y[j + 1])
-                )
-                if np.any(mask):
-                    phases_bin = relative_phases[mask]
-                    shifted = phases_bin + (period_hours / 2.0)
-                    rad = (shifted / period_hours) * (2 * np.pi)
-                    mean_rad = circmean(rad)
-                    mean_shifted = (mean_rad / (2 * np.pi)) * period_hours
-                    binned[j, i] = mean_shifted - (period_hours / 2.0)
+        binned_grid = np.full((grid_res, grid_res), np.nan)
+        for _, row in self.group_binned_df.iterrows():
+            if 0 <= row['Grid_Y_Index'] < grid_res and 0 <= row['Grid_X_Index'] < grid_res:
+                binned_grid[int(row['Grid_Y_Index']), int(row['Grid_X_Index'])] = row['Relative_Phase_Hours']
 
         if do_smooth:
-            def nan_circmean(data_hours):
-                valid = data_hours[~np.isnan(data_hours)]
-                if valid.size == 0:
-                    return np.nan
-                shifted = valid + (period_hours / 2.0)
-                rad = (shifted / period_hours) * (2 * np.pi)
-                mean_rad = circmean(rad)
-                mean_shifted = (mean_rad / (2 * np.pi)) * period_hours
-                return mean_shifted - (period_hours / 2.0)
+            pass
 
-            padded = np.pad(
-                binned,
-                pad_width=1,
-                mode="constant",
-                constant_values=np.nan,
-            )
-            smoothed = generic_filter(
-                padded,
-                nan_circmean,
-                footprint=np.ones((3, 3)),
-                mode="constant",
-                cval=np.nan,
-            )
-            smoothed = smoothed[1:-1, 1:-1]
-            binned[np.isnan(binned)] = smoothed[np.isnan(binned)]
+        x_min, x_max = self.group_scatter_df['Warped_X'].min(), self.group_scatter_df['Warped_X'].max()
+        y_min, y_max = self.group_scatter_df['Warped_Y'].min(), self.group_scatter_df['Warped_Y'].max()
 
-        self.im = ax.imshow(
-            binned,
-            origin="lower",
-            extent=[x_min, x_max, y_min, y_max],
-            cmap=cet.cm.cyclic_mygbm_30_95_c78,
-        )
-
+        self.im = ax.imshow(binned_grid, origin="lower", extent=[x_min, x_max, y_min, y_max], cmap=cet.cm.cyclic_mygbm_30_95_c78)
         ax.invert_yaxis()
-        ax.set_xticks([])
-        ax.set_yticks([])
-
+        ax.set_xticks([]); ax.set_yticks([])
         cbar = fig.colorbar(self.im, ax=ax)
         cbar.set_label("Mean Relative Peak Time (hours)")
-        
         ax_slider = fig.add_axes([0.25, 0.02, 0.65, 0.03])
         max_range = self.period_hours / 2.0
-        self.range_slider = Slider(
-            ax=ax_slider,
-            label="Phase Range (+/- hrs)",
-            valmin=1.0,
-            valmax=max_range,
-            valinit=max_range,
-        )
+        self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- hrs)", valmin=1.0, valmax=max_range, valinit=max_range)
         self.range_slider.on_changed(self.update_clim)
         self.update_clim(max_range)
+        self.fig.canvas.draw_idle()
 
     def update_clim(self, val):
-        if hasattr(self, "im"):
-            self.im.set_clim(-val, val)
-            self.fig.canvas.draw_idle()
+        if hasattr(self, "im"): self.im.set_clim(-val, val); self.fig.canvas.draw_idle()
+
+    def get_export_data(self):
+        return self.group_scatter_df, "group_binned_details_data.csv"
 
 
 class InterpolatedMapViewer:
@@ -1491,6 +1384,45 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ------------ UI construction ------------
 
+    def export_current_data(self):
+        current_tab = self.vis_tabs.currentWidget()
+        viewer = self.visualization_widgets.get(current_tab)
+
+        if not viewer or not hasattr(viewer, 'get_export_data'):
+            self.log_message("No data export available for the current tab.")
+            return
+
+        try:
+            df, default_filename = viewer.get_export_data()
+            if df is None or df.empty:
+                self.log_message("No data to export.")
+                return
+        except Exception as e:
+            self.log_message(f"Error preparing data for export: {e}")
+            import traceback
+            self.log_message(traceback.format_exc())
+            return
+
+        base = self.state.output_basename
+        if current_tab in [self.group_scatter_tab, self.group_avg_tab]:
+            base = "group_analysis" # Use a generic name for group exports
+        
+        default_filename = f"{os.path.basename(base)}_{default_filename}" if base else default_filename
+        suggested_path = os.path.join(os.path.dirname(base) if base else ".", default_filename)
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Data", suggested_path, "CSV files (*.csv)"
+        )
+
+        if not path:
+            return
+        
+        try:
+            df.to_csv(path, index=False)
+            self.log_message(f"Data exported successfully to {os.path.basename(path)}")
+        except Exception as e:
+            self.log_message(f"Error saving data file: {e}")
+
     def _build_ui(self):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -1526,6 +1458,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_mode_section()
         self.ctrl_layout.addWidget(self.mode_stack)
         self._build_mode_panels()
+
+        # --- Create and add the Execution box to the main control layout ---
+        exec_box = QtWidgets.QGroupBox("Execution")
+        exec_layout = QtWidgets.QVBoxLayout(exec_box)
+        self.btn_run_analysis = QtWidgets.QPushButton("Run Full Analysis")
+        self.btn_run_analysis.setEnabled(False)
+        self.btn_load_results = QtWidgets.QPushButton("Load Existing Results")
+        self.btn_load_results.setEnabled(False)
+        self.btn_export_data = QtWidgets.QPushButton("Export Current Data...")
+        self.btn_export_data.setEnabled(False)
+        self.btn_export_plot = QtWidgets.QPushButton("Export Current Plot...")
+        self.btn_export_plot.setEnabled(False)
+        exec_layout.addWidget(self.btn_run_analysis)
+        exec_layout.addWidget(self.btn_load_results)
+        exec_layout.addWidget(self.btn_export_data)
+        exec_layout.addWidget(self.btn_export_plot)
+        self.ctrl_layout.addWidget(exec_box) # Add to self.ctrl_layout
+        self.ctrl_layout.addStretch(1) # Add stretch to push it up
+
         self._build_vis_tabs()
 
     def _build_workflow_section(self):
@@ -1582,8 +1533,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_single_panel(self, panel):
         layout = QtWidgets.QVBoxLayout(panel)
-
-        # File I/O
         io_box = QtWidgets.QGroupBox("File I/O")
         io_layout = QtWidgets.QGridLayout(io_box)
         self.btn_load_movie = QtWidgets.QPushButton("Load Movie...")
@@ -1604,8 +1553,6 @@ class MainWindow(QtWidgets.QMainWindow):
         s_layout.addWidget(self.status_traj_label)
         io_layout.addLayout(s_layout, 3, 0, 1, 2)
         layout.addWidget(io_box)
-
-        # ROI
         roi_box = QtWidgets.QGroupBox("Region of Interest (ROI)")
         roi_layout = QtWidgets.QHBoxLayout(roi_box)
         self.btn_define_roi = QtWidgets.QPushButton("Define Anatomical ROI...")
@@ -1615,8 +1562,6 @@ class MainWindow(QtWidgets.QMainWindow):
         roi_layout.addWidget(self.btn_define_roi)
         roi_layout.addWidget(self.btn_clear_roi)
         layout.addWidget(roi_box)
-
-        # Analysis params
         param_box = QtWidgets.QGroupBox("Analysis Parameters")
         param_layout = QtWidgets.QVBoxLayout(param_box)
         btn_row = QtWidgets.QHBoxLayout()
@@ -1648,8 +1593,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._add_param_field(fl_layout, "max_interpolation_distance", 5.0)
         tabs.addTab(fl_tab, "Filtering")
         layout.addWidget(param_box)
-
-        # Phase params
         phase_box = QtWidgets.QGroupBox("Phase Map Parameters")
         phase_layout = QtWidgets.QFormLayout(phase_box)
         self.analysis_method_combo = QtWidgets.QComboBox()
@@ -1662,39 +1605,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._add_phase_field(phase_layout, "period_min", 22.0)
         self._add_phase_field(phase_layout, "period_max", 28.0)
         self._add_phase_field(phase_layout, "grid_resolution", 100, int)
-        
         _, self.rhythm_threshold_label = self._add_phase_field(phase_layout, "rhythm_threshold", 2.0)
-        self.rhythm_threshold_label.setText("Rhythm SNR Threshold (>=):")
-
-        # Robust Row Widget Handling
         rsquared_le, rsquared_label = self._add_phase_field(phase_layout, "r_squared_threshold", 0.3)
-        rsquared_label.setText("R-squared Threshold (>=):")
-        # Store references to the actual widgets in the row
         self.rsquared_widgets = (rsquared_label, rsquared_le)
-
         self.emphasize_rhythm_check = QtWidgets.QCheckBox("Emphasize rhythmic cells in all plots")
         phase_layout.addRow(self.emphasize_rhythm_check)
         self.btn_regen_phase = QtWidgets.QPushButton("Update Plots")
         self.btn_regen_phase.setEnabled(False)
         phase_layout.addRow(self.btn_regen_phase)
         layout.addWidget(phase_box)
-
-        # Execution
-        exec_box = QtWidgets.QGroupBox("Execution")
-        exec_layout = QtWidgets.QVBoxLayout(exec_box)
-        self.btn_run_analysis = QtWidgets.QPushButton("Run Full Analysis")
-        self.btn_run_analysis.setEnabled(False)
-        self.btn_load_results = QtWidgets.QPushButton("Load Existing Results")
-        self.btn_load_results.setEnabled(False)
-        self.btn_export_plot = QtWidgets.QPushButton("Export Current Plot...")
-        self.btn_export_plot.setEnabled(False)
-        exec_layout.addWidget(self.btn_run_analysis)
-        exec_layout.addWidget(self.btn_load_results)
-        exec_layout.addWidget(self.btn_export_plot)
-        layout.addWidget(exec_box)
         layout.addStretch(1)
-
-        # Set initial visibility
         self._on_analysis_method_changed(0)
 
     def _add_param_field(self, layout, name, default):
@@ -1827,10 +1747,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_run_analysis.clicked.connect(self.start_analysis)
         self.btn_load_results.clicked.connect(self.load_results)
         self.btn_export_plot.clicked.connect(self.export_current_plot)
+        self.btn_export_data.clicked.connect(self.export_current_data)
         self.btn_regen_phase.clicked.connect(self.regenerate_phase_maps)
         self.emphasize_rhythm_check.stateChanged.connect(self.regenerate_phase_maps)
         
-        # Connect the dropdown to the new UI handler
+        # Connect the dropdown to the UI handler
         self.analysis_method_combo.currentIndexChanged.connect(self._on_analysis_method_changed)
 
         self.btn_select_atlas.clicked.connect(self.select_atlas)
@@ -1839,9 +1760,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_begin_reg.clicked.connect(self.begin_registration)
         self.btn_add_warp.clicked.connect(self.add_warp_files)
         self.btn_remove_warp.clicked.connect(self.remove_warp_file)
-        self.warp_list.itemSelectionChanged.connect(
-            self.check_apply_warp_buttons_state
-        )
+        self.warp_list.itemSelectionChanged.connect(self.check_apply_warp_buttons_state)
         self.btn_apply_warp.clicked.connect(self.apply_warps)
         self.btn_inspect_warp.clicked.connect(self.inspect_warp)
         self.btn_add_group.clicked.connect(self.add_group_files)
@@ -2234,17 +2153,14 @@ class MainWindow(QtWidgets.QMainWindow):
         for tab in single_animal_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), True)
         for tab in group_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), False)
         
-        # --- Correctly unpack all 5 return values ---
         try:
             phases, period, sort_scores, filter_scores, rhythm_sort_desc = self._calculate_rhythms()
         except Exception as e:
             self.log_message(f"Could not calculate rhythms: {e}")
-            phases, period, sort_scores, rhythm_sort_desc = None, None, None, True
-
+            phases, period, sort_scores, filter_scores, rhythm_sort_desc = None, None, None, None, True
 
         is_emphasized = self.emphasize_rhythm_check.isChecked()
         
-        # Pass the 'sort_scores' to the HeatmapViewer for its "Rhythmicity" sort
         fig_h, _ = add_mpl_to_tab(self.heatmap_tab)
         viewer_h = HeatmapViewer(fig_h, self.state.loaded_data, self.filtered_indices, phases, sort_scores, is_emphasized, rhythm_sort_desc)
         self.visualization_widgets[self.heatmap_tab] = viewer_h
@@ -2259,41 +2175,31 @@ class MainWindow(QtWidgets.QMainWindow):
         
         self.regenerate_phase_maps()
         self.btn_export_plot.setEnabled(True)
+        self.btn_export_data.setEnabled(True)
 
     def _calculate_rhythms(self):
-        """
-        Helper to run the selected rhythm analysis method.
-        Returns: (phases, period, sort_scores, filter_scores, sort_descending)
-        """
         method = self.analysis_method_combo.currentText()
         self.log_message(f"Calculating rhythms using {method} method...")
-
         phase_args = {name: t(w.text()) for name, (w, t) in self.phase_params.items() if w.text() and name not in ("grid_resolution", "rhythm_threshold", "r_squared_threshold")}
-        if not phase_args.get("minutes_per_frame"):
-            raise ValueError("Minutes per frame is required.")
+        if not phase_args.get("minutes_per_frame"): raise ValueError("Minutes per frame is required.")
         
         _, discovered_period, _ = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
         self.discovered_period_edit.setText(f"{discovered_period:.2f}")
 
         if "FFT" in method:
             phases, period, snr_scores = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
-            # For FFT, sort and filter scores are the same
             return phases, period, snr_scores, snr_scores, True
         elif "Cosinor" in method:
             traces = self.state.loaded_data["traces"]
-            time_points = traces[:, 0] * (phase_args["minutes_per_frame"] / 60.0)
-            
+            time_points_hours = traces[:, 0] * (phase_args["minutes_per_frame"] / 60.0)
             phases, p_values, r_squareds = [], [], []
             for i in range(1, traces.shape[1]):
                 intensity = traces[:, i]
-                result = csn.cosinor_analysis(intensity, time_points, period=discovered_period)
+                result = csn.cosinor_analysis(intensity, time_points_hours, period=discovered_period)
                 phases.append(result['acrophase'])
                 p_values.append(result['p_value'])
                 r_squareds.append(result['r_squared'])
-
-            # For Cosinor, sort by R-squared, filter by p-value
             return np.array(phases), discovered_period, np.array(r_squareds), np.array(p_values), True
-        
         return None, None, None, None, True
 
     @QtCore.pyqtSlot(int)
@@ -2317,71 +2223,81 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def regenerate_phase_maps(self):
         if not self.state.loaded_data or "traces" not in self.state.loaded_data:
-            if self.emphasize_rhythm_check.isChecked():
-                self.log_message("Load data before enabling rhythm emphasis.")
+            if self.emphasize_rhythm_check.isChecked(): self.log_message("Load data before enabling rhythm emphasis.")
             return
-
         self.log_message("Updating plots based on phase parameters...")
         for tab in (self.phase_tab, self.interp_tab): clear_layout(tab.layout())
         try:
             phases, period, sort_scores, filter_scores, sort_desc = self._calculate_rhythms()
-            if phases is None:
-                raise ValueError("Rhythm calculation failed.")
-
+            if phases is None: raise ValueError("Rhythm calculation failed.")
             method = self.analysis_method_combo.currentText()
-            p_thresh = float(self.phase_params["rhythm_threshold"][0].text())
-            
+            thresh = float(self.phase_params["rhythm_threshold"][0].text())
             if "Cosinor" in method:
                 r_thresh = float(self.phase_params["r_squared_threshold"][0].text())
-                # Two-factor filtering for Cosinor
-                rhythm_mask = (filter_scores <= p_thresh) & (sort_scores >= r_thresh)
-                self.log_message(f"Applying Cosinor filter: p <= {p_thresh} AND R² >= {r_thresh}")
-            else: # FFT
-                # Single-factor filtering for FFT
-                rhythm_mask = filter_scores >= p_thresh
-                self.log_message(f"Applying FFT filter: SNR >= {p_thresh}")
-
+                rhythm_mask = (filter_scores <= thresh) & (sort_scores >= r_thresh)
+                self.log_message(f"Applying Cosinor filter: p <= {thresh} AND R² >= {r_thresh}")
+            else:
+                rhythm_mask = filter_scores >= thresh
+                self.log_message(f"Applying FFT filter: SNR >= {thresh}")
             is_emphasized = self.emphasize_rhythm_check.isChecked()
-
             heatmap_viewer = self.visualization_widgets.get(self.heatmap_tab)
             if heatmap_viewer:
                 heatmap_viewer.update_phase_data(phases, sort_scores, rhythm_mask, sort_desc)
                 heatmap_viewer.update_rhythm_emphasis(rhythm_mask, is_emphasized)
-            
             com_viewer = self.visualization_widgets.get(self.com_tab)
             if com_viewer:
                 com_viewer.update_rhythm_emphasis(rhythm_mask, is_emphasized)
-
             rhythmic_indices_relative = np.where(rhythm_mask)[0]
             self.log_message(f"{len(rhythmic_indices_relative)} cells pass rhythmicity threshold(s).")
-            
             if self.filtered_indices is not None:
                 rhythmic_indices_original = self.filtered_indices[rhythmic_indices_relative]
             else:
                 rhythmic_indices_original = rhythmic_indices_relative
+            if len(rhythmic_indices_relative) == 0:
+                for t in [self.phase_tab, self.interp_tab]:
+                    fig, canvas = add_mpl_to_tab(t)
+                    ax = fig.add_subplot(111)
+                    ax.text(0.5, 0.5, "No cells passed the rhythmicity filter.", ha='center', va='center')
+                    canvas.draw()
+                self.log_message("No cells passed rhythmicity filter.")
+                # Create an empty dataframe for the viewer to avoid crashing on export
+                empty_df = pd.DataFrame()
+                viewer_p = PhaseMapViewer(fig_p, fig_p.add_subplot(111), self.state.unfiltered_data["background"], empty_df, None, vmin=self.vmin, vmax=self.vmax)
+                self.visualization_widgets[self.phase_tab] = viewer_p
+                return
 
-            roi = self.state.loaded_data["roi"][rhythmic_indices_relative]
-            ph = phases[rhythmic_indices_relative]
-            if len(ph) == 0: raise ValueError("No cells passed rhythmicity filter.")
-            
-            ph_rad = (ph % period) * (2 * np.pi / period)
+            ph_rad = (phases[rhythmic_indices_relative] % period) * (2 * np.pi / period)
             mean_rad = circmean(ph_rad)
             mean_h = mean_rad * (period / (2 * np.pi))
-            rel = (ph - mean_h + period / 2) % period - period / 2
+            rel_phases = (phases[rhythmic_indices_relative] - mean_h + period / 2) % period - period / 2
+            
+            # --- DataFrame Creation with Dynamic Column Names ---
+            df_data = {
+                'Original_ROI_Index': rhythmic_indices_original + 1,
+                'X_Position': self.state.loaded_data['roi'][rhythmic_indices_relative, 0],
+                'Y_Position': self.state.loaded_data['roi'][rhythmic_indices_relative, 1],
+                'Phase_Hours': phases[rhythmic_indices_relative],
+                'Relative_Phase_Hours': rel_phases,
+                'Period_Hours': period
+            }
+            if "Cosinor" in method:
+                df_data['R_Squared'] = sort_scores[rhythmic_indices_relative]
+                df_data['P_Value'] = filter_scores[rhythmic_indices_relative]
+            else: # FFT
+                df_data['SNR'] = sort_scores[rhythmic_indices_relative]
+            
+            rhythmic_df = pd.DataFrame(df_data)
             
             def phase_map_callback(selected_phase_index):
-                original_index = rhythmic_indices_original[selected_phase_index]
+                original_index = rhythmic_df['Original_ROI_Index'].iloc[selected_phase_index] - 1
                 self.on_roi_selected(original_index)
-
             fig_p, _ = add_mpl_to_tab(self.phase_tab)
-            viewer_p = PhaseMapViewer(fig_p, fig_p.add_subplot(111), self.state.unfiltered_data["background"], roi, rel, period, phase_map_callback, vmin=self.vmin, vmax=self.vmax)
+            viewer_p = PhaseMapViewer(fig_p, fig_p.add_subplot(111), self.state.unfiltered_data["background"], rhythmic_df, phase_map_callback, vmin=self.vmin, vmax=self.vmax)
             self.visualization_widgets[self.phase_tab] = viewer_p
-            
             grid_res = int(self.phase_params["grid_resolution"][0].text())
             fig_i, _ = add_mpl_to_tab(self.interp_tab)
-            viewer_i = InterpolatedMapViewer(fig_i, fig_i.add_subplot(111), roi, rel, period, grid_res, rois=self.rois)
+            viewer_i = InterpolatedMapViewer(fig_i, fig_i.add_subplot(111), rhythmic_df[['X_Position', 'Y_Position']].values, rhythmic_df['Relative_Phase_Hours'].values, period, grid_res, rois=self.rois)
             self.visualization_widgets[self.interp_tab] = viewer_i
-            
             self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.phase_tab), True)
             self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.interp_tab), True)
             self.btn_regen_phase.setEnabled(True)
@@ -2389,7 +2305,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.log_message(f"Could not update plots: {e}")
             self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.phase_tab), False)
-            self.vis_tabs.indexOf(self.interp_tab), False
+            self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.interp_tab), False)
 
     # ------------ Registration panel actions ------------
 
@@ -2565,92 +2481,81 @@ class MainWindow(QtWidgets.QMainWindow):
                 if key in self.phase_params:
                     widget, type_caster = self.phase_params[key]
                     value_str = widget.text().strip()
-                    if value_str:
-                        phase_args[key] = type_caster(value_str)
-
-            if "minutes_per_frame" not in phase_args:
-                raise ValueError("Minutes per Frame must be set for group analysis.")
+                    if value_str: phase_args[key] = type_caster(value_str)
+            if "minutes_per_frame" not in phase_args: raise ValueError("Minutes per Frame must be set for group analysis.")
             
-            all_rois, all_rel = [], []
+            all_dfs = []
             for i, roi_file in enumerate(self.state.group_data_paths):
                 self.log_message(f"  [{i + 1}/{len(self.state.group_data_paths)}] {os.path.basename(roi_file)}")
-                
                 traces_file = roi_file.replace("_roi_warped.csv", "_traces.csv")
                 unfiltered_roi_file = roi_file.replace("_roi_warped.csv", "_roi.csv")
                 filtered_roi_file = roi_file.replace("_roi_warped.csv", "_roi_filtered.csv")
-                
                 required_files = [traces_file, unfiltered_roi_file, filtered_roi_file, roi_file]
                 if not all(os.path.exists(f) for f in required_files):
                     self.log_message("    Warning: missing one or more required files; skipping.")
                     continue
-
-                # --- New Safety Check for Data Consistency ---
-                warped_rois = np.loadtxt(roi_file, delimiter=",")
-                filtered_rois = np.loadtxt(filtered_roi_file, delimiter=",")
-                
-                # Ensure both files have a shape, even if empty
-                num_warped = warped_rois.shape[0] if warped_rois.ndim > 1 else (1 if warped_rois.size > 0 else 0)
-                num_filtered = filtered_rois.shape[0] if filtered_rois.ndim > 1 else (1 if filtered_rois.size > 0 else 0)
-
-                if num_warped != num_filtered:
-                    self.log_message(
-                        f"    ERROR: Data inconsistency detected for {os.path.basename(roi_file)}.\n"
-                        f"    '{os.path.basename(roi_file)}' has {num_warped} cells, but\n"
-                        f"    '{os.path.basename(filtered_roi_file)}' has {num_filtered} cells.\n"
-                        f"    This animal will be SKIPPED. Please re-run the 'Apply Warp' step for this dataset."
-                    )
+                warped_rois = np.atleast_2d(np.loadtxt(roi_file, delimiter=","))
+                filtered_rois = np.atleast_2d(np.loadtxt(filtered_roi_file, delimiter=","))
+                if warped_rois.shape[0] != filtered_rois.shape[0]:
+                    self.log_message(f"    ERROR: Data inconsistency detected. Warped file has {warped_rois.shape[0]} cells, but filtered file has {filtered_rois.shape[0]}. Skipping.")
                     continue
-                # --- End Safety Check ---
-
                 traces = np.loadtxt(traces_file, delimiter=",")
                 unfiltered_rois = np.loadtxt(unfiltered_roi_file, delimiter=",")
-                
                 indices = []
-                for point in filtered_rois.reshape(-1, 2): # Reshape to handle single-row case
+                for point in filtered_rois:
                     diff = np.sum((unfiltered_rois - point)**2, axis=1)
                     idx = np.argmin(diff)
                     if diff[idx] < 1e-9: indices.append(idx)
-                
-                if len(indices) != num_filtered:
+                if len(indices) != filtered_rois.shape[0]:
                     self.log_message("    Warning: Could not match filtered to unfiltered ROIs; skipping.")
                     continue
-                    
                 trace_indices_to_keep = np.array(indices) + 1
                 filtered_traces_data = traces[:, np.concatenate(([0], trace_indices_to_keep))]
-                
                 phases, period, _ = calculate_phases_fft(filtered_traces_data, **phase_args)
-                
-                phases_rad = (phases % period) * (2 * np.pi / period)
-                mean_rad = circmean(phases_rad)
+                ph_rad = (phases % period) * (2 * np.pi / period)
+                mean_rad = circmean(ph_rad)
                 mean_h = mean_rad * (period / (2 * np.pi))
-                rel = (phases - mean_h + period / 2) % period - period / 2
-                all_rois.append(warped_rois)
-                all_rel.append(rel)
+                rel_phases = (phases - mean_h + period / 2) % period - period / 2
+                animal_df = pd.DataFrame({
+                    'Source_Animal': os.path.basename(roi_file).replace('_roi_warped.csv', ''),
+                    'Warped_X': warped_rois[:, 0],
+                    'Warped_Y': warped_rois[:, 1],
+                    'Relative_Phase_Hours': rel_phases,
+                    'Period_Hours': period
+                })
+                all_dfs.append(animal_df)
             
-            if not all_rois: raise ValueError("No valid and consistent group data was loaded.")
+            if not all_dfs: raise ValueError("No valid and consistent group data was loaded.")
             
-            pooled_rois = np.vstack(all_rois)
-            pooled_rel = np.concatenate(all_rel)
-            
-            if len(pooled_rois) != len(pooled_rel): 
-                raise RuntimeError(f"Internal error after processing: {len(pooled_rois)} ROIs, {len(pooled_rel)} phases.")
-            
+            group_scatter_df = pd.concat(all_dfs, ignore_index=True)
+            period = group_scatter_df['Period_Hours'].iloc[0]
             grid_res = int(self.group_grid_res_edit.text())
             do_smooth = self.group_smooth_check.isChecked()
+            x_min, x_max = group_scatter_df['Warped_X'].min(), group_scatter_df['Warped_X'].max()
+            y_min, y_max = group_scatter_df['Warped_Y'].min(), group_scatter_df['Warped_Y'].max()
+            grid_x_bins = np.linspace(x_min, x_max, grid_res + 1)
+            grid_y_bins = np.linspace(y_min, y_max, grid_res + 1)
+            group_scatter_df['Grid_X_Index'] = pd.cut(group_scatter_df['Warped_X'], bins=grid_x_bins, labels=False, include_lowest=True).fillna(-1).astype(int)
+            group_scatter_df['Grid_Y_Index'] = pd.cut(group_scatter_df['Warped_Y'], bins=grid_y_bins, labels=False, include_lowest=True).fillna(-1).astype(int)
+
+            def circmean_phase(series):
+                rad = (series / (period / 2.0)) * np.pi
+                mean_rad = circmean(rad)
+                return (mean_rad / np.pi) * (period / 2.0)
+            group_binned_df = group_scatter_df[group_scatter_df['Grid_X_Index'] >= 0].groupby(['Grid_X_Index', 'Grid_Y_Index'])['Relative_Phase_Hours'].apply(circmean_phase).reset_index()
             
             fig_s, _ = add_mpl_to_tab(self.group_scatter_tab)
-            viewer_s = GroupScatterViewer(fig_s, fig_s.add_subplot(111), pooled_rois, pooled_rel, period)
+            viewer_s = GroupScatterViewer(fig_s, fig_s.add_subplot(111), group_scatter_df)
             self.visualization_widgets[self.group_scatter_tab] = viewer_s
-            
             fig_g, _ = add_mpl_to_tab(self.group_avg_tab)
-            viewer_g = GroupAverageMapViewer(fig_g, fig_g.add_subplot(111), pooled_rois, pooled_rel, period, grid_res, do_smooth)
+            viewer_g = GroupAverageMapViewer(fig_g, fig_g.add_subplot(111), group_binned_df, group_scatter_df, grid_res, do_smooth)
             self.visualization_widgets[self.group_avg_tab] = viewer_g
-            
             for tab in group_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), True)
             for tab in single_animal_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), False)
             self.vis_tabs.setCurrentWidget(self.group_scatter_tab)
             self._mark_step_ready("group_view")
             self.log_message("Group visualizations generated.")
+            self.btn_export_data.setEnabled(True)
         except Exception as e:
             import traceback
             self.log_message(f"Error generating group visualizations: {e}")
