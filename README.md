@@ -4,7 +4,12 @@
 
 This suite of tools provides a complete, end-to-end pipeline for the analysis of cellular bioluminescence or fluorescence imaging data, specifically tailored for studying circadian rhythms in neuronal ensembles like the Suprachiasmatic Nucleus (SCN).
 
-The entire workflow, from loading a raw movie file to exploring the final, interactive phase map, is handled within a single, user-friendly graphical application. A command-line version is also provided for power users and for automating batch processing.
+The application supports a comprehensive workflow within a single, user-friendly graphical interface:
+1.  **Single-Animal Analysis:** Process a raw movie (`.tif`) to detect and track individual cells, extract their intensity traces, and generate interactive visualizations (heatmaps, phase maps, etc.).
+2.  **Atlas Registration:** A landmark-based warping tool to register multiple individual animal datasets into a common, standardized atlas space.
+3.  **Group-Level Analysis:** Pool data from multiple warped datasets to generate group-level visualizations, such as a group phase distribution scatter plot and a group average phase map.
+
+The application features a powerful, interactive visualization environment, allowing users to click on any cell in a spatial plot to instantly view its detailed trajectory and intensity trace over time.
 
 ---
 
@@ -15,83 +20,81 @@ This project requires Python 3. The necessary external libraries can be installe
 1.  Open a terminal or command prompt.
 2.  Navigate to the directory containing the project files.
 3.  Run the following command:
+    ```    pip install -r requirements.txt
     ```
-    pip install -r requirements.txt
-    ```
+    *Note: The Cosinor analysis feature depends on `scipy`, which is included in the requirements file.*
 
 ---
 
-## Workflow & Usage
+## Core Workflows
 
-The primary workflow is a simple two-step process: first, you run the analysis to process a movie file, and second, you explore the results.
+The application is organized around three primary scientific workflows, which can be selected from the "Active Panel" on the left-hand side of the main window.
 
-### Step 1: Run Analysis
+### Workflow A: Single-Animal Analysis
 
-You must first process your raw movie file (`.tif`) to generate the data files. You can use either the GUI for ease of use or the CLI for automation.
-
-#### Option A: Using the Graphical Application (Recommended)
-
-This is the main, all-in-one tool for analysis and visualization.
+This is the foundational workflow for processing a single movie and exploring its results.
 
 1.  **Launch the Application:**
     ```
     python neuron_analysis_app.py
     ```
-    This will open the main workspace window.
+2.  **Load a Movie:** In the "Single Animal" panel, click **"Load Movie..."** and select your raw `.tif` file.
+3.  **Run Analysis:** Click **"Run Full Analysis"**. This will detect, track, and extract data for all cells, which may take several minutes.
+4.  **Load Results:** Once the analysis is complete, click **"Load Existing Results"**. This will populate all the interactive visualization tabs on the right.
 
-2.  **Load a Movie:**
-    *   Click the **"Load Movie..."** button in the top-left "File I/O" panel.
-    *   Select your raw movie file (e.g., `.tif`).
-    *   The application will automatically suggest an output file basename.
+### Workflow B: Atlas Registration & Warping
 
-3.  **Run the Analysis:**
-    *   (Optional) Adjust any analysis or phase map parameters in the "Control Panel". Hover your mouse over any parameter's label to see a detailed tooltip explaining its function.
-    *   Click the large **"Run Full Analysis"** button.
-    *   Monitor the progress in the log at the bottom. The analysis may take several minutes.
+This workflow is for aligning multiple datasets to a common atlas. This requires that you have already run the single-animal analysis on each animal and used the **"Define Anatomical ROI..."** tool to create an `_anatomical_roi.json` file for each.
 
-#### Option B: Using the Command-Line Interface (CLI)
+1.  Switch to the **"Atlas Registration"** panel.
+2.  Select your master atlas file (which is itself an `_anatomical_roi.json` file).
+3.  Add one or more target `_anatomical_roi.json` files from your individual animals.
+4.  Click **"Begin Registration..."** to launch the landmark-placement tool. For each target, place 3+ corresponding landmarks on the atlas and the target to calculate the warp.
 
-This is ideal for batch processing multiple files.
+### Workflow C: Group-Level Analysis
 
-1.  **Run the analysis with default parameters:**
-    ```
-    python run_tracker_cli.py path/to/your_movie.tif
-    ```
-2.  **To see all tunable parameters and their descriptions, run:**
-    ```
-    python run_tracker_cli.py --help
-    ```
+This workflow is for visualizing data from multiple animals that have already been warped to the atlas space.
 
-**Output Files from Analysis:**
-Running the analysis will produce three files, which are the inputs for the visualization step:
-*   `your_movie_traces.csv`: A CSV file where the first column is time and subsequent columns are the intensity traces for each detected cell.
-*   `your_movie_roi.csv`: A CSV file with the average X,Y coordinates (center of mass) for each cell.
-*   `your_movie_trajectories.npy`: A NumPy binary file containing the full X,Y coordinates for every cell at every frame.
+1.  Switch to the **"Group Data Viewer"** panel.
+2.  Click **"Add Warped ROI File(s)..."** and select all the `_roi_warped.csv` files you want to include in the group.
+3.  Click **"Generate Group Visualizations"**. This will populate the "Group Scatter" and "Group Average Map" tabs.
 
 ---
 
-### Step 2: Explore and Visualize Results
+## Guide to Interactive Visualizations
 
-After the analysis is complete, you can explore the results at any time using the same graphical application.
+The power of this tool lies in its interconnected visualization tabs.
 
-1.  **Launch the Application:**
-    ```
-    python neuron_analysis_app.py
-    ```
-2.  **Load the Movie:**
-    *   Click the **"Load Movie..."** button and select the *original movie file* that you analyzed.
-    *   The application will detect that results for this movie already exist.
+### Interactive Selection
 
-3.  **Load the Results:**
-    *   The **"Load Existing Results"** button will become active. Click it.
-    *   The saved data files will be loaded instantly.
+*   **Click-to-Select:** In the **"Center of Mass"** or **"Phase Map"** tabs, you can click directly on any cell's dot.
+*   **View Trajectory:** The application will automatically switch to the **"Trajectory Inspector"** tab and display the full trajectory of the selected cell.
+*   **View Intensity Trace:** The application will also update the line plot at the bottom of the **"Heatmap"** tab to show the raw intensity trace for the selected cell.
+*   **Cross-Plot Highlighting:** The selected cell will be highlighted with a circle on all relevant plots so you never lose context.
 
-4.  **Explore the Interactive Plots:**
-    *   The **"Visualization"** panel on the right will become active, populated with four tabs:
-        1.  **Heatmap:** A raster plot of all cell traces, with radio buttons to sort the cells spatially.
-        2.  **Center of Mass:** The location of each cell overlaid on the background image, with sliders to adjust image contrast.
-        3.  **Trajectory Inspector:** A viewer that lets you step through the movement path of every single cell.
-        4.  **Phase Map:** The final spatiotemporal phase map, with a slider to adjust the color range of the relative peak times.
+### Trajectory Inspector with Frame Scrubbing
+
+The **"Trajectory Inspector"** is a powerful validation tool.
+*   Use the **"Previous" / "Next"** buttons to step through different cells.
+*   Use the **"Frame" slider** at the bottom to scrub through the movie frame by frame. The background image will update, and a prominent marker will show the cell's exact position at that moment in time, allowing you to visually confirm the tracking accuracy.
+
+### Advanced Heatmap Features
+
+The **"Heatmap"** tab is a central analysis tool.
+*   **Sorting:** The radio buttons allow you to sort the heatmap by scientifically relevant criteria:
+    *   **Y-coordinate:** Sorts cells spatially from top to bottom.
+    *   **Phase:** Sorts cells by their calculated peak time, making temporal patterns (like waves) easy to see.
+    *   **Rhythmicity:** Sorts cells by the quality of their rhythm (either SNR or R-squared). This brings the "best" cells to the top.
+*   **Rhythm Emphasis:** In the "Phase Map Parameters" panel, check **"Emphasize rhythmic cells"**. This will visually de-emphasize non-rhythmic cells in both the "Center of Mass" plot (making them gray) and the "Heatmap" (covering them with a semi-transparent gray mask), allowing you to focus on the data of interest without losing context.
+
+### Choice of Analysis Method
+
+In the "Phase Map Parameters" panel, you can choose your rhythm analysis engine from the **"Analysis Method"** dropdown.
+
+*   **FFT (SNR):** This model-free method is excellent for discovering rhythms and analyzing non-sinusoidal data. The "rhythmicity score" is a signal-to-noise ratio, where a value > 2.0 is a good starting point for a confident rhythm.
+*   **Cosinor (p-value):** This model-based method is statistically rigorous and provides standard circadian parameters. It uses a two-factor threshold:
+    *   **p-value:** The statistical significance of the rhythm's existence (e.g., `<= 0.05`).
+    *   **R-squared:** The "goodness of fit," or how much of the data's variance is explained by the cosine model (e.g., `>= 0.3`).
 
 ---
 
