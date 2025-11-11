@@ -46,6 +46,28 @@ from PyQt5 import QtCore, QtWidgets
 
 import neuron_tracker_core as ntc
 
+# ------------------------------------------------------------
+# Centralized State Management
+# ------------------------------------------------------------
+class AnalysisState:
+    """A simple class to hold all application state."""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        # File paths
+        self.input_movie_path = ""
+        self.output_basename = ""
+        self.atlas_roi_path = ""
+        
+        # Lists for workflow panels
+        self.target_roi_paths = []
+        self.warp_param_paths = []
+        self.group_data_paths = []
+        
+        # In-memory data
+        self.unfiltered_data = {}
+        self.loaded_data = {}
 
 # ------------------------------------------------------------
 # Helpers
@@ -276,13 +298,15 @@ class RegistrationWindow(QtWidgets.QDialog):
     Writes *_warp_parameters.json exactly as original.
     """
 
-    def __init__(self, parent, atlas_path, target_paths, log_callback):
+    def __init__(self, parent, state, log_callback):
         super().__init__(parent)
         self.setWindowTitle("Atlas Registration Tool")
         self.resize(1200, 700)
 
-        self.atlas_path = atlas_path
-        self.target_paths = list(target_paths)
+        self.state = state
+        self.atlas_path = self.state.atlas_roi_path
+        # Make a copy so we can pop items without affecting the main state
+        self.target_paths = list(self.state.target_roi_paths)
         self.log_callback = log_callback
 
         with open(self.atlas_path, "r") as f:
@@ -379,80 +403,47 @@ class RegistrationWindow(QtWidgets.QDialog):
     def update_plots(self, preview_shapes=None, warp_vectors=None):
         self.ax_atlas.clear()
         self.ax_target.clear()
-
         self.ax_atlas.set_title("Atlas SCN")
         self.ax_target.set_title("Target SCN")
-
-        # Draw ROIs
         for roi in self.atlas_rois:
             xs, ys = zip(*roi["path_vertices"])
             self.ax_atlas.plot(xs, ys, color="black")
-
         for roi in getattr(self, "target_rois", []):
             xs, ys = zip(*roi["path_vertices"])
             self.ax_target.plot(xs, ys, color="black")
-
-        # Landmarks
         for i, (x, y) in enumerate(self.source_landmarks):
-            self.ax_atlas.text(
-                x, y, str(i + 1),
-                color="red", ha="center", va="center", weight="bold"
-            )
+            self.ax_atlas.text(x, y, str(i + 1), color="red", ha="center", va="center", weight="bold")
         for i, (x, y) in enumerate(self.dest_landmarks):
-            self.ax_target.text(
-                x, y, str(i + 1),
-                color="red", ha="center", va="center", weight="bold"
-            )
-
+            self.ax_target.text(x, y, str(i + 1), color="red", ha="center", va="center", weight="bold")
         if preview_shapes:
             for shape in preview_shapes:
                 xs, ys = shape[:, 0], shape[:, 1]
                 self.ax_atlas.plot(xs, ys, color="cyan", linestyle="--")
-
         if warp_vectors:
             ox, oy, dx, dy = warp_vectors
-            self.ax_target.quiver(
-                ox, oy, dx, dy,
-                color="cyan", angles="xy", scale_units="xy", scale=1
-            )
-
-        # Apply common settings and let Matplotlib autoscale each plot individually first
+            self.ax_target.quiver(ox, oy, dx, dy, color="cyan", angles="xy", scale_units="xy", scale=1)
         for ax in (self.ax_atlas, self.ax_target):
             ax.set_aspect("equal", adjustable="box")
             ax.invert_yaxis()
             ax.autoscale_view()
-
-        # --- Synchronize Coordinate Systems ---
-        # Get the initial, independently-scaled limits from both axes
         l1, r1 = self.ax_atlas.get_xlim()
         b1, t1 = self.ax_atlas.get_ylim()
         l2, r2 = self.ax_target.get_xlim()
         b2, t2 = self.ax_target.get_ylim()
-
-        # Calculate a new, global set of limits that encompasses both plots
-        # Note: For an inverted y-axis, the "bottom" value is numerically larger than the "top"
-        final_l = min(l1, l2)
-        final_r = max(r1, r2)
-        final_b = max(b1, b2)
-        final_t = min(t1, t2)
-
-        # Apply the same, synchronized limits to both axes
+        final_l, final_r = min(l1, l2), max(r1, r2)
+        final_b, final_t = max(b1, b2), min(t1, t2)
         self.ax_atlas.set_xlim(final_l, final_r)
         self.ax_atlas.set_ylim(final_b, final_t)
         self.ax_target.set_xlim(final_l, final_r)
         self.ax_target.set_ylim(final_b, final_t)
-
         self.canvas.draw_idle()
 
     def calculate_warp(self):
-        if len(self.source_landmarks) < 3 or \
-           len(self.source_landmarks) != len(self.dest_landmarks):
+        if len(self.source_landmarks) < 3 or len(self.source_landmarks) != len(self.dest_landmarks):
             self.log_callback("Error: Need ≥3 matched landmark pairs.")
             return
-
         source_pts = np.array(self.source_landmarks)
         dest_pts = np.array(self.dest_landmarks)
-
         sc = source_pts.mean(axis=0)
         dc = dest_pts.mean(axis=0)
         ssd = np.sqrt(np.mean(np.sum((source_pts - sc) ** 2, axis=1)))
@@ -460,27 +451,17 @@ class RegistrationWindow(QtWidgets.QDialog):
         if ssd == 0 or dsd == 0:
             self.log_callback("Error: Degenerate landmark configuration.")
             return
-
         source_norm = (source_pts - sc) / ssd
         dest_norm = (dest_pts - dc) / dsd
-
-        # TPS: dest_norm -> source_norm
         from skimage.transform import ThinPlateSplineTransform
         tps = ThinPlateSplineTransform()
         tps.estimate(dest_norm, source_norm)
-
         self.warp_params = {
-            "source_centroid": sc.tolist(),
-            "dest_centroid": dc.tolist(),
-            "source_scale": float(ssd),
-            "dest_scale": float(dsd),
-            "source_landmarks_norm": source_norm.tolist(),
-            "dest_landmarks_norm": dest_norm.tolist(),
-            "source_landmarks": self.source_landmarks,
-            "destination_landmarks": self.dest_landmarks,
+            "source_centroid": sc.tolist(), "dest_centroid": dc.tolist(),
+            "source_scale": float(ssd), "dest_scale": float(dsd),
+            "source_landmarks_norm": source_norm.tolist(), "dest_landmarks_norm": dest_norm.tolist(),
+            "source_landmarks": self.source_landmarks, "destination_landmarks": self.dest_landmarks,
         }
-
-        # Preview warped target ROIs in atlas space
         preview = []
         for roi in self.target_rois:
             verts = np.array(roi["path_vertices"])
@@ -488,13 +469,9 @@ class RegistrationWindow(QtWidgets.QDialog):
             warped_norm = tps(verts_norm)
             warped = warped_norm * ssd + sc
             preview.append(warped)
-
-        # Corrected vector calculation: The vector should point FROM the target
-        # landmark TO the corresponding atlas landmark.
         dx = source_pts[:, 0] - dest_pts[:, 0]
         dy = source_pts[:, 1] - dest_pts[:, 1]
         warp_vectors = (dest_pts[:, 0], dest_pts[:, 1], dx, dy)
-
         self.update_plots(preview_shapes=preview, warp_vectors=warp_vectors)
         self.save_btn.setEnabled(True)
         self.log_callback("Warp computed; review preview and click 'Save Warp & Next'.")
@@ -503,21 +480,14 @@ class RegistrationWindow(QtWidgets.QDialog):
         if not self.warp_params:
             self.log_callback("Error: compute warp before saving.")
             return
-
-        out_path = self.current_target_path.replace(
-            "_anatomical_roi.json",
-            "_warp_parameters.json",
-        )
+        out_path = self.current_target_path.replace("_anatomical_roi.json", "_warp_parameters.json")
         try:
             with open(out_path, "w") as f:
                 json.dump(self.warp_params, f, indent=4)
-            self.log_callback(
-                f"Saved warp parameters: {os.path.basename(out_path)}"
-            )
+            self.log_callback(f"Saved warp parameters: {os.path.basename(out_path)}")
         except Exception as e:
             self.log_callback(f"Error saving warp file: {e}")
             return
-
         self.load_next_target()
 
 
@@ -546,139 +516,65 @@ class WarpInspectorWindow(QtWidgets.QDialog):
         self.original_points_norm = original_points_norm
         self.warped_points_norm = warped_points_norm
         self.warp_params = warp_params
-
         self.overlay_visible = False
         self.overlay_artists = []
-
         main_layout = QtWidgets.QVBoxLayout(self)
-
         self.fig = Figure(figsize=(12, 6))
         self.ax_before = self.fig.add_subplot(1, 2, 1)
         self.ax_after = self.fig.add_subplot(1, 2, 2)
-
         self.canvas = FigureCanvas(self.fig)
         toolbar = NavigationToolbar(self.canvas, self)
-
         main_layout.addWidget(toolbar)
         main_layout.addWidget(self.canvas)
-
         btn_layout = QtWidgets.QHBoxLayout()
-        self.overlay_btn = QtWidgets.QCheckBox(
-            "Show Normalized Original Data as Overlay"
-        )
+        self.overlay_btn = QtWidgets.QCheckBox("Show Normalized Original Data as Overlay")
         self.overlay_btn.stateChanged.connect(self.toggle_overlay)
         btn_layout.addWidget(self.overlay_btn)
-
         close_btn = QtWidgets.QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         btn_layout.addWidget(close_btn)
-
         main_layout.addLayout(btn_layout)
-
         self.draw_plots()
 
     def draw_plots(self):
-        # Before: This plot remains in its native image coordinate system.
         self.ax_before.clear()
         self.ax_before.set_title("Before Warp: Original Target")
-        with open(self.target_roi_path, "r") as f:
-            trois = json.load(f)
+        with open(self.target_roi_path, "r") as f: trois = json.load(f)
         for roi in trois:
             xs, ys = zip(*roi["path_vertices"])
             self.ax_before.plot(xs, ys, color="black", linewidth=2)
-
-        self.ax_before.scatter(
-            self.original_points[:, 0],
-            self.original_points[:, 1],
-            s=10, alpha=0.7, c="blue"
-        )
+        self.ax_before.scatter(self.original_points[:, 0], self.original_points[:, 1], s=10, alpha=0.7, c="blue")
         self.ax_before.set_aspect("equal", adjustable="box")
         self.ax_before.invert_yaxis()
-
-        # After: Both datasets are in a consistent image coordinate system.
         self.ax_after.clear()
         self.ax_after.set_title("After Warp: Normalized Atlas Space")
         sc = np.array(self.warp_params["source_centroid"])
         ss = self.warp_params["source_scale"]
-        with open(self.atlas_roi_path, "r") as f:
-            arois = json.load(f)
+        with open(self.atlas_roi_path, "r") as f: arois = json.load(f)
         for roi in arois:
             verts = (np.array(roi["path_vertices"]) - sc) / ss
             self.ax_after.plot(verts[:, 0], verts[:, 1], color="black", linewidth=2)
-
-        # Plot the warped points directly without Y-negation.
-        # Both the outline and the points are now in the same coordinate system.
-        self.ax_after.scatter(
-            self.warped_points_norm[:, 0],
-            self.warped_points_norm[:, 1],
-            s=10, alpha=0.7, c="red"
-        )
+        self.ax_after.scatter(self.warped_points_norm[:, 0], self.warped_points_norm[:, 1], s=10, alpha=0.7, c="red")
         self.ax_after.set_aspect("equal", adjustable="box")
         self.ax_after.invert_yaxis()
-
         self.toggle_overlay()
         self.canvas.draw_idle()
 
     def toggle_overlay(self):
-        for a in self.overlay_artists:
-            a.remove()
+        for a in self.overlay_artists: a.remove()
         self.overlay_artists.clear()
-
         if self.overlay_btn.isChecked():
             dc = np.array(self.warp_params["dest_centroid"])
             ds = self.warp_params["dest_scale"]
-            with open(self.target_roi_path, "r") as f:
-                trois = json.load(f)
+            with open(self.target_roi_path, "r") as f: trois = json.load(f)
             for roi in trois:
                 verts_norm = (np.array(roi["path_vertices"]) - dc) / ds
-                line = self.ax_after.plot(
-                    verts_norm[:, 0],
-                    verts_norm[:, 1],
-                    color="blue", linestyle="--", linewidth=1, alpha=0.5
-                )[0]
+                line = self.ax_after.plot(verts_norm[:, 0], verts_norm[:, 1], color="blue", linestyle="--", linewidth=1, alpha=0.5)[0]
                 self.overlay_artists.append(line)
-
-            scatter = self.ax_after.scatter(
-                self.original_points_norm[:, 0],
-                self.original_points_norm[:, 1],
-                s=10, alpha=0.3, c="blue", marker="x"
-            )
+            scatter = self.ax_after.scatter(self.original_points_norm[:, 0], self.original_points_norm[:, 1], s=10, alpha=0.3, c="blue", marker="x")
             self.overlay_artists.append(scatter)
-
         self.ax_after.autoscale_view()
         self.canvas.draw_idle()
-
-    def toggle_overlay(self):
-        for a in self.overlay_artists:
-            a.remove()
-        self.overlay_artists.clear()
-
-        if self.overlay_btn.isChecked():
-            dc = np.array(self.warp_params["dest_centroid"])
-            ds = self.warp_params["dest_scale"]
-            with open(self.target_roi_path, "r") as f:
-                trois = json.load(f)
-            for roi in trois:
-                # Target ROI overlay is already in image-like coordinates.
-                verts_norm = (np.array(roi["path_vertices"]) - dc) / ds
-                line = self.ax_after.plot(
-                    verts_norm[:, 0],
-                    verts_norm[:, 1],
-                    color="blue", linestyle="--", linewidth=1, alpha=0.5
-                )[0]
-                self.overlay_artists.append(line)
-
-            # Original points overlay is already in image-like coordinates.
-            scatter = self.ax_after.scatter(
-                self.original_points_norm[:, 0],
-                self.original_points_norm[:, 1],
-                s=10, alpha=0.3, c="blue", marker="x"
-            )
-            self.overlay_artists.append(scatter)
-
-        self.ax_after.autoscale_view()
-        self.canvas.draw_idle()
-
 
 # ------------------------------------------------------------
 # Visualization Viewers
@@ -1359,10 +1255,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("Neuron Analysis Workspace (PyQt)")
         self.resize(1400, 900)
 
+        # Centralized state object
+        self.state = AnalysisState()
+
         self.params = {}
         self.phase_params = {}
-        self.unfiltered_data = {}
-        self.loaded_data = {}
         self.filtered_indices = None
         self.rois = None
         self.vmin = None
@@ -1388,35 +1285,23 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_ui(self):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-
         main_layout = QtWidgets.QVBoxLayout(central)
-
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         main_layout.addWidget(self.splitter, 1)
-
-        # Left: controls + log
         left_widget = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left_widget)
         self.splitter.addWidget(left_widget)
-
-        # Scroll area for controls
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         left_layout.addWidget(scroll, 3)
-
         self.ctrl_container = QtWidgets.QWidget()
         self.ctrl_layout = QtWidgets.QVBoxLayout(self.ctrl_container)
         scroll.setWidget(self.ctrl_container)
-
-        # Right: visualization tabs
         right_widget = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right_widget)
         self.splitter.addWidget(right_widget)
-
         self.vis_tabs = QtWidgets.QTabWidget()
         right_layout.addWidget(self.vis_tabs)
-
-        # Execution log
         log_group = QtWidgets.QGroupBox("Execution Log")
         log_layout = QtWidgets.QVBoxLayout(log_group)
         self.log_text = QtWidgets.QPlainTextEdit()
@@ -1425,38 +1310,18 @@ class MainWindow(QtWidgets.QMainWindow):
         log_layout.addWidget(self.log_text)
         log_layout.addWidget(self.progress_bar)
         left_layout.addWidget(log_group, 1)
-
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
-
-        # --- Corrected Initialization Order ---
-
-        # 1. Build the static "Workflow" section.
         self._build_workflow_section()
-
-        # 2. Create the QStackedWidget that will hold the different control panels.
         self.mode_stack = QtWidgets.QStackedWidget()
-
-        # 3. Build the "Active Panel" radio buttons. This will connect signals
-        #    that call _switch_mode, which requires self.mode_stack to exist.
         self._build_mode_section()
-
-        # 4. Add the mode_stack to the layout, below the radio buttons.
         self.ctrl_layout.addWidget(self.mode_stack)
-
-        # 5. Build and add the actual control panels to the mode_stack.
         self._build_mode_panels()
-
-        # 6. Build the visualization tabs on the right side of the splitter.
         self._build_vis_tabs()
-
-        # The call to .setChecked(True) inside _build_mode_section already
-        # handles the initial switch to the correct panel.
 
     def _build_workflow_section(self):
         box = QtWidgets.QGroupBox("Workflow")
         layout = QtWidgets.QVBoxLayout(box)
-
         self.step_labels = {}
         items = [
             ("single", "1. Single Animal Analysis"),
@@ -1469,16 +1334,13 @@ class MainWindow(QtWidgets.QMainWindow):
             lbl.setStyleSheet("color: #666666;")
             layout.addWidget(lbl)
             self.step_labels[key] = lbl
-
         self.ctrl_layout.addWidget(box)
 
     def _build_mode_section(self):
         box = QtWidgets.QGroupBox("Active Panel")
         layout = QtWidgets.QVBoxLayout(box)
-
         self.mode_buttons = {}
         self.mode_group = QtWidgets.QButtonGroup(self)
-
         def add_mode(key, label, enabled=True):
             btn = QtWidgets.QRadioButton(label)
             btn.setEnabled(enabled)
@@ -1488,57 +1350,40 @@ class MainWindow(QtWidgets.QMainWindow):
             btn.toggled.connect(
                 lambda checked, k=key: checked and self._switch_mode(k)
             )
-
         add_mode("single", "Single Animal", True)
         add_mode("register", "Atlas Registration", False)
         add_mode("apply_warp", "Apply Warp to Data", False)
-        # This is the change: The group viewer is now enabled by default.
         add_mode("group_view", "Group Data Viewer", True)
-
         self.mode_buttons["single"].setChecked(True)
         self.ctrl_layout.addWidget(box)
 
     def _build_mode_panels(self):
-        # Single-animal panel
         self.single_panel = QtWidgets.QWidget()
         self._build_single_panel(self.single_panel)
         self.mode_stack.addWidget(self.single_panel)
-
-        # Registration panel
         self.register_panel = QtWidgets.QWidget()
         self._build_register_panel(self.register_panel)
         self.mode_stack.addWidget(self.register_panel)
-
-        # Apply warp panel
         self.apply_panel = QtWidgets.QWidget()
         self._build_apply_panel(self.apply_panel)
         self.mode_stack.addWidget(self.apply_panel)
-
-        # Group view panel
         self.group_panel = QtWidgets.QWidget()
         self._build_group_panel(self.group_panel)
         self.mode_stack.addWidget(self.group_panel)
 
     def _build_single_panel(self, panel):
         layout = QtWidgets.QVBoxLayout(panel)
-
-        # File I/O
         io_box = QtWidgets.QGroupBox("File I/O")
         io_layout = QtWidgets.QGridLayout(io_box)
-
         self.btn_load_movie = QtWidgets.QPushButton("Load Movie...")
         io_layout.addWidget(self.btn_load_movie, 0, 0, 1, 2)
-
         io_layout.addWidget(QtWidgets.QLabel("Input File:"), 1, 0)
         self.input_file_edit = QtWidgets.QLineEdit()
         self.input_file_edit.setReadOnly(True)
         io_layout.addWidget(self.input_file_edit, 1, 1)
-
         io_layout.addWidget(QtWidgets.QLabel("Output Basename:"), 2, 0)
         self.output_base_edit = QtWidgets.QLineEdit()
         io_layout.addWidget(self.output_base_edit, 2, 1)
-
-        # Status labels
         self.status_traces_label = QtWidgets.QLabel("Traces: —")
         self.status_roi_label = QtWidgets.QLabel("ROI: —")
         self.status_traj_label = QtWidgets.QLabel("Trajectories: —")
@@ -1547,10 +1392,7 @@ class MainWindow(QtWidgets.QMainWindow):
         s_layout.addWidget(self.status_roi_label)
         s_layout.addWidget(self.status_traj_label)
         io_layout.addLayout(s_layout, 3, 0, 1, 2)
-
         layout.addWidget(io_box)
-
-        # ROI
         roi_box = QtWidgets.QGroupBox("Region of Interest (ROI)")
         roi_layout = QtWidgets.QHBoxLayout(roi_box)
         self.btn_define_roi = QtWidgets.QPushButton("Define Anatomical ROI...")
@@ -1560,22 +1402,16 @@ class MainWindow(QtWidgets.QMainWindow):
         roi_layout.addWidget(self.btn_define_roi)
         roi_layout.addWidget(self.btn_clear_roi)
         layout.addWidget(roi_box)
-
-        # Analysis params
         param_box = QtWidgets.QGroupBox("Analysis Parameters")
         param_layout = QtWidgets.QVBoxLayout(param_box)
-
         btn_row = QtWidgets.QHBoxLayout()
         self.btn_save_params = QtWidgets.QPushButton("Save Params...")
         self.btn_load_params = QtWidgets.QPushButton("Load Params...")
         btn_row.addWidget(self.btn_save_params)
         btn_row.addWidget(self.btn_load_params)
         param_layout.addLayout(btn_row)
-
         tabs = QtWidgets.QTabWidget()
         param_layout.addWidget(tabs)
-
-        # Detection params
         det_tab = QtWidgets.QWidget()
         det_layout = QtWidgets.QFormLayout(det_tab)
         self._add_param_field(det_layout, "sigma1", 3.0)
@@ -1583,16 +1419,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._add_param_field(det_layout, "blur_sigma", 2.0)
         self._add_param_field(det_layout, "max_features", 200)
         tabs.addTab(det_tab, "Detection")
-
-        # Tracking params
         tr_tab = QtWidgets.QWidget()
         tr_layout = QtWidgets.QFormLayout(tr_tab)
         self._add_param_field(tr_layout, "search_range", 50)
         self._add_param_field(tr_layout, "cone_radius_base", 1.5)
         self._add_param_field(tr_layout, "cone_radius_multiplier", 0.125)
         tabs.addTab(tr_tab, "Tracking")
-
-        # Filtering params
         fl_tab = QtWidgets.QWidget()
         fl_layout = QtWidgets.QFormLayout(fl_tab)
         self._add_param_field(fl_layout, "min_trajectory_length", 0.08)
@@ -1600,26 +1432,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._add_param_field(fl_layout, "sampling_sigma", 2.0)
         self._add_param_field(fl_layout, "max_interpolation_distance", 5.0)
         tabs.addTab(fl_tab, "Filtering")
-
         layout.addWidget(param_box)
-
-        # Phase params
         phase_box = QtWidgets.QGroupBox("Phase Map Parameters")
         phase_layout = QtWidgets.QFormLayout(phase_box)
-
         self._add_phase_field(phase_layout, "minutes_per_frame", 15.0)
         self._add_phase_field(phase_layout, "period_min", 22.0)
         self._add_phase_field(phase_layout, "period_max", 28.0)
         self._add_phase_field(phase_layout, "grid_resolution", 100, int)
         self._add_phase_field(phase_layout, "rhythm_threshold", 0.0)
-
         self.btn_regen_phase = QtWidgets.QPushButton("Regenerate Phase Maps")
         self.btn_regen_phase.setEnabled(False)
         phase_layout.addRow(self.btn_regen_phase)
-
         layout.addWidget(phase_box)
-
-        # Execution
         exec_box = QtWidgets.QGroupBox("Execution")
         exec_layout = QtWidgets.QVBoxLayout(exec_box)
         self.btn_run_analysis = QtWidgets.QPushButton("Run Full Analysis")
@@ -1646,10 +1470,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_register_panel(self, panel):
         layout = QtWidgets.QVBoxLayout(panel)
-
         box = QtWidgets.QGroupBox("Atlas Registration Setup")
         b = QtWidgets.QVBoxLayout(box)
-
         row = QtWidgets.QHBoxLayout()
         self.btn_select_atlas = QtWidgets.QPushButton("Select Atlas...")
         self.atlas_path_edit = QtWidgets.QLineEdit()
@@ -1657,43 +1479,35 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self.btn_select_atlas)
         row.addWidget(self.atlas_path_edit)
         b.addLayout(row)
-
         self.target_list = QtWidgets.QListWidget()
         b.addWidget(self.target_list)
-
         row_btn = QtWidgets.QHBoxLayout()
         self.btn_add_targets = QtWidgets.QPushButton("Add Target(s)...")
         self.btn_remove_target = QtWidgets.QPushButton("Remove Selected")
         row_btn.addWidget(self.btn_add_targets)
         row_btn.addWidget(self.btn_remove_target)
         b.addLayout(row_btn)
-
         self.btn_begin_reg = QtWidgets.QPushButton("Begin Registration...")
         self.btn_begin_reg.setEnabled(False)
         b.addWidget(self.btn_begin_reg)
-
         layout.addWidget(box)
         layout.addStretch(1)
 
     def _build_apply_panel(self, panel):
         layout = QtWidgets.QVBoxLayout(panel)
-
         box = QtWidgets.QGroupBox("Apply Warp Setup")
         b = QtWidgets.QVBoxLayout(box)
-
         self.warp_list = QtWidgets.QListWidget()
         self.warp_list.setSelectionMode(
             QtWidgets.QAbstractItemView.ExtendedSelection
         )
         b.addWidget(self.warp_list)
-
         row = QtWidgets.QHBoxLayout()
         self.btn_add_warp = QtWidgets.QPushButton("Add Warp Parameter File(s)...")
         self.btn_remove_warp = QtWidgets.QPushButton("Remove Selected")
         row.addWidget(self.btn_add_warp)
         row.addWidget(self.btn_remove_warp)
         b.addLayout(row)
-
         row2 = QtWidgets.QHBoxLayout()
         self.btn_inspect_warp = QtWidgets.QPushButton("Inspect Selected Warp...")
         self.btn_inspect_warp.setEnabled(False)
@@ -1702,54 +1516,44 @@ class MainWindow(QtWidgets.QMainWindow):
         row2.addWidget(self.btn_inspect_warp)
         row2.addWidget(self.btn_apply_warp)
         b.addLayout(row2)
-
         layout.addWidget(box)
         layout.addStretch(1)
 
     def _build_group_panel(self, panel):
         layout = QtWidgets.QVBoxLayout(panel)
-
         box = QtWidgets.QGroupBox("Group Data Setup")
         b = QtWidgets.QVBoxLayout(box)
-
         self.group_list = QtWidgets.QListWidget()
         self.group_list.setSelectionMode(
             QtWidgets.QAbstractItemView.ExtendedSelection
         )
         b.addWidget(self.group_list)
-
         row = QtWidgets.QHBoxLayout()
         self.btn_add_group = QtWidgets.QPushButton("Add Warped ROI File(s)...")
         self.btn_remove_group = QtWidgets.QPushButton("Remove Selected")
         row.addWidget(self.btn_add_group)
         row.addWidget(self.btn_remove_group)
         b.addLayout(row)
-
         form = QtWidgets.QFormLayout()
         self.group_grid_res_edit = QtWidgets.QLineEdit("50")
         self.group_smooth_check = QtWidgets.QCheckBox("Smooth to fill empty bins")
         form.addRow("Grid Resolution:", self.group_grid_res_edit)
         form.addRow(self.group_smooth_check)
         b.addLayout(form)
-
         self.btn_view_group = QtWidgets.QPushButton("Generate Group Visualizations")
         self.btn_view_group.setEnabled(False)
         b.addWidget(self.btn_view_group)
-
         layout.addWidget(box)
         layout.addStretch(1)
 
     def _build_vis_tabs(self):
-        # Single-animal tabs
         self.heatmap_tab = QtWidgets.QWidget()
         self.com_tab = QtWidgets.QWidget()
         self.traj_tab = QtWidgets.QWidget()
         self.phase_tab = QtWidgets.QWidget()
         self.interp_tab = QtWidgets.QWidget()
-        # Group-specific tabs
         self.group_scatter_tab = QtWidgets.QWidget()
         self.group_avg_tab = QtWidgets.QWidget()
-
         tabs_to_add = [
             (self.heatmap_tab, "Heatmap"),
             (self.com_tab, "Center of Mass"),
@@ -1759,7 +1563,6 @@ class MainWindow(QtWidgets.QMainWindow):
             (self.group_scatter_tab, "Group Scatter"),
             (self.group_avg_tab, "Group Average Map"),
         ]
-
         for tab, name in tabs_to_add:
             self.vis_tabs.addTab(tab, name)
             layout = QtWidgets.QVBoxLayout(tab)
@@ -1768,16 +1571,14 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             label.setAlignment(QtCore.Qt.AlignCenter)
             layout.addWidget(label)
-
-        # Initially disable all tabs
         for i in range(self.vis_tabs.count()):
             self.vis_tabs.setTabEnabled(i, False)
 
     # ------------ Signals ------------
 
     def _connect_signals(self):
-        # Single panel
         self.btn_load_movie.clicked.connect(self.load_movie)
+        self.output_base_edit.textChanged.connect(self.update_output_basename)
         self.btn_define_roi.clicked.connect(self.open_roi_tool)
         self.btn_clear_roi.clicked.connect(self.clear_roi_filter)
         self.btn_save_params.clicked.connect(self.save_parameters)
@@ -1786,14 +1587,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_load_results.clicked.connect(self.load_results)
         self.btn_export_plot.clicked.connect(self.export_current_plot)
         self.btn_regen_phase.clicked.connect(self.regenerate_phase_maps)
-
-        # Register panel
         self.btn_select_atlas.clicked.connect(self.select_atlas)
         self.btn_add_targets.clicked.connect(self.add_targets)
         self.btn_remove_target.clicked.connect(self.remove_target)
         self.btn_begin_reg.clicked.connect(self.begin_registration)
-
-        # Apply warp panel
         self.btn_add_warp.clicked.connect(self.add_warp_files)
         self.btn_remove_warp.clicked.connect(self.remove_warp_file)
         self.warp_list.itemSelectionChanged.connect(
@@ -1801,30 +1598,53 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.btn_apply_warp.clicked.connect(self.apply_warps)
         self.btn_inspect_warp.clicked.connect(self.inspect_warp)
-
-        # Group panel
         self.btn_add_group.clicked.connect(self.add_group_files)
         self.btn_remove_group.clicked.connect(self.remove_group_file)
         self.btn_view_group.clicked.connect(self.generate_group_visualizations)
 
     # ------------ Mode & workflow helpers ------------
 
-    def log_msg(self, msg: str):
-        """Append a message to the log window with automatic scrolling."""
-        if hasattr(self, "log") and self.log is not None:
-            self.log.append(msg)
-            self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
-        else:
-            # Fallback to console if log widget not yet built
-            print(msg)
-        QtWidgets.QApplication.processEvents()
+    def _reset_state(self):
+        self.log_message("Resetting workspace for new analysis...")
+        self.state.reset()
+        self.filtered_indices = None
+        self.rois = None
+        self.vmin = None
+        self.vmax = None
+        self.visualization_widgets.clear()
+        for i in range(self.vis_tabs.count()):
+            tab = self.vis_tabs.widget(i)
+            layout = tab.layout()
+            if layout is not None:
+                clear_layout(layout)
+            else:
+                layout = QtWidgets.QVBoxLayout(tab)
+            label = QtWidgets.QLabel(
+                f"{self.vis_tabs.tabText(i)} will appear here after analysis."
+            )
+            label.setAlignment(QtCore.Qt.AlignCenter)
+            layout.addWidget(label)
+            self.vis_tabs.setTabEnabled(i, False)
+        self.btn_define_roi.setEnabled(False)
+        self.btn_clear_roi.setEnabled(False)
+        self.btn_regen_phase.setEnabled(False)
+        self.btn_export_plot.setEnabled(False)
+        self.btn_run_analysis.setEnabled(False)
+        self.btn_load_results.setEnabled(False)
+        self.status_traces_label.setText("Traces: —")
+        self.status_roi_label.setText("ROI: —")
+        self.status_traj_label.setText("Trajectories: —")
+        self.progress_bar.setValue(0)
+
+    def log_message(self, text: str):
+        self.log_text.appendPlainText(text)
+        self.log_text.verticalScrollBar().setValue(
+            self.log_text.verticalScrollBar().maximum()
+        )
 
     def _switch_mode(self, mode_name: str):
         mode_map = {
-            "single": 0,
-            "register": 1,
-            "apply_warp": 2,
-            "group_view": 3,
+            "single": 0, "register": 1, "apply_warp": 2, "group_view": 3,
         }
         idx = mode_map.get(mode_name)
         if idx is not None:
@@ -1843,120 +1663,57 @@ class MainWindow(QtWidgets.QMainWindow):
         if lbl:
             lbl.setStyleSheet("color: #107010;")
 
-    def log_message(self, text: str):
-        self.log_text.appendPlainText(text)
-        self.log_text.verticalScrollBar().setValue(
-            self.log_text.verticalScrollBar().maximum()
-        )
-
-    def _reset_state(self):
-        """Clears all data and resets the UI to its initial state."""
-        self.log_message("Resetting workspace for new analysis...")
-
-        # Clear all in-memory data structures
-        self.unfiltered_data.clear()
-        self.loaded_data.clear()
-        self.filtered_indices = None
-        self.rois = None
-        self.vmin = None
-        self.vmax = None
-        self.visualization_widgets.clear()
-
-        # Reset visualization tabs to their placeholder state
-        for i in range(self.vis_tabs.count()):
-            tab = self.vis_tabs.widget(i)
-            layout = tab.layout()
-            
-            # If a layout already exists, clear it. Otherwise, create one.
-            if layout is not None:
-                clear_layout(layout)
-            else:
-                layout = QtWidgets.QVBoxLayout(tab)
-
-            label = QtWidgets.QLabel(
-                f"{self.vis_tabs.tabText(i)} will appear here after analysis."
-            )
-            label.setAlignment(QtCore.Qt.AlignCenter)
-            layout.addWidget(label)
-            self.vis_tabs.setTabEnabled(i, False)
-
-        # Disable buttons that depend on loaded data
-        self.btn_define_roi.setEnabled(False)
-        self.btn_clear_roi.setEnabled(False)
-        self.btn_regen_phase.setEnabled(False)
-        self.btn_export_plot.setEnabled(False)
-        self.btn_run_analysis.setEnabled(False)
-        self.btn_load_results.setEnabled(False)
-
-        # Clear status labels
-        self.status_traces_label.setText("Traces: —")
-        self.status_roi_label.setText("ROI: —")
-        self.status_traj_label.setText("Trajectories: —")
-        
-        self.progress_bar.setValue(0)
-
     # ------------ Single-animal flow ------------
 
     def load_movie(self):
-        # First, reset the entire application state
         self._reset_state()
-
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select Movie", "", "TIFF files (*.tif *.tiff);;All files (*.*)"
         )
         if not path:
-            # If user cancels, clear the file paths as well
             self.input_file_edit.clear()
             self.output_base_edit.clear()
             return
-            
+        self.state.input_movie_path = path
         self.input_file_edit.setText(path)
         base, _ = os.path.splitext(path)
+        self.state.output_basename = base
         self.output_base_edit.setText(base)
         self.workflow_state["has_input"] = True
         self.log_message(f"Loaded movie: {os.path.basename(path)}")
         self.update_workflow_from_files()
 
+    def update_output_basename(self, text):
+        self.state.output_basename = text
+        self.update_workflow_from_files()
+
     def update_workflow_from_files(self):
-        basename = self.output_base_edit.text().strip()
+        basename = self.state.output_basename
         if not basename:
             return
-
-        input_present = bool(self.input_file_edit.text())
+        input_present = bool(self.state.input_movie_path)
         if input_present:
             self.workflow_state["has_input"] = True
             self._mark_step_ready("single")
             self.btn_run_analysis.setEnabled(True)
-
         traces_path = f"{basename}_traces.csv"
         roi_path = f"{basename}_roi.csv"
         traj_path = f"{basename}_trajectories.npy"
-
         has_traces = os.path.exists(traces_path)
         has_roi = os.path.exists(roi_path)
         has_traj = os.path.exists(traj_path)
-
-        self.status_traces_label.setText(
-            f"Traces: {'found' if has_traces else 'missing'}"
-        )
-        self.status_roi_label.setText(
-            f"ROI: {'found' if has_roi else 'missing'}"
-        )
-        self.status_traj_label.setText(
-            f"Trajectories: {'found' if has_traj else 'missing'}"
-        )
-
+        self.status_traces_label.setText(f"Traces: {'found' if has_traces else 'missing'}")
+        self.status_roi_label.setText(f"ROI: {'found' if has_roi else 'missing'}")
+        self.status_traj_label.setText(f"Trajectories: {'found' if has_traj else 'missing'}")
         has_results = has_traces and has_roi and has_traj
         self.workflow_state["has_results"] = has_results
         self.btn_load_results.setEnabled(has_results)
-
         if has_results:
             self._mark_step_ready("single")
             self._set_mode_enabled("register", True)
             self.btn_define_roi.setEnabled(True)
             self.btn_regen_phase.setEnabled(True)
             self.btn_export_plot.setEnabled(True)
-
         anatomical_roi_path = f"{basename}_anatomical_roi.json"
         has_anatomical_roi = os.path.exists(anatomical_roi_path)
         self.workflow_state["has_anatomical_roi"] = has_anatomical_roi
@@ -1964,20 +1721,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._mark_step_ready("register")
             self._set_mode_enabled("register", True)
             self._set_mode_enabled("apply_warp", True)
-
         dirname = os.path.dirname(basename) or "."
-        warp_files = [
-            f for f in os.listdir(dirname) if f.endswith("_warp_parameters.json")
-        ]
-        warped_roi_files = [
-            f for f in os.listdir(dirname) if f.endswith("_roi_warped.csv")
-        ]
-
+        warp_files = [f for f in os.listdir(dirname) if f.endswith("_warp_parameters.json")]
+        warped_roi_files = [f for f in os.listdir(dirname) if f.endswith("_roi_warped.csv")]
         has_warp = len(warp_files) > 0
         has_group = len(warped_roi_files) > 0
         self.workflow_state["has_warp"] = has_warp
         self.workflow_state["has_group_data"] = has_group
-
         if has_warp:
             self._mark_step_ready("apply_warp")
             self._set_mode_enabled("apply_warp", True)
@@ -1987,37 +1737,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_view_group.setEnabled(True)
 
     def start_analysis(self):
-        input_file = self.input_file_edit.text().strip()
-        basename = self.output_base_edit.text().strip()
-        if not input_file or not basename:
+        if not self.state.input_movie_path or not self.state.output_basename:
             self.log_message("Error: input file and output basename required.")
             return
-
         try:
-            args = {
-                name: t(le.text())
-                for name, (le, t) in self.params.items()
-            }
+            args = {name: t(le.text()) for name, (le, t) in self.params.items()}
         except ValueError as e:
             self.log_message(f"Error in analysis parameters: {e}")
             return
-
         self.log_text.clear()
         self.progress_bar.setValue(0)
         self.btn_run_analysis.setEnabled(False)
         self.btn_load_results.setEnabled(False)
-
-        # QThread setup
-        self._analysis_worker = AnalysisWorker(input_file, basename, args)
+        self._analysis_worker = AnalysisWorker(self.state.input_movie_path, self.state.output_basename, args)
         self._analysis_thread = QtCore.QThread(self)
         self._analysis_worker.moveToThread(self._analysis_thread)
-
         self._analysis_thread.started.connect(self._analysis_worker.run)
         self._analysis_worker.message.connect(self.log_message)
-        self._analysis_worker.progress.connect(
-            lambda v: self.progress_bar.setValue(int(v * 100))
-        )
-
+        self._analysis_worker.progress.connect(lambda v: self.progress_bar.setValue(int(v * 100)))
         def done(success, msg):
             self._analysis_thread.quit()
             self._analysis_thread.wait()
@@ -2029,45 +1766,35 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self.log_message("Analysis failed.")
             self.update_workflow_from_files()
-
         self._analysis_worker.finished.connect(done)
         self._analysis_thread.start()
 
     def load_results(self):
-        basename = self.output_base_edit.text().strip()
-        if not basename:
-            return
+        basename = self.state.output_basename
+        if not basename: return
         try:
-            self.unfiltered_data["traces"] = np.loadtxt(
-                f"{basename}_traces.csv", delimiter=","
-            )
-            self.unfiltered_data["roi"] = np.loadtxt(
-                f"{basename}_roi.csv", delimiter=","
-            )
-            self.unfiltered_data["trajectories"] = np.load(
-                f"{basename}_trajectories.npy"
-            )
-            movie = skimage.io.imread(self.input_file_edit.text())
-            self.unfiltered_data["background"] = movie[len(movie) // 2]
+            self.state.unfiltered_data["traces"] = np.loadtxt(f"{basename}_traces.csv", delimiter=",")
+            self.state.unfiltered_data["roi"] = np.loadtxt(f"{basename}_roi.csv", delimiter=",")
+            self.state.unfiltered_data["trajectories"] = np.load(f"{basename}_trajectories.npy")
+            movie = skimage.io.imread(self.state.input_movie_path)
+            self.state.unfiltered_data["background"] = movie[len(movie) // 2]
             self.log_message("Results loaded successfully.")
             self.apply_roi_filter(None, None)
         except Exception as e:
             self.log_message(f"Error loading results: {e}")
 
     def open_roi_tool(self):
-        if "background" not in self.unfiltered_data:
+        if "background" not in self.state.unfiltered_data:
             self.log_message("Error: Load data before defining an ROI.")
             return
-        basename = self.output_base_edit.text().strip()
-        if not basename:
+        if not self.state.output_basename:
             self.log_message("Error: Output Basename required.")
             return
-
         dlg = ROIDrawerDialog(
             self,
-            self.unfiltered_data["background"],
-            self.unfiltered_data["roi"],
-            basename,
+            self.state.unfiltered_data["background"],
+            self.state.unfiltered_data["roi"],
+            self.state.output_basename,
             self.apply_roi_filter,
             vmin=self.vmin,
             vmax=self.vmax,
@@ -2078,89 +1805,46 @@ class MainWindow(QtWidgets.QMainWindow):
     def apply_roi_filter(self, indices, rois):
         self.filtered_indices = indices
         self.rois = rois
-
         if indices is None:
-            self.loaded_data = dict(self.unfiltered_data)
+            self.state.loaded_data = dict(self.state.unfiltered_data)
             self.log_message("ROI filter cleared. Showing all data.")
             self.btn_clear_roi.setEnabled(False)
         else:
-            self.loaded_data["roi"] = self.unfiltered_data["roi"][indices]
-            self.loaded_data["trajectories"] = \
-                self.unfiltered_data["trajectories"][indices]
+            self.state.loaded_data["roi"] = self.state.unfiltered_data["roi"][indices]
+            self.state.loaded_data["trajectories"] = self.state.unfiltered_data["trajectories"][indices]
             trace_indices = np.concatenate(([0], indices + 1))
-            self.loaded_data["traces"] = \
-                self.unfiltered_data["traces"][:, trace_indices]
-            self.log_message(
-                f"ROI filter applied. {len(indices)} cells selected."
-            )
+            self.state.loaded_data["traces"] = self.state.unfiltered_data["traces"][:, trace_indices]
+            self.log_message(f"ROI filter applied. {len(indices)} cells selected.")
             self.btn_clear_roi.setEnabled(True)
-
         self.populate_visualizations()
 
     def clear_roi_filter(self):
         self.apply_roi_filter(None, None)
 
     def save_parameters(self):
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save Parameters", "", "JSON files (*.json)"
-        )
-        if not path:
-            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Parameters", "", "JSON files (*.json)")
+        if not path: return
         data = {name: le.text() for name, (le, _) in self.params.items()}
-        with open(path, "w") as f:
-            json.dump(data, f, indent=4)
+        with open(path, "w") as f: json.dump(data, f, indent=4)
         self.log_message(f"Parameters saved to {os.path.basename(path)}")
 
     def load_parameters(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load Parameters", "", "JSON files (*.json)"
-        )
-        if not path:
-            return
-        with open(path, "r") as f:
-            data = json.load(f)
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load Parameters", "", "JSON files (*.json)")
+        if not path: return
+        with open(path, "r") as f: data = json.load(f)
         for name, value in data.items():
-            if name in self.params:
-                self.params[name][0].setText(str(value))
+            if name in self.params: self.params[name][0].setText(str(value))
         self.log_message(f"Parameters loaded from {os.path.basename(path)}")
 
     def export_current_plot(self):
-        idx = self.vis_tabs.currentIndex()
-        key_order = [
-            "heatmap", "com", "traj", "phase", "interp",
-            "group_scatter", "group_average",
-        ]
-        for k in key_order:
-            # map first existing for index
-            pass
-        widget = None
-        if idx == 0:
-            widget = self.visualization_widgets.get("heatmap")
-        elif idx == 1:
-            widget = self.visualization_widgets.get("com")
-        elif idx == 2:
-            widget = self.visualization_widgets.get("traj")
-        elif idx == 3:
-            widget = self.visualization_widgets.get("phase")
-        elif idx == 4:
-            widget = self.visualization_widgets.get("interp")
-        # group views reuse tabs 0 & 1 with different viewers when active
-        if widget is None:
-            widget = self.visualization_widgets.get("group_scatter") \
-                      if idx == 0 else \
-                      self.visualization_widgets.get("group_average")
-
-        if not widget or not hasattr(widget, "fig"):
+        widget = self.vis_tabs.currentWidget()
+        viewer = self.visualization_widgets.get(widget)
+        if not viewer or not hasattr(viewer, "fig"):
             self.log_message("No active figure to export.")
             return
-
-        fig = widget.fig
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save Plot", "",
-            "PNG files (*.png);;PDF files (*.pdf);;SVG files (*.svg)"
-        )
-        if not path:
-            return
+        fig = viewer.fig
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Plot", "", "PNG files (*.png);;PDF files (*.pdf);;SVG files (*.svg)")
+        if not path: return
         try:
             fig.savefig(path, dpi=300, bbox_inches="tight")
             self.log_message(f"Plot saved to {os.path.basename(path)}")
@@ -2172,279 +1856,173 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_contrast_change(self, vmin, vmax):
         self.vmin = vmin
         self.vmax = vmax
-        for key in ("traj", "phase"):
-            if key in self.visualization_widgets:
-                self.visualization_widgets[key].update_contrast(vmin, vmax)
+        
+        # Look up viewers by their widget object key, not by string
+        traj_viewer = self.visualization_widgets.get(self.traj_tab)
+        if traj_viewer:
+            traj_viewer.update_contrast(vmin, vmax)
+            
+        phase_viewer = self.visualization_widgets.get(self.phase_tab)
+        if phase_viewer:
+            phase_viewer.update_contrast(vmin, vmax)
 
     def populate_visualizations(self):
-        if not self.loaded_data:
+        if not self.state.loaded_data or "background" not in self.state.unfiltered_data:
             return
-        if "background" not in self.unfiltered_data:
-            return
-
         self.log_message("Generating interactive plots...")
-        bg = self.unfiltered_data["background"]
+        bg = self.state.unfiltered_data["background"]
         self.vmin, self.vmax = float(bg.min()), float(bg.max())
-
-        # Enable single-animal tabs and disable group tabs
-        single_animal_tabs = [
-            self.heatmap_tab, self.com_tab, self.traj_tab,
-            self.phase_tab, self.interp_tab
-        ]
+        single_animal_tabs = [self.heatmap_tab, self.com_tab, self.traj_tab, self.phase_tab, self.interp_tab]
         group_tabs = [self.group_scatter_tab, self.group_avg_tab]
+        for tab in single_animal_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), True)
+        for tab in group_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), False)
         
-        for tab in single_animal_tabs:
-            self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), True)
-        for tab in group_tabs:
-            self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), False)
-
-        # Heatmap tab
         fig_h, _ = add_mpl_to_tab(self.heatmap_tab)
-        self.visualization_widgets["heatmap"] = HeatmapViewer(
-            fig_h,
-            fig_h.add_subplot(111),
-            self.loaded_data["traces"],
-            self.loaded_data["roi"],
-        )
-
-        # COM + contrast
+        viewer_h = HeatmapViewer(fig_h, fig_h.add_subplot(111), self.state.loaded_data["traces"], self.state.loaded_data["roi"])
+        self.visualization_widgets[self.heatmap_tab] = viewer_h
+        
         fig_c, _ = add_mpl_to_tab(self.com_tab)
-        self.visualization_widgets["com"] = ContrastViewer(
-            fig_c,
-            fig_c.add_subplot(111),
-            bg,
-            self.loaded_data["roi"],
-            self.on_contrast_change,
-        )
-
-        # Trajectory inspector
+        viewer_c = ContrastViewer(fig_c, fig_c.add_subplot(111), bg, self.state.loaded_data["roi"], self.on_contrast_change)
+        self.visualization_widgets[self.com_tab] = viewer_c
+        
         fig_t, _ = add_mpl_to_tab(self.traj_tab)
-        self.visualization_widgets["traj"] = TrajectoryInspector(
-            fig_t,
-            fig_t.add_subplot(111),
-            self.loaded_data["trajectories"],
-            bg,
-        )
-
-        # Phase maps (fills phase_tab & interp_tab)
+        viewer_t = TrajectoryInspector(fig_t, fig_t.add_subplot(111), self.state.loaded_data["trajectories"], bg)
+        self.visualization_widgets[self.traj_tab] = viewer_t
+        
         self.regenerate_phase_maps()
         self.btn_export_plot.setEnabled(True)
 
     def regenerate_phase_maps(self):
-        if not self.loaded_data or "traces" not in self.loaded_data:
+        if not self.state.loaded_data or "traces" not in self.state.loaded_data:
             return
-
         self.log_message("Regenerating phase maps...")
-        for tab in (self.phase_tab, self.interp_tab):
-            clear_layout(tab.layout())
-
+        for tab in (self.phase_tab, self.interp_tab): clear_layout(tab.layout())
         try:
-            # Collect phase params (excluding grid & threshold here)
             phase_args = {}
             for name, (w, t) in self.phase_params.items():
                 v = w.text().strip()
-                if not v:
-                    continue
-                if name in ("grid_resolution", "rhythm_threshold"):
-                    continue
+                if not v or name in ("grid_resolution", "rhythm_threshold"): continue
                 phase_args[name] = t(v)
-
-            phases, period, rhythm = calculate_phases_fft(
-                self.loaded_data["traces"],
-                **phase_args,
-            )
-
+            phases, period, rhythm = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
             thr = float(self.phase_params["rhythm_threshold"][0].text())
             idx = np.where(rhythm >= thr)[0]
-            self.log_message(
-                f"{len(idx)} cells pass rhythmicity threshold {thr}."
-            )
-
-            roi = self.loaded_data["roi"][idx]
+            self.log_message(f"{len(idx)} cells pass rhythmicity threshold {thr}.")
+            roi = self.state.loaded_data["roi"][idx]
             ph = phases[idx]
-            if len(ph) == 0:
-                raise ValueError("No cells passed rhythmicity filter.")
-
+            if len(ph) == 0: raise ValueError("No cells passed rhythmicity filter.")
             ph_rad = (ph % period) * (2 * np.pi / period)
             mean_rad = circmean(ph_rad)
             mean_h = mean_rad * (period / (2 * np.pi))
             rel = (ph - mean_h + period / 2) % period - period / 2
-
-            # Phase map tab
+            
             fig_p, _ = add_mpl_to_tab(self.phase_tab)
-            self.visualization_widgets["phase"] = PhaseMapViewer(
-                fig_p,
-                fig_p.add_subplot(111),
-                self.unfiltered_data["background"],
-                roi,
-                rel,
-                period,
-                vmin=self.vmin,
-                vmax=self.vmax,
-            )
-
-            # Interpolated map tab
+            viewer_p = PhaseMapViewer(fig_p, fig_p.add_subplot(111), self.state.unfiltered_data["background"], roi, rel, period, vmin=self.vmin, vmax=self.vmax)
+            self.visualization_widgets[self.phase_tab] = viewer_p
+            
             grid_res = int(self.phase_params["grid_resolution"][0].text())
             fig_i, _ = add_mpl_to_tab(self.interp_tab)
-            self.visualization_widgets["interp"] = InterpolatedMapViewer(
-                fig_i,
-                fig_i.add_subplot(111),
-                roi,
-                rel,
-                period,
-                grid_res,
-                rois=self.rois,
-            )
-
-            self.vis_tabs.setTabEnabled(
-                self.vis_tabs.indexOf(self.phase_tab), True
-            )
-            self.vis_tabs.setTabEnabled(
-                self.vis_tabs.indexOf(self.interp_tab), True
-            )
+            viewer_i = InterpolatedMapViewer(fig_i, fig_i.add_subplot(111), roi, rel, period, grid_res, rois=self.rois)
+            self.visualization_widgets[self.interp_tab] = viewer_i
+            
+            self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.phase_tab), True)
+            self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.interp_tab), True)
             self.btn_regen_phase.setEnabled(True)
             self.log_message("Phase maps updated.")
-
         except Exception as e:
             self.log_message(f"Could not generate phase maps: {e}")
-            self.vis_tabs.setTabEnabled(
-                self.vis_tabs.indexOf(self.phase_tab), False
-            )
-            self.vis_tabs.setTabEnabled(
-                self.vis_tabs.indexOf(self.interp_tab), False
-            )
+            self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.phase_tab), False)
+            self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.interp_tab), False)
 
     # ------------ Registration panel actions ------------
 
     def select_atlas(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Select Atlas ROI File",
-            "",
-            "Anatomical ROI files (*_anatomical_roi.json)",
-        )
-        if not path:
-            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Atlas ROI File", "", "Anatomical ROI files (*_anatomical_roi.json)")
+        if not path: return
+        self.state.atlas_roi_path = path
         self.atlas_path_edit.setText(path)
         self._update_reg_button_state()
 
     def add_targets(self):
-        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self,
-            "Select Target ROI Files",
-            "",
-            "Anatomical ROI files (*_anatomical_roi.json)",
-        )
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Select Target ROI Files", "", "Anatomical ROI files (*_anatomical_roi.json)")
         for f in files:
-            self.target_list.addItem(f)
+            if f not in self.state.target_roi_paths:
+                self.state.target_roi_paths.append(f)
+                self.target_list.addItem(f)
         self._update_reg_button_state()
 
     def remove_target(self):
         for item in self.target_list.selectedItems():
-            self.target_list.takeItem(self.target_list.row(item))
+            row = self.target_list.row(item)
+            path = self.target_list.item(row).text()
+            if path in self.state.target_roi_paths:
+                self.state.target_roi_paths.remove(path)
+            self.target_list.takeItem(row)
         self._update_reg_button_state()
 
     def _update_reg_button_state(self):
-        has_atlas = bool(self.atlas_path_edit.text().strip())
-        has_targets = self.target_list.count() > 0
+        has_atlas = bool(self.state.atlas_roi_path)
+        has_targets = len(self.state.target_roi_paths) > 0
         self.btn_begin_reg.setEnabled(has_atlas and has_targets)
 
     def begin_registration(self):
-        atlas = self.atlas_path_edit.text().strip()
-        if not atlas:
-            return
-        targets = [
-            self.target_list.item(i).text()
-            for i in range(self.target_list.count())
-        ]
-        if not targets:
-            return
-
-        dlg = RegistrationWindow(
-            self,
-            atlas,
-            targets,
-            self.log_message,
-        )
+        if not self.state.atlas_roi_path or not self.state.target_roi_paths: return
+        dlg = RegistrationWindow(self, self.state, self.log_message)
         dlg.exec_()
         self.update_workflow_from_files()
 
     # ------------ Apply warp panel actions ------------
 
     def add_warp_files(self):
-        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self,
-            "Select Warp Parameter Files",
-            "",
-            "Warp Parameters (*_warp_parameters.json)",
-        )
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Select Warp Parameter Files", "", "Warp Parameters (*_warp_parameters.json)")
         for f in files:
-            self.warp_list.addItem(f)
+            if f not in self.state.warp_param_paths:
+                self.state.warp_param_paths.append(f)
+                self.warp_list.addItem(f)
         self.check_apply_warp_buttons_state()
 
     def remove_warp_file(self):
         for item in self.warp_list.selectedItems():
-            self.warp_list.takeItem(self.warp_list.row(item))
+            row = self.warp_list.row(item)
+            path = self.warp_list.item(row).text()
+            if path in self.state.warp_param_paths:
+                self.state.warp_param_paths.remove(path)
+            self.warp_list.takeItem(row)
         self.check_apply_warp_buttons_state()
 
     def check_apply_warp_buttons_state(self):
-        total = self.warp_list.count()
+        total = len(self.state.warp_param_paths)
         selected = len(self.warp_list.selectedItems())
         self.btn_apply_warp.setEnabled(total > 0)
         self.btn_inspect_warp.setEnabled(selected == 1)
 
     def apply_warps(self):
-        count = self.warp_list.count()
-        if count == 0:
+        if not self.state.warp_param_paths:
             self.log_message("No warp files selected.")
             return
-
-        self.log_message(f"Applying {count} warp(s)...")
-        for i in range(count):
-            warp_file = self.warp_list.item(i).text()
+        self.log_message(f"Applying {len(self.state.warp_param_paths)} warp(s)...")
+        for warp_file in self.state.warp_param_paths:
             try:
-                with open(warp_file, "r") as f:
-                    warp = json.load(f)
-
-                roi_file = warp_file.replace(
-                    "_warp_parameters.json",
-                    "_roi_filtered.csv",
-                )
+                with open(warp_file, "r") as f: warp = json.load(f)
+                roi_file = warp_file.replace("_warp_parameters.json", "_roi_filtered.csv")
                 if not os.path.exists(roi_file):
-                    self.log_message(
-                        f"Missing _roi_filtered.csv for {os.path.basename(warp_file)}"
-                    )
+                    self.log_message(f"Missing _roi_filtered.csv for {os.path.basename(warp_file)}")
                     continue
-
                 roi_pts = np.loadtxt(roi_file, delimiter=",")
-
                 from skimage.transform import ThinPlateSplineTransform
                 tps = ThinPlateSplineTransform()
-                tps.estimate(
-                    np.array(warp["dest_landmarks_norm"]),
-                    np.array(warp["source_landmarks_norm"]),
-                )
-
+                tps.estimate(np.array(warp["dest_landmarks_norm"]), np.array(warp["source_landmarks_norm"]))
                 dc = np.array(warp["dest_centroid"])
                 ds = warp["dest_scale"]
                 sc = np.array(warp["source_centroid"])
                 ss = warp["source_scale"]
-
                 pts_norm = (roi_pts - dc) / ds
                 warped_norm = tps(pts_norm)
                 warped_pts = warped_norm * ss + sc
-
-                out = roi_file.replace(
-                    "_roi_filtered.csv",
-                    "_roi_warped.csv",
-                )
+                out = roi_file.replace("_roi_filtered.csv", "_roi_warped.csv")
                 np.savetxt(out, warped_pts, delimiter=",")
                 self.log_message(f"Created {os.path.basename(out)}")
             except Exception as e:
-                self.log_message(
-                    f"Failed to process {os.path.basename(warp_file)}: {e}"
-                )
-
+                self.log_message(f"Failed to process {os.path.basename(warp_file)}: {e}")
         self.log_message("Warp application complete.")
         self.update_workflow_from_files()
 
@@ -2453,61 +2031,41 @@ class MainWindow(QtWidgets.QMainWindow):
         if not items:
             self.log_message("Select a warp file to inspect.")
             return
-
         warp_file = items[0].text()
         try:
-            atlas_path = self.atlas_path_edit.text().strip()
-            if not atlas_path or not os.path.exists(atlas_path):
-                raise ValueError(
-                    "Select a valid Atlas file in 'Atlas Registration' first."
-                )
-
-            target_roi_filtered = warp_file.replace(
-                "_warp_parameters.json", "_roi_filtered.csv"
-            )
-            target_anatomical = warp_file.replace(
-                "_warp_parameters.json", "_anatomical_roi.json"
-            )
-
-            if not os.path.exists(target_roi_filtered):
-                raise FileNotFoundError(
-                    f"Missing _roi_filtered.csv for {os.path.basename(warp_file)}"
-                )
-            if not os.path.exists(target_anatomical):
-                raise FileNotFoundError(
-                    f"Missing _anatomical_roi.json for {os.path.basename(warp_file)}"
-                )
-
-            with open(warp_file, "r") as f:
-                warp = json.load(f)
-
+            if not self.state.atlas_roi_path or not os.path.exists(self.state.atlas_roi_path):
+                # Attempt to find a logical atlas file if not set
+                base_dir = os.path.dirname(warp_file)
+                potential_atlas = os.path.join(base_dir, "atlas_anatomical_roi.json") # A guess
+                if os.path.exists(potential_atlas):
+                    self.state.atlas_roi_path = potential_atlas
+                    self.atlas_path_edit.setText(potential_atlas)
+                    self.log_message(f"Auto-detected atlas: {os.path.basename(potential_atlas)}")
+                else:
+                    raise ValueError("Atlas file not set. Please select one in the 'Atlas Registration' panel.")
+            
+            target_roi_filtered = warp_file.replace("_warp_parameters.json", "_roi_filtered.csv")
+            target_anatomical = warp_file.replace("_warp_parameters.json", "_anatomical_roi.json")
+            if not os.path.exists(target_roi_filtered): raise FileNotFoundError(f"Missing _roi_filtered.csv for {os.path.basename(warp_file)}")
+            if not os.path.exists(target_anatomical): raise FileNotFoundError(f"Missing _anatomical_roi.json for {os.path.basename(warp_file)}")
+            
+            with open(warp_file, "r") as f: warp = json.load(f)
             orig_pts = np.loadtxt(target_roi_filtered, delimiter=",")
-
             from skimage.transform import ThinPlateSplineTransform
             tps = ThinPlateSplineTransform()
-            tps.estimate(
-                np.array(warp["dest_landmarks_norm"]),
-                np.array(warp["source_landmarks_norm"]),
-            )
+            tps.estimate(np.array(warp["dest_landmarks_norm"]), np.array(warp["source_landmarks_norm"]))
             dc = np.array(warp["dest_centroid"])
             ds = warp["dest_scale"]
             sc = np.array(warp["source_centroid"])
             ss = warp["source_scale"]
-
             pts_norm = (orig_pts - dc) / ds
             warped_norm = tps(pts_norm)
             warped_pts = warped_norm * ss + sc
-
+            
             dlg = WarpInspectorWindow(
-                self,
-                atlas_path,
-                target_anatomical,
-                orig_pts,
-                warped_pts,
-                pts_norm,
-                warped_norm,
-                warp,
-                title=os.path.basename(target_roi_filtered),
+                self, self.state.atlas_roi_path, target_anatomical,
+                orig_pts, warped_pts, pts_norm, warped_norm, warp,
+                title=os.path.basename(target_roi_filtered)
             )
             dlg.exec_()
         except Exception as e:
@@ -2516,61 +2074,43 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------ Group panel actions ------------
 
     def add_group_files(self):
-        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self,
-            "Select Warped ROI Files",
-            "",
-            "Warped ROI files (*_roi_warped.csv)",
-        )
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Select Warped ROI Files", "", "Warped ROI files (*_roi_warped.csv)")
         for f in files:
-            self.group_list.addItem(f)
+            if f not in self.state.group_data_paths:
+                self.state.group_data_paths.append(f)
+                self.group_list.addItem(f)
         self._update_group_view_button()
 
     def remove_group_file(self):
         for item in self.group_list.selectedItems():
-            self.group_list.takeItem(self.group_list.row(item))
+            row = self.group_list.row(item)
+            path = self.group_list.item(row).text()
+            if path in self.state.group_data_paths:
+                self.state.group_data_paths.remove(path)
+            self.group_list.takeItem(row)
         self._update_group_view_button()
 
     def _update_group_view_button(self):
-        self.btn_view_group.setEnabled(self.group_list.count() > 0)
+        self.btn_view_group.setEnabled(len(self.state.group_data_paths) > 0)
 
     def generate_group_visualizations(self):
-        count = self.group_list.count()
-        if count == 0:
+        if not self.state.group_data_paths:
             self.log_message("No group files selected.")
             return
-
         self.log_message("Loading and processing group data...")
-        files = [self.group_list.item(i).text() for i in range(count)]
-
-        all_rois = []
-        all_rel = []
-        
-        # Define tab sets for visibility control
-        single_animal_tabs = [
-            self.heatmap_tab, self.com_tab, self.traj_tab,
-            self.phase_tab, self.interp_tab
-        ]
+        single_animal_tabs = [self.heatmap_tab, self.com_tab, self.traj_tab, self.phase_tab, self.interp_tab]
         group_tabs = [self.group_scatter_tab, self.group_avg_tab]
-
         try:
-            # Common phase params
             phase_args = {}
             for name, (w, t) in self.phase_params.items():
                 v = w.text().strip()
-                if not v:
-                    continue
-                if name in ("grid_resolution", "rhythm_threshold"):
-                    continue
+                if not v or name in ("grid_resolution", "rhythm_threshold"): continue
                 phase_args[name] = t(v)
-            if "minutes_per_frame" not in phase_args:
-                raise ValueError("Minutes per Frame must be set.")
-
-            # This loop remains the same as the previous fix
-            for i, roi_file in enumerate(files):
-                self.log_message(
-                    f"  [{i + 1}/{count}] {os.path.basename(roi_file)}"
-                )
+            if "minutes_per_frame" not in phase_args: raise ValueError("Minutes per Frame must be set.")
+            
+            all_rois, all_rel = [], []
+            for i, roi_file in enumerate(self.state.group_data_paths):
+                self.log_message(f"  [{i + 1}/{len(self.state.group_data_paths)}] {os.path.basename(roi_file)}")
                 traces_file = roi_file.replace("_roi_warped.csv", "_traces.csv")
                 unfiltered_roi_file = roi_file.replace("_roi_warped.csv", "_roi.csv")
                 filtered_roi_file = roi_file.replace("_roi_warped.csv", "_roi_filtered.csv")
@@ -2586,8 +2126,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 for point in filtered_rois:
                     diff = np.sum((unfiltered_rois - point)**2, axis=1)
                     idx = np.argmin(diff)
-                    if diff[idx] < 1e-9:
-                        indices.append(idx)
+                    if diff[idx] < 1e-9: indices.append(idx)
                 if len(indices) != len(filtered_rois):
                     self.log_message("    Warning: Could not match filtered to unfiltered ROIs; skipping.")
                     continue
@@ -2600,48 +2139,33 @@ class MainWindow(QtWidgets.QMainWindow):
                 rel = (phases - mean_h + period / 2) % period - period / 2
                 all_rois.append(warped_rois)
                 all_rel.append(rel)
-
-            if not all_rois:
-                raise ValueError("No valid group data loaded.")
-
+            
+            if not all_rois: raise ValueError("No valid group data loaded.")
             pooled_rois = np.vstack(all_rois)
             pooled_rel = np.concatenate(all_rel)
-            if len(pooled_rois) != len(pooled_rel):
-                raise RuntimeError(f"Final data inconsistency: {len(pooled_rois)} ROIs, {len(pooled_rel)} phases.")
-
+            if len(pooled_rois) != len(pooled_rel): raise RuntimeError(f"Final data inconsistency: {len(pooled_rois)} ROIs, {len(pooled_rel)} phases.")
+            
             grid_res = int(self.group_grid_res_edit.text())
             do_smooth = self.group_smooth_check.isChecked()
-
-            # Plot to the new, dedicated tabs
-            fig_s, _ = add_mpl_to_tab(self.group_scatter_tab)
-            self.visualization_widgets["group_scatter"] = GroupScatterViewer(
-                fig_s, fig_s.add_subplot(111), pooled_rois, pooled_rel, period
-            )
-
-            fig_g, _ = add_mpl_to_tab(self.group_avg_tab)
-            self.visualization_widgets["group_average"] = GroupAverageMapViewer(
-                fig_g, fig_g.add_subplot(111), pooled_rois, pooled_rel, period, grid_res, do_smooth
-            )
-
-            # Enable group tabs and disable single-animal tabs
-            for tab in group_tabs:
-                self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), True)
-            for tab in single_animal_tabs:
-                self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), False)
             
-            # Switch view to the first group tab
+            fig_s, _ = add_mpl_to_tab(self.group_scatter_tab)
+            viewer_s = GroupScatterViewer(fig_s, fig_s.add_subplot(111), pooled_rois, pooled_rel, period)
+            self.visualization_widgets[self.group_scatter_tab] = viewer_s
+            
+            fig_g, _ = add_mpl_to_tab(self.group_avg_tab)
+            viewer_g = GroupAverageMapViewer(fig_g, fig_g.add_subplot(111), pooled_rois, pooled_rel, period, grid_res, do_smooth)
+            self.visualization_widgets[self.group_avg_tab] = viewer_g
+            
+            for tab in group_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), True)
+            for tab in single_animal_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), False)
             self.vis_tabs.setCurrentWidget(self.group_scatter_tab)
-
             self._mark_step_ready("group_view")
             self.log_message("Group visualizations generated.")
-
         except Exception as e:
             import traceback
             self.log_message(f"Error generating group visualizations: {e}")
             self.log_message(traceback.format_exc())
-            # Ensure group tabs are disabled on failure
-            for tab in group_tabs:
-                self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), False)
+            for tab in group_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), False)
 
     # --------------------------------------------------------
 
