@@ -45,6 +45,7 @@ from matplotlib.widgets import Slider, RadioButtons
 from PyQt5 import QtCore, QtWidgets
 
 import neuron_tracker_core as ntc
+import cosinor as csn
 
 # ------------------------------------------------------------
 # Centralized State Management
@@ -581,7 +582,7 @@ class WarpInspectorWindow(QtWidgets.QDialog):
 # ------------------------------------------------------------
 
 class HeatmapViewer:
-    def __init__(self, fig, loaded_data, filtered_indices, phases, rhythm_scores, is_emphasized):
+    def __init__(self, fig, loaded_data, filtered_indices, phases, rhythm_scores, is_emphasized, rhythm_sort_desc):
         self.fig = fig
         self.loaded_data = loaded_data
         self.traces_data = loaded_data["traces"]
@@ -590,7 +591,8 @@ class HeatmapViewer:
         self.is_emphasized = is_emphasized
         self.rhythm_mask = None
         self.selected_index = None
-        self.emphasis_overlay = None # Artist for the gray overlay
+        self.emphasis_overlay = None
+        self.rhythm_sort_desc = rhythm_sort_desc
 
         gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.3)
         self.ax_heatmap = self.fig.add_subplot(gs[0])
@@ -616,14 +618,14 @@ class HeatmapViewer:
         self.trace_line = self.ax_trace.plot([], [])[0]
 
         if rhythm_scores is not None:
-            thr = 0.0 
-            try:
-                main_win = self.fig.canvas.parent().window()
-                thr = float(main_win.phase_params["rhythm_threshold"][0].text())
-            except Exception: pass
-            self.rhythm_mask = rhythm_scores >= thr
+            main_win = self.fig.canvas.parent().window()
+            thr = float(main_win.phase_params["rhythm_threshold"][0].text())
+            if self.rhythm_sort_desc:
+                self.rhythm_mask = rhythm_scores >= thr
+            else:
+                self.rhythm_mask = rhythm_scores <= thr
 
-        self.update_phase_data(phases, rhythm_scores, self.rhythm_mask)
+        self.update_phase_data(phases, rhythm_scores, self.rhythm_mask, self.rhythm_sort_desc)
         
         if sort_options:
             self.on_sort_change(sort_options[0])
@@ -644,6 +646,11 @@ class HeatmapViewer:
         sort_values = self.sort_values.get(label)
         if sort_values is None: return
 
+        is_descending = self.rhythm_sort_desc if label == "Rhythmicity" else False
+        
+        if is_descending:
+            sort_values = -sort_values
+
         if self.is_emphasized and self.rhythm_mask is not None:
             final_indices = np.lexsort((sort_values, ~self.rhythm_mask))
         else:
@@ -652,7 +659,6 @@ class HeatmapViewer:
         self.image_artist.set_data(self.normalized_data[:, final_indices].T)
         self.ax_heatmap.set_ylabel(f"Cells (sorted by {label})")
         
-        # --- Add/Remove Visual Emphasis Overlay ---
         if self.emphasis_overlay:
             self.emphasis_overlay.remove()
             self.emphasis_overlay = None
@@ -660,38 +666,27 @@ class HeatmapViewer:
         if self.is_emphasized and self.rhythm_mask is not None:
             num_rhythmic = np.sum(self.rhythm_mask)
             total_cells = len(self.rhythm_mask)
-            
             if num_rhythmic < total_cells:
                 from matplotlib.patches import Rectangle
-                # The overlay covers the block of non-rhythmic cells at the bottom
                 height = total_cells - num_rhythmic
-                # The y-coordinate system for imshow starts at -0.5 at the top
                 y_start = num_rhythmic - 0.5 
-                
-                self.emphasis_overlay = Rectangle(
-                    xy=(-0.5, y_start),
-                    width=self.normalized_data.shape[0],
-                    height=height,
-                    facecolor='black',
-                    alpha=0.6,
-                    edgecolor='none',
-                    zorder=10 # Ensure it's drawn on top of the heatmap
-                )
+                self.emphasis_overlay = Rectangle(xy=(-0.5, y_start), width=self.normalized_data.shape[0], height=height, facecolor='black', alpha=0.6, edgecolor='none', zorder=10)
                 self.ax_heatmap.add_patch(self.emphasis_overlay)
 
         self.fig.canvas.draw_idle()
 
-    def update_phase_data(self, phases, rhythm_scores, rhythm_mask=None):
+    def update_phase_data(self, phases, rhythm_scores, rhythm_mask=None, sort_desc=True):
         self.phases = phases
         self.rhythm_scores = rhythm_scores
         self.rhythm_mask = rhythm_mask
+        self.rhythm_sort_desc = sort_desc
         
         self.sort_values = {}
         self.sort_values["Y-coordinate"] = self.roi_data[:, 1]
         if self.phases is not None:
             self.sort_values["Phase"] = self.phases
         if self.rhythm_scores is not None:
-            self.sort_values["Rhythmicity"] = -self.rhythm_scores
+            self.sort_values["Rhythmicity"] = self.rhythm_scores
 
         current_sort = self.radio_buttons.value_selected
         if current_sort in self.sort_values:
@@ -1587,6 +1582,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_single_panel(self, panel):
         layout = QtWidgets.QVBoxLayout(panel)
+
+        # File I/O
         io_box = QtWidgets.QGroupBox("File I/O")
         io_layout = QtWidgets.QGridLayout(io_box)
         self.btn_load_movie = QtWidgets.QPushButton("Load Movie...")
@@ -1607,6 +1604,8 @@ class MainWindow(QtWidgets.QMainWindow):
         s_layout.addWidget(self.status_traj_label)
         io_layout.addLayout(s_layout, 3, 0, 1, 2)
         layout.addWidget(io_box)
+
+        # ROI
         roi_box = QtWidgets.QGroupBox("Region of Interest (ROI)")
         roi_layout = QtWidgets.QHBoxLayout(roi_box)
         self.btn_define_roi = QtWidgets.QPushButton("Define Anatomical ROI...")
@@ -1616,6 +1615,8 @@ class MainWindow(QtWidgets.QMainWindow):
         roi_layout.addWidget(self.btn_define_roi)
         roi_layout.addWidget(self.btn_clear_roi)
         layout.addWidget(roi_box)
+
+        # Analysis params
         param_box = QtWidgets.QGroupBox("Analysis Parameters")
         param_layout = QtWidgets.QVBoxLayout(param_box)
         btn_row = QtWidgets.QHBoxLayout()
@@ -1647,23 +1648,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self._add_param_field(fl_layout, "max_interpolation_distance", 5.0)
         tabs.addTab(fl_tab, "Filtering")
         layout.addWidget(param_box)
+
+        # Phase params
         phase_box = QtWidgets.QGroupBox("Phase Map Parameters")
         phase_layout = QtWidgets.QFormLayout(phase_box)
-
+        self.analysis_method_combo = QtWidgets.QComboBox()
+        self.analysis_method_combo.addItems(["FFT (SNR)", "Cosinor (p-value)"])
+        phase_layout.addRow("Analysis Method:", self.analysis_method_combo)
         self._add_phase_field(phase_layout, "minutes_per_frame", 15.0)
+        self.discovered_period_edit = QtWidgets.QLineEdit("N/A")
+        self.discovered_period_edit.setReadOnly(True)
+        phase_layout.addRow("Discovered Period (hrs):", self.discovered_period_edit)
         self._add_phase_field(phase_layout, "period_min", 22.0)
         self._add_phase_field(phase_layout, "period_max", 28.0)
         self._add_phase_field(phase_layout, "grid_resolution", 100, int)
-        self._add_phase_field(phase_layout, "rhythm_threshold", 2.0)
+        
+        _, self.rhythm_threshold_label = self._add_phase_field(phase_layout, "rhythm_threshold", 2.0)
+        self.rhythm_threshold_label.setText("Rhythm SNR Threshold (>=):")
 
-        self.emphasize_rhythm_check = QtWidgets.QCheckBox("Emphasize rhythmic cells in all plots")
+        # Robust Row Widget Handling
+        rsquared_le, rsquared_label = self._add_phase_field(phase_layout, "r_squared_threshold", 0.3)
+        rsquared_label.setText("R-squared Threshold (>=):")
+        # Store references to the actual widgets in the row
+        self.rsquared_widgets = (rsquared_label, rsquared_le)
+
         self.emphasize_rhythm_check = QtWidgets.QCheckBox("Emphasize rhythmic cells in all plots")
         phase_layout.addRow(self.emphasize_rhythm_check)
-
         self.btn_regen_phase = QtWidgets.QPushButton("Update Plots")
         self.btn_regen_phase.setEnabled(False)
         phase_layout.addRow(self.btn_regen_phase)
         layout.addWidget(phase_box)
+
+        # Execution
         exec_box = QtWidgets.QGroupBox("Execution")
         exec_layout = QtWidgets.QVBoxLayout(exec_box)
         self.btn_run_analysis = QtWidgets.QPushButton("Run Full Analysis")
@@ -1678,15 +1694,20 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(exec_box)
         layout.addStretch(1)
 
+        # Set initial visibility
+        self._on_analysis_method_changed(0)
+
     def _add_param_field(self, layout, name, default):
         le = QtWidgets.QLineEdit(str(default))
         layout.addRow(QtWidgets.QLabel(f"{name}:"), le)
         self.params[name] = (le, type(default))
 
     def _add_phase_field(self, layout, name, default, typ=float):
+        label = QtWidgets.QLabel(f"{name}:")
         le = QtWidgets.QLineEdit(str(default))
-        layout.addRow(QtWidgets.QLabel(f"{name}:"), le)
+        layout.addRow(label, le)
         self.phase_params[name] = (le, typ)
+        return le, label # Return both the line edit and the label
 
     def _build_register_panel(self, panel):
         layout = QtWidgets.QVBoxLayout(panel)
@@ -1807,9 +1828,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_load_results.clicked.connect(self.load_results)
         self.btn_export_plot.clicked.connect(self.export_current_plot)
         self.btn_regen_phase.clicked.connect(self.regenerate_phase_maps)
-        
         self.emphasize_rhythm_check.stateChanged.connect(self.regenerate_phase_maps)
-                
+        
+        # Connect the dropdown to the new UI handler
+        self.analysis_method_combo.currentIndexChanged.connect(self._on_analysis_method_changed)
+
         self.btn_select_atlas.clicked.connect(self.select_atlas)
         self.btn_add_targets.clicked.connect(self.add_targets)
         self.btn_remove_target.clicked.connect(self.remove_target)
@@ -2211,17 +2234,19 @@ class MainWindow(QtWidgets.QMainWindow):
         for tab in single_animal_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), True)
         for tab in group_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), False)
         
-        phases, period, rhythm = None, None, None
+        # --- Correctly unpack all 5 return values ---
         try:
-            phase_args = {name: t(w.text()) for name, (w, t) in self.phase_params.items() if w.text() and name not in ("grid_resolution", "rhythm_threshold")}
-            phases, period, rhythm = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
+            phases, period, sort_scores, filter_scores, rhythm_sort_desc = self._calculate_rhythms()
         except Exception as e:
-            self.log_message(f"Could not pre-calculate phase data: {e}")
+            self.log_message(f"Could not calculate rhythms: {e}")
+            phases, period, sort_scores, rhythm_sort_desc = None, None, None, True
+
 
         is_emphasized = self.emphasize_rhythm_check.isChecked()
         
+        # Pass the 'sort_scores' to the HeatmapViewer for its "Rhythmicity" sort
         fig_h, _ = add_mpl_to_tab(self.heatmap_tab)
-        viewer_h = HeatmapViewer(fig_h, self.state.loaded_data, self.filtered_indices, phases, rhythm, is_emphasized)
+        viewer_h = HeatmapViewer(fig_h, self.state.loaded_data, self.filtered_indices, phases, sort_scores, is_emphasized, rhythm_sort_desc)
         self.visualization_widgets[self.heatmap_tab] = viewer_h
         
         fig_c, _ = add_mpl_to_tab(self.com_tab)
@@ -2232,8 +2257,63 @@ class MainWindow(QtWidgets.QMainWindow):
         viewer_t = TrajectoryInspector(fig_t, fig_t.add_subplot(111), self.state.loaded_data["trajectories"], movie)
         self.visualization_widgets[self.traj_tab] = viewer_t
         
-        self.regenerate_phase_maps() # This will now also update emphasis
+        self.regenerate_phase_maps()
         self.btn_export_plot.setEnabled(True)
+
+    def _calculate_rhythms(self):
+        """
+        Helper to run the selected rhythm analysis method.
+        Returns: (phases, period, sort_scores, filter_scores, sort_descending)
+        """
+        method = self.analysis_method_combo.currentText()
+        self.log_message(f"Calculating rhythms using {method} method...")
+
+        phase_args = {name: t(w.text()) for name, (w, t) in self.phase_params.items() if w.text() and name not in ("grid_resolution", "rhythm_threshold", "r_squared_threshold")}
+        if not phase_args.get("minutes_per_frame"):
+            raise ValueError("Minutes per frame is required.")
+        
+        _, discovered_period, _ = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
+        self.discovered_period_edit.setText(f"{discovered_period:.2f}")
+
+        if "FFT" in method:
+            phases, period, snr_scores = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
+            # For FFT, sort and filter scores are the same
+            return phases, period, snr_scores, snr_scores, True
+        elif "Cosinor" in method:
+            traces = self.state.loaded_data["traces"]
+            time_points = traces[:, 0] * (phase_args["minutes_per_frame"] / 60.0)
+            
+            phases, p_values, r_squareds = [], [], []
+            for i in range(1, traces.shape[1]):
+                intensity = traces[:, i]
+                result = csn.cosinor_analysis(intensity, time_points, period=discovered_period)
+                phases.append(result['acrophase'])
+                p_values.append(result['p_value'])
+                r_squareds.append(result['r_squared'])
+
+            # For Cosinor, sort by R-squared, filter by p-value
+            return np.array(phases), discovered_period, np.array(r_squareds), np.array(p_values), True
+        
+        return None, None, None, None, True
+
+    @QtCore.pyqtSlot(int)
+    def _on_analysis_method_changed(self, index):
+        """Updates the UI when the analysis method dropdown changes."""
+        method = self.analysis_method_combo.currentText()
+        thresh_edit = self.phase_params["rhythm_threshold"][0]
+
+        if "FFT" in method:
+            self.rhythm_threshold_label.setText("Rhythm SNR Threshold (>=):")
+            thresh_edit.setText("2.0")
+            if hasattr(self, 'rsquared_widgets'):
+                for widget in self.rsquared_widgets:
+                    widget.hide()
+        elif "Cosinor" in method:
+            self.rhythm_threshold_label.setText("Rhythm p-value (<=):")
+            thresh_edit.setText("0.05")
+            if hasattr(self, 'rsquared_widgets'):
+                for widget in self.rsquared_widgets:
+                    widget.show()
 
     def regenerate_phase_maps(self):
         if not self.state.loaded_data or "traces" not in self.state.loaded_data:
@@ -2244,27 +2324,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_message("Updating plots based on phase parameters...")
         for tab in (self.phase_tab, self.interp_tab): clear_layout(tab.layout())
         try:
-            phase_args = {name: t(w.text()) for name, (w, t) in self.phase_params.items() if w.text() and name not in ("grid_resolution", "rhythm_threshold")}
-            phases, period, rhythm = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
+            phases, period, sort_scores, filter_scores, sort_desc = self._calculate_rhythms()
+            if phases is None:
+                raise ValueError("Rhythm calculation failed.")
+
+            method = self.analysis_method_combo.currentText()
+            p_thresh = float(self.phase_params["rhythm_threshold"][0].text())
             
-            thr = float(self.phase_params["rhythm_threshold"][0].text())
-            rhythm_mask = rhythm >= thr
+            if "Cosinor" in method:
+                r_thresh = float(self.phase_params["r_squared_threshold"][0].text())
+                # Two-factor filtering for Cosinor
+                rhythm_mask = (filter_scores <= p_thresh) & (sort_scores >= r_thresh)
+                self.log_message(f"Applying Cosinor filter: p <= {p_thresh} AND R² >= {r_thresh}")
+            else: # FFT
+                # Single-factor filtering for FFT
+                rhythm_mask = filter_scores >= p_thresh
+                self.log_message(f"Applying FFT filter: SNR >= {p_thresh}")
+
             is_emphasized = self.emphasize_rhythm_check.isChecked()
 
-            # --- UPDATE OTHER VIEWERS ---
             heatmap_viewer = self.visualization_widgets.get(self.heatmap_tab)
             if heatmap_viewer:
-                # This is the corrected call. It passes all new data to the heatmap.
-                heatmap_viewer.update_phase_data(phases, rhythm, rhythm_mask)
+                heatmap_viewer.update_phase_data(phases, sort_scores, rhythm_mask, sort_desc)
                 heatmap_viewer.update_rhythm_emphasis(rhythm_mask, is_emphasized)
             
             com_viewer = self.visualization_widgets.get(self.com_tab)
             if com_viewer:
                 com_viewer.update_rhythm_emphasis(rhythm_mask, is_emphasized)
 
-            # --- REGENERATE PHASE MAPS (which only show rhythmic cells) ---
             rhythmic_indices_relative = np.where(rhythm_mask)[0]
-            self.log_message(f"{len(rhythmic_indices_relative)} cells pass rhythmicity threshold {thr}.")
+            self.log_message(f"{len(rhythmic_indices_relative)} cells pass rhythmicity threshold(s).")
             
             if self.filtered_indices is not None:
                 rhythmic_indices_original = self.filtered_indices[rhythmic_indices_relative]
@@ -2300,7 +2389,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.log_message(f"Could not update plots: {e}")
             self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.phase_tab), False)
-            self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.interp_tab), False)
+            self.vis_tabs.indexOf(self.interp_tab), False
 
     # ------------ Registration panel actions ------------
 
