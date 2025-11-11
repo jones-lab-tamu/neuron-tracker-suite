@@ -1240,7 +1240,27 @@ class AnalysisWorker(QtCore.QObject):
             self.message.emit(tb)
             self.finished.emit(False, str(e))
 
+class MovieLoaderWorker(QtCore.QObject):
+    """Worker to load a movie file in a background thread."""
+    finished = QtCore.pyqtSignal(object)  # Emits the loaded numpy array
+    error = QtCore.pyqtSignal(str)
 
+    def __init__(self, movie_path):
+        super().__init__()
+        self.movie_path = movie_path
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            if not self.movie_path or not os.path.exists(self.movie_path):
+                raise FileNotFoundError("Movie file not found.")
+            data = skimage.io.imread(self.movie_path)
+            self.finished.emit(data)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.error.emit(f"Failed to load movie: {e}\n{tb}")
+            
 # ------------------------------------------------------------
 # Main Window
 # ------------------------------------------------------------
@@ -1276,6 +1296,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._analysis_thread = None
         self._analysis_worker = None
+        self._movie_loader_thread = None
+        self._movie_loader_worker = None
 
         self._build_ui()
         self._connect_signals()
@@ -1771,17 +1793,80 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def load_results(self):
         basename = self.state.output_basename
-        if not basename: return
+        if not basename:
+            self.log_message("Error: Output basename not set.")
+            return
+
+        # Prevent starting a new load if one is already running
+        if self._movie_loader_thread is not None and self._movie_loader_thread.isRunning():
+            self.log_message("Movie is already being loaded.")
+            return
+
         try:
+            # Load small/fast files on the main thread
             self.state.unfiltered_data["traces"] = np.loadtxt(f"{basename}_traces.csv", delimiter=",")
             self.state.unfiltered_data["roi"] = np.loadtxt(f"{basename}_roi.csv", delimiter=",")
             self.state.unfiltered_data["trajectories"] = np.load(f"{basename}_trajectories.npy")
-            movie = skimage.io.imread(self.state.input_movie_path)
-            self.state.unfiltered_data["background"] = movie[len(movie) // 2]
-            self.log_message("Results loaded successfully.")
-            self.apply_roi_filter(None, None)
+            self.log_message("Loaded ROI and trace data.")
         except Exception as e:
-            self.log_message(f"Error loading results: {e}")
+            self.log_message(f"Error loading result files: {e}")
+            return
+
+        # Disable UI to prevent user interaction during load
+        self.btn_load_movie.setEnabled(False)
+        self.btn_load_results.setEnabled(False)
+        self.log_message("Loading movie in background... The UI will remain responsive.")
+
+        # Setup and start the background thread for the slow I/O operation
+        self._movie_loader_worker = MovieLoaderWorker(self.state.input_movie_path)
+        self._movie_loader_thread = QtCore.QThread(self)
+        self._movie_loader_worker.moveToThread(self._movie_loader_thread)
+
+        self._movie_loader_thread.started.connect(self._movie_loader_worker.run)
+        self._movie_loader_worker.finished.connect(self._on_movie_loaded)
+        self._movie_loader_worker.error.connect(self._on_movie_load_error)
+        
+        # Clean up the thread when it's done
+        self._movie_loader_worker.finished.connect(self._movie_loader_thread.quit)
+        self._movie_loader_thread.finished.connect(self._movie_loader_thread.deleteLater)
+        self._movie_loader_worker.finished.connect(self._movie_loader_worker.deleteLater)
+
+        self._movie_loader_thread.start()
+    
+    @QtCore.pyqtSlot(object)
+    def _on_movie_loaded(self, movie_data):
+        """Receives the loaded movie data from the worker thread."""
+        self.log_message("Movie loaded successfully.")
+        
+        # Extract the middle frame for the background image
+        self.state.unfiltered_data["background"] = movie_data[len(movie_data) // 2]
+        
+        # Re-enable UI
+        self.btn_load_movie.setEnabled(True)
+        self.btn_load_results.setEnabled(True)
+
+        # Now that all data is loaded, proceed with visualization
+        self.apply_roi_filter(None, None)
+
+        # Clear thread handles
+        self._movie_loader_thread = None
+        self._movie_loader_worker = None
+
+    @QtCore.pyqtSlot(str)
+    def _on_movie_load_error(self, error_message):
+        """Receives an error message from the worker thread."""
+        self.log_message(f"--- MOVIE LOAD FAILED ---\n{error_message}")
+        
+        # Re-enable UI
+        self.btn_load_movie.setEnabled(True)
+        self.btn_load_results.setEnabled(True)
+
+        # Clean up the failed thread
+        if self._movie_loader_thread:
+            self._movie_loader_thread.quit()
+            self._movie_loader_thread.wait()
+        self._movie_loader_thread = None
+        self._movie_loader_worker = None
 
     def open_roi_tool(self):
         if "background" not in self.state.unfiltered_data:
