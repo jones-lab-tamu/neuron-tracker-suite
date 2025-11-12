@@ -44,7 +44,7 @@ from matplotlib.backends.backend_qt5agg import (
 )
 from matplotlib.widgets import Slider, RadioButtons
 
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtWidgets, QtGui
 
 import neuron_tracker_core as ntc
 import cosinor as csn
@@ -52,6 +52,85 @@ import cosinor as csn
 # ------------------------------------------------------------
 # Centralized State Management
 # ------------------------------------------------------------
+
+# ------------------------------------------------------------
+# Tooltip Helper
+# ------------------------------------------------------------
+class Tooltip(QtCore.QObject):
+    """A custom tooltip that can be styled and supports rich text."""
+    _instance = None
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._label = QtWidgets.QLabel(
+            None,
+            flags=QtCore.Qt.ToolTip | QtCore.Qt.BypassWindowManagerHint,
+        )
+        self._label.setWindowOpacity(0.95)
+        self._label.setStyleSheet("""
+            QLabel {
+                border: 1px solid #555;
+                padding: 5px;
+                background-color: #ffffe0; /* Light yellow */
+                color: #000;
+                border-radius: 3px;
+            }
+        """)
+        self._label.setWordWrap(True)
+        self._label.setAlignment(QtCore.Qt.AlignLeft)
+        self._timer = QtCore.QTimer(self, singleShot=True)
+        self._timer.setInterval(750)  # ms delay
+        self._timer.timeout.connect(self._show)
+        self._text = ""
+
+    def _show(self):
+        if not self._text:
+            return
+        self._label.setText(self._text)
+        self._label.adjustSize()
+        pos = QtGui.QCursor.pos()
+        x = pos.x() + 20
+        y = pos.y() + 20
+        
+        screen_geo = QtWidgets.QApplication.desktop().availableGeometry(pos)
+        if x + self._label.width() > screen_geo.right():
+            x = pos.x() - self._label.width() - 20
+        if y + self._label.height() > screen_geo.bottom():
+            y = pos.y() - self._label.height() - 20
+            
+        self._label.move(x, y)
+        self._label.show()
+
+    def show_tooltip(self, text):
+        self._text = text
+        self._timer.start()
+
+    def hide_tooltip(self):
+        self._timer.stop()
+        self._label.hide()
+
+    @classmethod
+    def install(cls, widget, text):
+        if cls._instance is None:
+            # Ensure the instance has a parent to be properly managed
+            parent = widget.window() if widget.window() else QtWidgets.QApplication.instance()
+            cls._instance = cls(parent)
+        
+        widget.setMouseTracking(True)
+        
+        class Filter(QtCore.QObject):
+            def eventFilter(self, obj, event):
+                if obj == widget:
+                    if event.type() == QtCore.QEvent.Enter:
+                        cls._instance.show_tooltip(text)
+                    elif event.type() == QtCore.QEvent.Leave:
+                        cls._instance.hide_tooltip()
+                return False
+
+        if not hasattr(widget, '_tooltip_filter'):
+            widget._tooltip_filter = Filter(widget)
+            widget.installEventFilter(widget._tooltip_filter)
+
 class AnalysisState:
     """A simple class to hold all application state."""
     def __init__(self):
@@ -1463,6 +1542,7 @@ class MainWindow(QtWidgets.QMainWindow):
         exec_box = QtWidgets.QGroupBox("Execution")
         exec_layout = QtWidgets.QVBoxLayout(exec_box)
         self.btn_run_analysis = QtWidgets.QPushButton("Run Full Analysis")
+        Tooltip.install(self.btn_run_analysis, "Performs the complete cell tracking and trace extraction pipeline on the loaded movie. This may take several minutes and will overwrite existing result files for this movie.")
         self.btn_run_analysis.setEnabled(False)
         self.btn_load_results = QtWidgets.QPushButton("Load Existing Results")
         self.btn_load_results.setEnabled(False)
@@ -1474,8 +1554,8 @@ class MainWindow(QtWidgets.QMainWindow):
         exec_layout.addWidget(self.btn_load_results)
         exec_layout.addWidget(self.btn_export_data)
         exec_layout.addWidget(self.btn_export_plot)
-        self.ctrl_layout.addWidget(exec_box) # Add to self.ctrl_layout
-        self.ctrl_layout.addStretch(1) # Add stretch to push it up
+        self.ctrl_layout.addWidget(exec_box)
+        self.ctrl_layout.addStretch(1)
 
         self._build_vis_tabs()
 
@@ -1557,11 +1637,33 @@ class MainWindow(QtWidgets.QMainWindow):
         roi_layout = QtWidgets.QHBoxLayout(roi_box)
         self.btn_define_roi = QtWidgets.QPushButton("Define Anatomical ROI...")
         self.btn_define_roi.setEnabled(False)
+        Tooltip.install(self.btn_define_roi, "Launches the ROI drawing tool. This is required to create the `_anatomical_roi.json` file, which is a prerequisite for the Atlas Registration workflow.")
         self.btn_clear_roi = QtWidgets.QPushButton("Clear ROI Filter")
         self.btn_clear_roi.setEnabled(False)
         roi_layout.addWidget(self.btn_define_roi)
         roi_layout.addWidget(self.btn_clear_roi)
         layout.addWidget(roi_box)
+        
+        param_tooltips = {
+            "sigma1": "<b>What it is:</b> The size (pixels) of the smaller Gaussian blur, roughly the radius of your cells.<br><b>How to tune it:</b> Decrease for smaller cells, increase for larger cells.<br><b>Trade-off:</b> Too small detects noise; too large merges cells.",
+            "sigma2": "<b>What it is:</b> The size (pixels) of the larger Gaussian blur for background subtraction.<br><b>How to tune it:</b> Increase for large, uneven background brightness.<br><b>Trade-off:</b> Too small subtracts cells; too large is ineffective.",
+            "blur_sigma": "<b>What it is:</b> A small blur applied before ranking features by brightness.<br><b>How to tune it:</b> A small value (1-2 pixels) makes brightness measurement more stable.<br><b>Trade-off:</b> 0 is fine, but slight blurring is often more robust.",
+            "max_features": "<b>What it is:</b> The max number of brightest features to consider in any single frame.<br><b>How to tune it:</b> Set higher than the max number of cells you expect to see.<br><b>Trade-off:</b> Too low misses cells; too high includes noise and slows analysis.",
+            "search_range": "<b>What it is:</b> Max number of frames to look backward in time to link a track.<br><b>How to tune it:</b> Increase if cells can disappear for long periods.<br><b>Trade-off:</b> Too high increases incorrect matches and slows tracking.",
+            "cone_radius_base": "<b>What it is:</b> The initial search radius (pixels) for linking a cell to the very next frame.<br><b>How to tune it:</b> Increase if cells move rapidly between frames.<br><b>Trade-off:</b> Too small fails to track fast cells; too large risks mismatches with neighbors.",
+            "cone_radius_multiplier": "<b>What it is:</b> A factor allowing the search radius to grow for linking across larger time gaps.<br><b>How to tune it:</b> Advanced. Leave at default unless movement is very erratic.<br><b>Trade-off:</b> Helps track fast cells over gaps, but increases mismatch risk.",
+            "min_trajectory_length": "<b>What it is:</b> The minimum track length as a fraction of total movie length (e.g., 0.08 = 8%).<br><b>How to tune it:</b> Increase to be stricter; decrease to include transient cells.<br><b>Trade-off:</b> Too high discards valid cells; too low includes noisy false-positives.",
+            "sampling_box_size": "<b>What it is:</b> Side length (pixels) of the square box used to measure cell brightness.<br><b>How to tune it:</b> Should be large enough to encompass the entire cell (e.g., 2-3x cell diameter).<br><b>Trade-off:</b> Too small misses signal; too large includes background noise.",
+            "sampling_sigma": "<b>What it is:</b> Blur applied within the sampling box for a weighted measurement.<br><b>How to tune it:</b> Should be close to the cell's radius. A value of 0 is a simple average.<br><b>Trade-off:</b> A good value (e.g., 2.0) makes the measurement robust to tracking jitter.",
+            "max_interpolation_distance": "<b>What it is:</b> A safety check. Tracks with a frame-to-frame jump larger than this (in pixels) are discarded.<br><b>How to tune it:</b> Set slightly larger than the max plausible distance a cell could move in one frame.<br><b>Trade-off:</b> Too low discards valid fast cells; too high fails to catch errors.",
+            "minutes_per_frame": "<b>REQUIRED:</b> The sampling interval of your recording in minutes.",
+            "period_min": "<b>Optional:</b> Constrains the rhythm search to periods LONGER than this value (in hours).",
+            "period_max": "<b>Optional:</b> Constrains the rhythm search to periods SHORTER than this value (in hours).",
+            "grid_resolution": "<b>What it is:</b> The resolution of the grid used for interpolated and group average maps.<br><b>How to tune it:</b> Higher values produce a smoother, higher-resolution image but can take longer to compute.",
+            "rhythm_threshold": "<b>What it is:</b> The cutoff for considering a cell 'rhythmic'. Its meaning depends on the selected Analysis Method.<br><b>FFT (SNR):</b> A signal-to-noise ratio. A value >= 2.0 is a good start.<br><b>Cosinor (p-value):</b> The statistical significance. A value less than or equal to 0.05 is standard.",
+            "r_squared_threshold": "<b>What it is:</b> (Cosinor only) The 'goodness-of-fit'. Filters for cells where the cosine model explains at least this much of the data's variance.<br><b>How to tune it:</b> A value >= 0.3 is a reasonable starting point for finding well-fit rhythms."
+        }
+        
         param_box = QtWidgets.QGroupBox("Analysis Parameters")
         param_layout = QtWidgets.QVBoxLayout(param_box)
         btn_row = QtWidgets.QHBoxLayout()
@@ -1574,23 +1676,23 @@ class MainWindow(QtWidgets.QMainWindow):
         param_layout.addWidget(tabs)
         det_tab = QtWidgets.QWidget()
         det_layout = QtWidgets.QFormLayout(det_tab)
-        self._add_param_field(det_layout, "sigma1", 3.0)
-        self._add_param_field(det_layout, "sigma2", 20.0)
-        self._add_param_field(det_layout, "blur_sigma", 2.0)
-        self._add_param_field(det_layout, "max_features", 200)
+        self._add_param_field(det_layout, "sigma1", 3.0, param_tooltips)
+        self._add_param_field(det_layout, "sigma2", 20.0, param_tooltips)
+        self._add_param_field(det_layout, "blur_sigma", 2.0, param_tooltips)
+        self._add_param_field(det_layout, "max_features", 200, param_tooltips)
         tabs.addTab(det_tab, "Detection")
         tr_tab = QtWidgets.QWidget()
         tr_layout = QtWidgets.QFormLayout(tr_tab)
-        self._add_param_field(tr_layout, "search_range", 50)
-        self._add_param_field(tr_layout, "cone_radius_base", 1.5)
-        self._add_param_field(tr_layout, "cone_radius_multiplier", 0.125)
+        self._add_param_field(tr_layout, "search_range", 50, param_tooltips)
+        self._add_param_field(tr_layout, "cone_radius_base", 1.5, param_tooltips)
+        self._add_param_field(tr_layout, "cone_radius_multiplier", 0.125, param_tooltips)
         tabs.addTab(tr_tab, "Tracking")
         fl_tab = QtWidgets.QWidget()
         fl_layout = QtWidgets.QFormLayout(fl_tab)
-        self._add_param_field(fl_layout, "min_trajectory_length", 0.08)
-        self._add_param_field(fl_layout, "sampling_box_size", 15)
-        self._add_param_field(fl_layout, "sampling_sigma", 2.0)
-        self._add_param_field(fl_layout, "max_interpolation_distance", 5.0)
+        self._add_param_field(fl_layout, "min_trajectory_length", 0.08, param_tooltips)
+        self._add_param_field(fl_layout, "sampling_box_size", 15, param_tooltips)
+        self._add_param_field(fl_layout, "sampling_sigma", 2.0, param_tooltips)
+        self._add_param_field(fl_layout, "max_interpolation_distance", 5.0, param_tooltips)
         tabs.addTab(fl_tab, "Filtering")
         layout.addWidget(param_box)
         phase_box = QtWidgets.QGroupBox("Phase Map Parameters")
@@ -1598,36 +1700,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self.analysis_method_combo = QtWidgets.QComboBox()
         self.analysis_method_combo.addItems(["FFT (SNR)", "Cosinor (p-value)"])
         phase_layout.addRow("Analysis Method:", self.analysis_method_combo)
-        self._add_phase_field(phase_layout, "minutes_per_frame", 15.0)
+        self._add_phase_field(phase_layout, "minutes_per_frame", 15.0, tooltips=param_tooltips)
         self.discovered_period_edit = QtWidgets.QLineEdit("N/A")
         self.discovered_period_edit.setReadOnly(True)
         phase_layout.addRow("Discovered Period (hrs):", self.discovered_period_edit)
-        self._add_phase_field(phase_layout, "period_min", 22.0)
-        self._add_phase_field(phase_layout, "period_max", 28.0)
-        self._add_phase_field(phase_layout, "grid_resolution", 100, int)
-        _, self.rhythm_threshold_label = self._add_phase_field(phase_layout, "rhythm_threshold", 2.0)
-        rsquared_le, rsquared_label = self._add_phase_field(phase_layout, "r_squared_threshold", 0.3)
+        self._add_phase_field(phase_layout, "period_min", 22.0, tooltips=param_tooltips)
+        self._add_phase_field(phase_layout, "period_max", 28.0, tooltips=param_tooltips)
+        self._add_phase_field(phase_layout, "grid_resolution", 100, int, param_tooltips)
+        _, self.rhythm_threshold_label = self._add_phase_field(phase_layout, "rhythm_threshold", 2.0, tooltips=param_tooltips)
+        rsquared_le, rsquared_label = self._add_phase_field(phase_layout, "r_squared_threshold", 0.3, tooltips=param_tooltips)
         self.rsquared_widgets = (rsquared_label, rsquared_le)
         self.emphasize_rhythm_check = QtWidgets.QCheckBox("Emphasize rhythmic cells in all plots")
+        Tooltip.install(self.emphasize_rhythm_check, "<b>What it is:</b> Visually distinguishes rhythmic from non-rhythmic cells in all plots.<br><b>How it works:</b> On the Center of Mass plot, non-rhythmic cells are shown as small, gray dots. On the Heatmap, they are sorted to the bottom and covered with a gray overlay.<br><b>Note:</b> All cells remain selectable for inspection, even when de-emphasized.")
         phase_layout.addRow(self.emphasize_rhythm_check)
         self.btn_regen_phase = QtWidgets.QPushButton("Update Plots")
+        Tooltip.install(self.btn_regen_phase, "Re-calculates all phase and rhythmicity data using the current parameters and updates all relevant plots (Heatmap, Center of Mass, Phase Maps).")
         self.btn_regen_phase.setEnabled(False)
         phase_layout.addRow(self.btn_regen_phase)
         layout.addWidget(phase_box)
         layout.addStretch(1)
         self._on_analysis_method_changed(0)
 
-    def _add_param_field(self, layout, name, default):
-        le = QtWidgets.QLineEdit(str(default))
-        layout.addRow(QtWidgets.QLabel(f"{name}:"), le)
-        self.params[name] = (le, type(default))
-
-    def _add_phase_field(self, layout, name, default, typ=float):
+    def _add_param_field(self, layout, name, default, tooltips=None):
         label = QtWidgets.QLabel(f"{name}:")
+        if tooltips and name in tooltips:
+            Tooltip.install(label, tooltips[name])
+        le = QtWidgets.QLineEdit(str(default))
+        layout.addRow(label, le)
+        self.params[name] = (le, type(default))
+        return le, label
+
+    def _add_phase_field(self, layout, name, default, typ=float, tooltips=None):
+        label = QtWidgets.QLabel(f"{name}:")
+        if tooltips and name in tooltips:
+            Tooltip.install(label, tooltips[name])
         le = QtWidgets.QLineEdit(str(default))
         layout.addRow(label, le)
         self.phase_params[name] = (le, typ)
-        return le, label # Return both the line edit and the label
+        return le, label
 
     def _build_register_panel(self, panel):
         layout = QtWidgets.QVBoxLayout(panel)
@@ -1698,10 +1808,12 @@ class MainWindow(QtWidgets.QMainWindow):
         form = QtWidgets.QFormLayout()
         self.group_grid_res_edit = QtWidgets.QLineEdit("50")
         self.group_smooth_check = QtWidgets.QCheckBox("Smooth to fill empty bins")
+        Tooltip.install(self.group_smooth_check, "<b>What it is:</b> A 3x3 circular mean smoothing filter.<br><b>How it works:</b> For each empty bin in the Group Average Map, it calculates the circular mean of its 8 neighbors. If any neighbors have data, the empty bin is filled with that mean value.<br><b>Trade-off:</b> Creates a visually smoother map but interpolates data. The unsmoothed map is a more direct representation of the raw data.")
         form.addRow("Grid Resolution:", self.group_grid_res_edit)
         form.addRow(self.group_smooth_check)
         b.addLayout(form)
         self.btn_view_group = QtWidgets.QPushButton("Generate Group Visualizations")
+        Tooltip.install(self.btn_view_group, "Loads all specified warped ROI and trace files, calculates phases, and generates the Group Scatter and Group Average Map plots.")
         self.btn_view_group.setEnabled(False)
         b.addWidget(self.btn_view_group)
         layout.addWidget(box)
