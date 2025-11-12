@@ -138,6 +138,7 @@ class AnalysisState:
 
     def reset(self):
         # File paths
+        self.project_path = "" # Path to the .ntp project file
         self.input_movie_path = ""
         self.output_basename = ""
         self.atlas_roi_path = ""
@@ -1431,7 +1432,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Neuron Analysis Workspace (PyQt)")
+        self.setWindowTitle("Neuron Analysis Workspace")
         self.resize(1400, 900)
 
         # Centralized state object
@@ -1455,13 +1456,120 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._analysis_thread = None
         self._analysis_worker = None
+        
         self._movie_loader_thread = None
         self._movie_loader_worker = None
 
         self._build_ui()
+        self._build_menu() # Call the new menu builder
         self._connect_signals()
 
     # ------------ UI construction ------------
+
+    def _build_menu(self):
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("&File")
+
+        open_action = QtWidgets.QAction("&Open Project...", self)
+        open_action.triggered.connect(self.load_project)
+        file_menu.addAction(open_action)
+
+        save_action = QtWidgets.QAction("&Save Project", self)
+        save_action.triggered.connect(self.save_project)
+        file_menu.addAction(save_action)
+
+        save_as_action = QtWidgets.QAction("Save Project &As...", self)
+        save_as_action.triggered.connect(lambda: self.save_project(save_as=True))
+        file_menu.addAction(save_as_action)
+        
+    def save_project(self, save_as=False):
+        """Saves the current session state to a project file."""
+        project_path = self.state.project_path
+        if not project_path or save_as:
+            start_dir = self._get_last_dir()
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Save Project", start_dir, "Neuron Tracker Project (*.ntp)"
+            )
+            if not path:
+                return
+            project_path = path
+        
+        try:
+            self._sync_state_from_ui()
+            state_to_save = {
+                'atlas_roi_path': self.state.atlas_roi_path,
+                'target_roi_paths': self.state.target_roi_paths,
+                'warp_param_paths': self.state.warp_param_paths,
+                'group_data_paths': self.state.group_data_paths,
+            }
+            with open(project_path, 'w') as f:
+                json.dump(state_to_save, f, indent=4)
+            
+            self._set_last_dir(project_path)
+            self.state.project_path = project_path
+            self.log_message(f"Project saved to {os.path.basename(self.state.project_path)}")
+            self.setWindowTitle(f"{os.path.basename(self.state.project_path)} - Neuron Analysis Workspace (PyQt)")
+
+        except Exception as e:
+            self.log_message(f"Error saving project: {e}")
+
+
+    def load_project(self):
+        """Loads a session state from a project file."""
+        start_dir = self._get_last_dir()
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open Project", start_dir, "Neuron Tracker Project (*.ntp)"
+        )
+        if not path:
+            return
+        
+        self._set_last_dir(path)
+        self._reset_state()
+        
+        try:
+            with open(path, 'r') as f:
+                loaded_state = json.load(f)
+            
+            self.state.project_path = path
+            self.state.atlas_roi_path = loaded_state.get('atlas_roi_path', "")
+            self.state.target_roi_paths = loaded_state.get('target_roi_paths', [])
+            self.state.warp_param_paths = loaded_state.get('warp_param_paths', [])
+            self.state.group_data_paths = loaded_state.get('group_data_paths', [])
+            
+            self.log_message(f"Loaded project: {os.path.basename(path)}")
+            self._update_ui_from_state()
+            self.setWindowTitle(f"{os.path.basename(path)} - Neuron Analysis Workspace (PyQt)")
+
+        except Exception as e:
+            self.log_message(f"Error loading project: {e}")
+
+    def _update_ui_from_state(self):
+        """Updates all UI list widgets to match the current state object."""
+        self.atlas_path_edit.setText(self.state.atlas_roi_path)
+        
+        self.target_list.clear()
+        self.target_list.addItems(self.state.target_roi_paths)
+        
+        self.warp_list.clear()
+        self.warp_list.addItems(self.state.warp_param_paths)
+        
+        self.group_list.clear()
+        self.group_list.addItems(self.state.group_data_paths)
+        
+        # Trigger updates for button enabled/disabled states
+        self._update_reg_button_state()
+        self.check_apply_warp_buttons_state()
+        self._update_group_view_button()
+        self.log_message("UI updated from loaded project.")
+
+    def _sync_state_from_ui(self):
+        """Updates the state object from the current UI list widgets."""
+        self.state.atlas_roi_path = self.atlas_path_edit.text()
+        
+        self.state.target_roi_paths = [self.target_list.item(i).text() for i in range(self.target_list.count())]
+        self.state.warp_param_paths = [self.warp_list.item(i).text() for i in range(self.warp_list.count())]
+        self.state.group_data_paths = [self.group_list.item(i).text() for i in range(self.group_list.count())]
+        self.log_message("Internal state synchronized from UI.")
 
     def export_current_data(self):
         current_tab = self.vis_tabs.currentWidget()
@@ -1484,10 +1592,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         base = self.state.output_basename
         if current_tab in [self.group_scatter_tab, self.group_avg_tab]:
-            base = "group_analysis" # Use a generic name for group exports
+            base = "group_analysis"
         
         default_filename = f"{os.path.basename(base)}_{default_filename}" if base else default_filename
-        suggested_path = os.path.join(os.path.dirname(base) if base else ".", default_filename)
+        
+        start_dir = self._get_last_dir()
+        suggested_path = os.path.join(start_dir, default_filename)
 
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save Data", suggested_path, "CSV files (*.csv)"
@@ -1496,6 +1606,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         
+        self._set_last_dir(path)
         try:
             df.to_csv(path, index=False)
             self.log_message(f"Data exported successfully to {os.path.basename(path)}")
@@ -1579,8 +1690,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_mode_section(self):
         box = QtWidgets.QGroupBox("Active Panel")
         layout = QtWidgets.QVBoxLayout(box)
+
         self.mode_buttons = {}
         self.mode_group = QtWidgets.QButtonGroup(self)
+
         def add_mode(key, label, enabled=True):
             btn = QtWidgets.QRadioButton(label)
             btn.setEnabled(enabled)
@@ -1590,10 +1703,12 @@ class MainWindow(QtWidgets.QMainWindow):
             btn.toggled.connect(
                 lambda checked, k=key: checked and self._switch_mode(k)
             )
+
         add_mode("single", "Single Animal", True)
-        add_mode("register", "Atlas Registration", False)
-        add_mode("apply_warp", "Apply Warp to Data", False)
+        add_mode("register", "Atlas Registration", True)
+        add_mode("apply_warp", "Apply Warp to Data", True)
         add_mode("group_view", "Group Data Viewer", True)
+
         self.mode_buttons["single"].setChecked(True)
         self.ctrl_layout.addWidget(box)
 
@@ -1913,6 +2028,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_traj_label.setText("Trajectories: —")
         self.progress_bar.setValue(0)
 
+    def _get_last_dir(self):
+        """Retrieves the last used directory from settings."""
+        settings = QtCore.QSettings()
+        return settings.value("last_dir", "")
+
+    def _set_last_dir(self, path):
+        """Saves a directory to settings for future use."""
+        if not path:
+            return
+        settings = QtCore.QSettings()
+        # If path is a file, get its directory; otherwise, assume it's a directory
+        directory = os.path.dirname(path) if os.path.isfile(path) else path
+        settings.setValue("last_dir", directory)
+
     def log_message(self, text: str):
         self.log_text.appendPlainText(text)
         self.log_text.verticalScrollBar().setValue(
@@ -1944,13 +2073,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def load_movie(self):
         self._reset_state()
+        start_dir = self._get_last_dir()
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select Movie", "", "TIFF files (*.tif *.tiff);;All files (*.*)"
+            self, "Select Movie", start_dir, "TIFF files (*.tif *.tiff);;All files (*.*)"
         )
         if not path:
             self.input_file_edit.clear()
             self.output_base_edit.clear()
             return
+        
+        self._set_last_dir(path)
         self.state.input_movie_path = path
         self.input_file_edit.setText(path)
         base, _ = os.path.splitext(path)
@@ -2164,18 +2296,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_roi_filter(None, None)
 
     def save_parameters(self):
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Parameters", "", "JSON files (*.json)")
-        if not path: return
+        start_dir = self._get_last_dir()
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Parameters", start_dir, "JSON files (*.json)"
+        )
+        if not path:
+            return
+        self._set_last_dir(path)
         data = {name: le.text() for name, (le, _) in self.params.items()}
-        with open(path, "w") as f: json.dump(data, f, indent=4)
+        with open(path, "w") as f:
+            json.dump(data, f, indent=4)
         self.log_message(f"Parameters saved to {os.path.basename(path)}")
 
     def load_parameters(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load Parameters", "", "JSON files (*.json)")
-        if not path: return
-        with open(path, "r") as f: data = json.load(f)
+        start_dir = self._get_last_dir()
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load Parameters", start_dir, "JSON files (*.json)"
+        )
+        if not path:
+            return
+        self._set_last_dir(path)
+        with open(path, "r") as f:
+            data = json.load(f)
         for name, value in data.items():
-            if name in self.params: self.params[name][0].setText(str(value))
+            if name in self.params:
+                self.params[name][0].setText(str(value))
         self.log_message(f"Parameters loaded from {os.path.basename(path)}")
 
     def export_current_plot(self):
@@ -2185,8 +2330,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log_message("No active figure to export.")
             return
         fig = viewer.fig
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Plot", "", "PNG files (*.png);;PDF files (*.pdf);;SVG files (*.svg)")
-        if not path: return
+        start_dir = self._get_last_dir()
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Plot", start_dir,
+            "PNG files (*.png);;PDF files (*.pdf);;SVG files (*.svg)"
+        )
+        if not path:
+            return
+        self._set_last_dir(path)
         try:
             fig.savefig(path, dpi=300, bbox_inches="tight")
             self.log_message(f"Plot saved to {os.path.basename(path)}")
@@ -2422,14 +2573,31 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------ Registration panel actions ------------
 
     def select_atlas(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Atlas ROI File", "", "Anatomical ROI files (*_anatomical_roi.json)")
-        if not path: return
+        start_dir = self._get_last_dir()
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Atlas ROI File",
+            start_dir,
+            "Anatomical ROI files (*_anatomical_roi.json)",
+        )
+        if not path:
+            return
+        self._set_last_dir(path)
         self.state.atlas_roi_path = path
         self.atlas_path_edit.setText(path)
         self._update_reg_button_state()
 
     def add_targets(self):
-        files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Select Target ROI Files", "", "Anatomical ROI files (*_anatomical_roi.json)")
+        start_dir = self._get_last_dir()
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Select Target ROI Files",
+            start_dir,
+            "Anatomical ROI files (*_anatomical_roi.json)",
+        )
+        if not files:
+            return
+        self._set_last_dir(files[0])
         for f in files:
             if f not in self.state.target_roi_paths:
                 self.state.target_roi_paths.append(f)
@@ -2440,6 +2608,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for item in self.target_list.selectedItems():
             row = self.target_list.row(item)
             path = self.target_list.item(row).text()
+            # Directly remove from state object
             if path in self.state.target_roi_paths:
                 self.state.target_roi_paths.remove(path)
             self.target_list.takeItem(row)
@@ -2459,7 +2628,16 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------ Apply warp panel actions ------------
 
     def add_warp_files(self):
-        files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Select Warp Parameter Files", "", "Warp Parameters (*_warp_parameters.json)")
+        start_dir = self._get_last_dir()
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Select Warp Parameter Files",
+            start_dir,
+            "Warp Parameters (*_warp_parameters.json)",
+        )
+        if not files:
+            return
+        self._set_last_dir(files[0])
         for f in files:
             if f not in self.state.warp_param_paths:
                 self.state.warp_param_paths.append(f)
@@ -2470,6 +2648,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for item in self.warp_list.selectedItems():
             row = self.warp_list.row(item)
             path = self.warp_list.item(row).text()
+            # Directly remove from state object
             if path in self.state.warp_param_paths:
                 self.state.warp_param_paths.remove(path)
             self.warp_list.takeItem(row)
@@ -2560,7 +2739,16 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------ Group panel actions ------------
 
     def add_group_files(self):
-        files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Select Warped ROI Files", "", "Warped ROI files (*_roi_warped.csv)")
+        start_dir = self._get_last_dir()
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Select Warped ROI Files",
+            start_dir,
+            "Warped ROI files (*_roi_warped.csv)",
+        )
+        if not files:
+            return
+        self._set_last_dir(files[0])
         for f in files:
             if f not in self.state.group_data_paths:
                 self.state.group_data_paths.append(f)
@@ -2571,6 +2759,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for item in self.group_list.selectedItems():
             row = self.group_list.row(item)
             path = self.group_list.item(row).text()
+            # Directly remove from state object
             if path in self.state.group_data_paths:
                 self.state.group_data_paths.remove(path)
             self.group_list.takeItem(row)
@@ -2679,6 +2868,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    
+    # Set application details for QSettings
+    QtCore.QCoreApplication.setOrganizationName("HerzogLab")
+    QtCore.QCoreApplication.setApplicationName("NeuronAnalysis")
+
     win = MainWindow()
     win.show()
     sys.exit(app.exec_())
