@@ -32,6 +32,8 @@ from scipy.stats import circmean
 from scipy.interpolate import RBFInterpolator
 from scipy.spatial import ConvexHull
 from scipy.ndimage import generic_filter
+from scipy.signal import medfilt
+from scipy.signal import find_peaks
 
 import skimage.io
 import colorcet as cet
@@ -1204,97 +1206,388 @@ class InterpolatedMapViewer:
 
 
 # ------------------------------------------------------------
-# Phase calculation (unchanged)
+# Phase calculation
 # ------------------------------------------------------------
 
-def calculate_phases_fft(traces_data, minutes_per_frame,
-                         period_min=None, period_max=None):
-    intensities = traces_data[:, 1:]
-    if intensities.shape[1] < 2: # Need at least 2 time points
-        return np.array([]), 0.0, np.array([])
+RHYTHM_TREND_WINDOW_HOURS = 36.0  # default detrend timescale for circadian work
+
+def compute_median_window_frames(minutes_per_frame, trend_window_hours, T=None):
+    """
+    Compute an odd-length median filter window in frames for a given trend window in hours.
+
+    Parameters:
+        minutes_per_frame : float
+            Sampling interval in minutes.
+        trend_window_hours : float
+            Desired width of the detrending window in hours.
+        T : int or None
+            Optional number of frames in the trace, used to cap the window.
+
+    Returns:
+        median_window_frames : int (odd, >= 3)
+    """
+    if minutes_per_frame <= 0:
+        # Fallback: use a small default window in frames if sampling is invalid
+        frames = 3
+    else:
+        hours_per_frame = minutes_per_frame / 60.0
+        if hours_per_frame <= 0:
+            frames = 3
+        else:
+            frames = int(round(trend_window_hours / hours_per_frame))
+            if frames < 3:
+                frames = 3
+
+    # Enforce odd window size
+    if frames % 2 == 0:
+        frames += 1
+
+    # Cap by T if provided and meaningful
+    if T is not None and T > 0:
+        if frames > T:
+            frames = T if (T % 2 == 1) else (T - 1)
+            if frames < 3:
+                frames = 3
+
+    return frames
+
+def preprocess_for_rhythmicity(trace, method="running_median",
+                               median_window_frames=None,
+                               poly_order=2):
+    """
+    Preprocess a raw fluorescence trace before rhythmicity analysis.
+    Returns a detrended trace suitable for FFT or cosinor.
+
+    Parameters:
+        trace: 1D numpy array
+        method: "running_median", "polynomial", or "none"
+        median_window_frames: int or None
+            If None and method == "running_median", caller must have computed a
+            suitable window; this function will fall back to a small default.
+        poly_order: polynomial order for polynomial detrending
+
+    Returns:
+        detrended_trace: 1D numpy array
+    """
+    trace = np.asarray(trace, dtype=float)
+
+    if method == "none":
+        return trace.copy()
+
+    x = np.arange(len(trace))
+
+    if method == "running_median":
+        # If the caller did not provide a window, fall back to a minimal safe default.
+        if median_window_frames is None:
+            median_window_frames = 3
+        if median_window_frames % 2 == 0:
+            median_window_frames += 1
+        baseline = medfilt(trace, kernel_size=median_window_frames)
+        detrended = trace - baseline
+        return detrended
+
+    if method == "polynomial":
+        # Global polynomial baseline
+        if trace.size < (poly_order + 1):
+            return trace.copy()
+        coeffs = np.polyfit(x, trace, poly_order)
+        baseline = np.polyval(coeffs, x)
+        detrended = trace - baseline
+        return detrended
+
+    # Fallback
+    return trace.copy()
+
+def estimate_cycle_count_from_trace(
+    trace,
+    minutes_per_frame,
+    period_hours,
+    detrend_method="running_median",
+    median_window_frames=None,
+    trend_window_hours=RHYTHM_TREND_WINDOW_HOURS,
+    smoothing_window_hours=2.0,
+    min_prominence_fraction=0.2,
+):
+    """
+    Estimate how many cycles a single trace contains around a target period.
+
+    Parameters:
+        trace : 1D array-like
+            Raw fluorescence trace for one cell.
+        minutes_per_frame : float
+            Sampling interval in minutes.
+        period_hours : float
+            Target period (e.g., 24.0 for circadian).
+        detrend_method : str
+            Method passed to preprocess_for_rhythmicity ("running_median", "polynomial", or "none").
+        median_window_frames : int or None
+            If None and detrend_method == "running_median", window is derived from
+            minutes_per_frame and trend_window_hours.
+        trend_window_hours : float
+            Trend window in hours for dynamic median-window computation.
+        smoothing_window_hours : float
+            Width of the smoothing window (in hours) for peak detection.
+        min_prominence_fraction : float
+            Minimum peak prominence as a fraction of the smoothed trace amplitude range.
+
+    Returns:
+        n_cycles : int
+            Estimated number of cycles (roughly number of usable peaks minus 1).
+        peak_indices : 1D np.ndarray of ints
+            Indices of peaks used for counting.
+    """
+    trace = np.asarray(trace, dtype=float)
+    T = trace.shape[0]
+    if T < 3:
+        return 0, np.array([], dtype=int)
+
+    # Choose median window in frames if needed
+    if detrend_method == "running_median" and median_window_frames is None:
+        median_window_frames = compute_median_window_frames(
+            minutes_per_frame,
+            trend_window_hours,
+            T=T,
+        )
+
+    detr = preprocess_for_rhythmicity(
+        trace,
+        method=detrend_method,
+        median_window_frames=median_window_frames,
+    )
 
     hours_per_frame = minutes_per_frame / 60.0
-    sampling_rate = 1.0 / hours_per_frame
+    if hours_per_frame <= 0:
+        return 0, np.array([], dtype=int)
 
-    nyquist = 0.5 * sampling_rate
-    cutoff = 1.0 / 40.0 # High-pass filter cutoff in Hz (1 cycle per 40 hours)
-    if cutoff >= nyquist:
-        # If cutoff is too high for the sampling rate, use a smaller fraction
-        cutoff = nyquist / 2.0
-        
-    b, a = signal.butter(3, cutoff / nyquist, btype="high", analog=False)
-    filtered = signal.filtfilt(b, a, intensities, axis=0)
+    window_frames = int(round(smoothing_window_hours / hours_per_frame))
+    if window_frames < 1:
+        window_frames = 1
+    if window_frames % 2 == 0:
+        window_frames += 1
 
-    mean_signal = filtered.mean(axis=1)
-    fft_pop = np.fft.fft(mean_signal)
-    freqs = np.fft.fftfreq(len(mean_signal), d=hours_per_frame)
-
-    pos_idx = np.where(freqs > 0)
-    pos_freqs = freqs[pos_idx]
-    pos_fft = fft_pop[pos_idx]
-    power_spectrum_pop = np.abs(pos_fft)
-
-    if period_min and period_max:
-        f_low, f_high = 1.0 / period_max, 1.0 / period_min
-        mask = (pos_freqs >= f_low) & (pos_freqs <= f_high)
-        if not np.any(mask):
-            raise ValueError("No FFT frequencies found in specified period range.")
-        search_power = power_spectrum_pop[mask]
-        sub_idx = np.argmax(search_power)
-        peak_idx = np.where(mask)[0][sub_idx]
+    if window_frames > 1:
+        kernel = np.ones(window_frames, dtype=float) / float(window_frames)
+        smooth = np.convolve(detr, kernel, mode="same")
     else:
-        peak_idx = np.argmax(power_spectrum_pop)
+        smooth = detr
 
-    dominant_freq = pos_freqs[peak_idx]
-    if dominant_freq == 0:
-        raise ValueError("Could not determine dominant frequency.")
+    amp_range = float(smooth.max() - smooth.min())
+    if amp_range <= 0:
+        return 0, np.array([], dtype=int)
 
-    period_hours = 1.0 / dominant_freq
+    prominence = amp_range * float(min_prominence_fraction)
+    if prominence <= 0:
+        prominence = amp_range * 0.1
 
-    phases = []
-    rhythm_snr_scores = []
+    peaks, _ = find_peaks(smooth, prominence=prominence)
+    if peaks.size == 0:
+        return 0, peaks
 
-    for i in range(filtered.shape[1]):
-        fft_cell = np.fft.fft(filtered[:, i])
-        cell_fft_pos = fft_cell[pos_idx]
-        
-        # Calculate phase (remains the same)
-        phase_angle = np.angle(cell_fft_pos[peak_idx])
-        phase_hours = -phase_angle / (2 * np.pi * dominant_freq)
-        phases.append(phase_hours)
-        
-        # --- New Rhythmicity Score: Signal-to-Noise Ratio ---
-        power_spectrum_cell = np.abs(cell_fft_pos)
-        
-        # Define signal band: +/- 1 frequency bin around the peak
-        signal_bins = slice(max(0, peak_idx - 1), peak_idx + 2)
-        signal_power = np.mean(power_spectrum_cell[signal_bins])
-        
-        # Define noise band: +/- 10 bins, excluding the signal band
-        noise_start = max(0, peak_idx - 10)
-        noise_end = peak_idx + 11
-        
-        # Create a mask to exclude the signal band from the noise calculation
-        noise_mask = np.ones(len(power_spectrum_cell), dtype=bool)
-        noise_mask[signal_bins] = False
-        
-        noise_indices = np.arange(len(power_spectrum_cell))[noise_start:noise_end]
-        valid_noise_indices = noise_indices[noise_mask[noise_start:noise_end]]
-        
-        if len(valid_noise_indices) > 0:
-            noise_power = np.mean(power_spectrum_cell[valid_noise_indices])
+    expected_frames = period_hours / hours_per_frame
+    if expected_frames <= 0:
+        return int(peaks.size), peaks
+
+    min_dist = 0.5 * expected_frames
+    max_dist = 1.5 * expected_frames
+
+    good_peaks = []
+    prev_peak = None
+    for idx in peaks:
+        if prev_peak is None:
+            good_peaks.append(idx)
+            prev_peak = idx
         else:
-            noise_power = 1e-9 # Avoid division by zero if spectrum is too narrow
+            d = idx - prev_peak
+            if min_dist <= d <= max_dist:
+                good_peaks.append(idx)
+                prev_peak = idx
+            elif d > max_dist:
+                good_peaks.append(idx)
+                prev_peak = idx
+            else:
+                continue
 
-        if noise_power > 0:
-            snr = signal_power / noise_power
-        else:
-            snr = np.inf # Effectively a perfect rhythm
-            
-        rhythm_snr_scores.append(snr)
+    good_peaks = np.array(good_peaks, dtype=int)
+    n_cycles = max(int(good_peaks.size - 1), 0)
+    return n_cycles, good_peaks
 
-    return np.array(phases), period_hours, np.array(rhythm_snr_scores)
+def strict_cycle_mask(
+    traces_data,
+    minutes_per_frame,
+    period_hours,
+    base_mask,
+    min_cycles=2,
+    detrend_method="running_median",
+    median_window_frames=None,
+    trend_window_hours=RHYTHM_TREND_WINDOW_HOURS,
+    smoothing_window_hours=2.0,
+    min_prominence_fraction=0.2,
+):
+    """
+    Refine a base rhythmicity mask by requiring a minimum number of cycles.
 
+    Parameters:
+        traces_data : 2D array-like, shape (T, N+1)
+            First column is time, remaining columns are per-cell traces.
+        minutes_per_frame : float
+            Sampling interval in minutes.
+        period_hours : float
+            Target period (e.g., 24.0 for circadian).
+        base_mask : 1D boolean array, length N
+            Initial rhythmicity decision per cell (e.g., Cosinor/FFT filter).
+        min_cycles : int
+            Minimum number of cycles required to keep a cell as "rhythmic".
+        detrend_method, median_window_frames, trend_window_hours,
+        smoothing_window_hours, min_prominence_fraction :
+            Parameters passed through to estimate_cycle_count_from_trace.
+
+    Returns:
+        strict_mask : 1D boolean np.ndarray, length N
+            Refined mask that incorporates both base_mask and cycle-count requirement.
+    """
+    traces_data = np.asarray(traces_data)
+    base_mask = np.asarray(base_mask, dtype=bool)
+
+    if traces_data.ndim != 2 or traces_data.shape[1] < 2:
+        raise ValueError("traces_data must have shape (T, N+1).")
+
+    T, cols = traces_data.shape
+    N = cols - 1
+
+    if base_mask.shape[0] != N:
+        raise ValueError("base_mask length must equal number of cells (N).")
+
+    strict_mask = base_mask.copy()
+    if not np.any(base_mask):
+        return strict_mask
+
+    intensities = traces_data[:, 1:]
+
+    for i in range(N):
+        if not base_mask[i]:
+            continue
+
+        trace = intensities[:, i]
+        n_cycles, _ = estimate_cycle_count_from_trace(
+            trace,
+            minutes_per_frame=minutes_per_frame,
+            period_hours=period_hours,
+            detrend_method=detrend_method,
+            median_window_frames=median_window_frames,
+            trend_window_hours=trend_window_hours,
+            smoothing_window_hours=smoothing_window_hours,
+            min_prominence_fraction=min_prominence_fraction,
+        )
+
+        if n_cycles < min_cycles:
+            strict_mask[i] = False
+
+    return strict_mask
+
+def calculate_phases_fft(traces_data,
+                         minutes_per_frame,
+                         period_min=None,
+                         period_max=None,
+                         detrend_method="running_median",
+                         detrend_window_frames=None,
+                         detrend_window_hours=RHYTHM_TREND_WINDOW_HOURS):
+    """
+    Compute per-cell FFT phases and a sideband-based SNR rhythmicity score.
+
+    Parameters:
+        traces_data: 2D array of shape (T, N+1) where first column is time
+                     and remaining columns are fluorescence traces.
+        minutes_per_frame: float
+        period_min, period_max: optional bounds on allowed periods (hours)
+        detrend_method: "running_median", "polynomial", or "none"
+        detrend_window_frames: int or None
+            If None and detrend_method == "running_median", the window will be
+            derived from minutes_per_frame and detrend_window_hours.
+        detrend_window_hours: float
+            Trend window width in hours for dynamic median-window computation.
+
+    Returns:
+        phases: array of shape (N,)
+        period_hours: float, dominant period
+        rhythm_snr_scores: array of shape (N,)
+    """
+
+    intensities = traces_data[:, 1:]        # (T, N)
+    T, N = intensities.shape
+
+    # Time → frequency mapping
+    dt_hours = minutes_per_frame / 60.0
+    freqs = np.fft.rfftfreq(T, d=dt_hours)
+
+    # Choose median window in frames if needed
+    if detrend_method == "running_median" and detrend_window_frames is None:
+        detrend_window_frames = compute_median_window_frames(
+            minutes_per_frame,
+            detrend_window_hours,
+            T=T,
+        )
+
+    # Detrend ALL traces before spectrum analysis
+    detrended = np.zeros_like(intensities)
+    for i in range(N):
+        detrended[:, i] = preprocess_for_rhythmicity(
+            intensities[:, i],
+            method=detrend_method,
+            median_window_frames=detrend_window_frames,
+        )
+
+    # Mean trace used to estimate dominant period
+    mean_signal = detrended.mean(axis=1)
+    fft_mean = np.fft.rfft(mean_signal)
+    power_mean = np.abs(fft_mean) ** 2
+
+    # Determine allowed frequency range for peak search
+    if period_min is not None and period_max is not None:
+        fmin = 1.0 / period_max
+        fmax = 1.0 / period_min
+        mask = (freqs >= fmin) & (freqs <= fmax)
+    else:
+        mask = np.ones_like(freqs, dtype=bool)
+
+    masked_power = power_mean.copy()
+    masked_power[~mask] = 0
+    peak_idx = np.argmax(masked_power)
+    peak_freq = freqs[peak_idx]
+    period_hours = 1.0 / peak_freq if peak_freq > 0 else np.inf
+
+    # Sideband SNR: signal band = ±1 bins; noise = ±10 bins outside that
+    signal_band = []
+    for off in (-1, 0, 1):
+        idx = peak_idx + off
+        if 0 <= idx < len(freqs):
+            signal_band.append(idx)
+    signal_band = np.array(signal_band, dtype=int)
+
+    noise_band = []
+    for off in range(2, 11):
+        for sign in (-1, +1):
+            idx = peak_idx + sign * off
+            if 0 <= idx < len(freqs):
+                noise_band.append(idx)
+    noise_band = np.array(noise_band, dtype=int)
+
+    phases = np.zeros(N)
+    rhythm_snr_scores = np.zeros(N)
+
+    for i in range(N):
+        trace = detrended[:, i]
+        fft_vals = np.fft.rfft(trace)
+        power_vals = np.abs(fft_vals) ** 2
+
+        complex_val = fft_vals[peak_idx]
+        phases[i] = np.angle(complex_val)
+
+        signal_power = power_vals[signal_band].sum()
+        noise_power = power_vals[noise_band].mean() if len(noise_band) > 0 else 1e-9
+        snr = signal_power / (noise_power + 1e-9)
+        rhythm_snr_scores[i] = snr
+
+    return phases, period_hours, rhythm_snr_scores
 
 # ------------------------------------------------------------
 # Analysis worker (QThread)
@@ -1815,23 +2108,59 @@ class MainWindow(QtWidgets.QMainWindow):
         self.analysis_method_combo = QtWidgets.QComboBox()
         self.analysis_method_combo.addItems(["FFT (SNR)", "Cosinor (p-value)"])
         phase_layout.addRow("Analysis Method:", self.analysis_method_combo)
+
+        # Core rhythmicity parameters
         self._add_phase_field(phase_layout, "minutes_per_frame", 15.0, tooltips=param_tooltips)
         self.discovered_period_edit = QtWidgets.QLineEdit("N/A")
         self.discovered_period_edit.setReadOnly(True)
         phase_layout.addRow("Discovered Period (hrs):", self.discovered_period_edit)
         self._add_phase_field(phase_layout, "period_min", 22.0, tooltips=param_tooltips)
         self._add_phase_field(phase_layout, "period_max", 28.0, tooltips=param_tooltips)
+
+        # Detrend window in hours (controls RHYTHM_TREND_WINDOW_HOURS behavior)
+        self._add_phase_field(phase_layout, "trend_window_hours", 36.0, tooltips=param_tooltips)
+
         self._add_phase_field(phase_layout, "grid_resolution", 100, int, param_tooltips)
-        _, self.rhythm_threshold_label = self._add_phase_field(phase_layout, "rhythm_threshold", 2.0, tooltips=param_tooltips)
-        rsquared_le, rsquared_label = self._add_phase_field(phase_layout, "r_squared_threshold", 0.3, tooltips=param_tooltips)
+        _, self.rhythm_threshold_label = self._add_phase_field(
+            phase_layout,
+            "rhythm_threshold",
+            2.0,
+            tooltips=param_tooltips,
+        )
+        rsquared_le, rsquared_label = self._add_phase_field(
+            phase_layout,
+            "r_squared_threshold",
+            0.3,
+            tooltips=param_tooltips,
+        )
         self.rsquared_widgets = (rsquared_label, rsquared_le)
+
+        # Rhythm emphasis checkbox
         self.emphasize_rhythm_check = QtWidgets.QCheckBox("Emphasize rhythmic cells in all plots")
-        Tooltip.install(self.emphasize_rhythm_check, "<b>What it is:</b> Visually distinguishes rhythmic from non-rhythmic cells in all plots.<br><b>How it works:</b> On the Center of Mass plot, non-rhythmic cells are shown as small, gray dots. On the Heatmap, they are sorted to the bottom and covered with a gray overlay.<br><b>Note:</b> All cells remain selectable for inspection, even when de-emphasized.")
+        Tooltip.install(
+            self.emphasize_rhythm_check,
+            "<b>What it does:</b> de-emphasizes non-rhythmic cells in all visualizations "
+            "(Heatmap, Center of Mass, Phase Maps). Rhythmic cells remain fully visible.",
+        )
         phase_layout.addRow(self.emphasize_rhythm_check)
+
+        # Strict cycle-count checkbox
+        self.strict_cycle_check = QtWidgets.QCheckBox("Require >= 2 cycles (strict filter)")
+        Tooltip.install(
+            self.strict_cycle_check,
+            "<b>What it does:</b> after FFT/Cosinor thresholds, only keeps cells that show at "
+            "least two cycles near the target period, based on peak counting.",
+        )
+        phase_layout.addRow(self.strict_cycle_check)
+
         self.btn_regen_phase = QtWidgets.QPushButton("Update Plots")
-        Tooltip.install(self.btn_regen_phase, "Re-calculates all phase and rhythmicity data using the current parameters and updates all relevant plots (Heatmap, Center of Mass, Phase Maps).")
+        Tooltip.install(
+            self.btn_regen_phase,
+            "Re-calculates all relevant plots (Heatmap, Center of Mass, Phase Maps).",
+        )
         self.btn_regen_phase.setEnabled(False)
         phase_layout.addRow(self.btn_regen_phase)
+
         layout.addWidget(phase_box)
         layout.addStretch(1)
         self._on_analysis_method_changed(0)
@@ -2454,26 +2783,78 @@ class MainWindow(QtWidgets.QMainWindow):
     def _calculate_rhythms(self):
         method = self.analysis_method_combo.currentText()
         self.log_message(f"Calculating rhythms using {method} method...")
-        phase_args = {name: t(w.text()) for name, (w, t) in self.phase_params.items() if w.text() and name not in ("grid_resolution", "rhythm_threshold", "r_squared_threshold")}
-        if not phase_args.get("minutes_per_frame"): raise ValueError("Minutes per frame is required.")
-        
-        _, discovered_period, _ = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
+
+        # Build phase_args from GUI fields, excluding non-analytic controls
+        phase_args = {
+            name: t(w.text())
+            for name, (w, t) in self.phase_params.items()
+            if w.text() and name not in ("grid_resolution", "rhythm_threshold", "r_squared_threshold")
+        }
+        if not phase_args.get("minutes_per_frame"):
+            raise ValueError("Minutes per frame is required.")
+
+        # Map GUI trend_window_hours -> detrend_window_hours argument
+        if "trend_window_hours" in phase_args:
+            phase_args["detrend_window_hours"] = phase_args.pop("trend_window_hours")
+
+        # Use FFT on detrended mean signal to discover dominant period
+        _, discovered_period, _ = calculate_phases_fft(
+            self.state.loaded_data["traces"],
+            **phase_args,
+        )
         self.discovered_period_edit.setText(f"{discovered_period:.2f}")
 
         if "FFT" in method:
-            phases, period, snr_scores = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
+            phases, period, snr_scores = calculate_phases_fft(
+                self.state.loaded_data["traces"],
+                **phase_args,
+            )
             return phases, period, snr_scores, snr_scores, True
+
         elif "Cosinor" in method:
             traces = self.state.loaded_data["traces"]
             time_points_hours = traces[:, 0] * (phase_args["minutes_per_frame"] / 60.0)
-            phases, p_values, r_squareds = [], [], []
+
+            phases = []
+            p_values = []
+            r_squareds = []
+
+            detrend_method = "running_median"
+            minutes_per_frame = phase_args["minutes_per_frame"]
+            T = traces.shape[0]
+            # Use the same trend window hours that FFT is using
+            trend_window_hours = phase_args.get("detrend_window_hours", RHYTHM_TREND_WINDOW_HOURS)
+            median_window_frames = compute_median_window_frames(
+                minutes_per_frame,
+                trend_window_hours,
+                T=T,
+            )
+
             for i in range(1, traces.shape[1]):
-                intensity = traces[:, i]
-                result = csn.cosinor_analysis(intensity, time_points_hours, period=discovered_period)
-                phases.append(result['acrophase'])
-                p_values.append(result['p_value'])
-                r_squareds.append(result['r_squared'])
-            return np.array(phases), discovered_period, np.array(r_squareds), np.array(p_values), True
+                raw_intensity = traces[:, i]
+                intensity = preprocess_for_rhythmicity(
+                    raw_intensity,
+                    method=detrend_method,
+                    median_window_frames=median_window_frames,
+                )
+
+                result = csn.cosinor_analysis(
+                    intensity,
+                    time_points_hours,
+                    period=discovered_period,
+                )
+
+                phases.append(result["acrophase"])
+                p_values.append(result["p_value"])
+                r_squareds.append(result["r_squared"])
+
+            return (
+                np.array(phases),
+                discovered_period,
+                np.array(r_squareds),
+                np.array(p_values),
+                True,
+            )
         return None, None, None, None, True
 
     @QtCore.pyqtSlot(int)
@@ -2506,6 +2887,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if phases is None: raise ValueError("Rhythm calculation failed.")
             method = self.analysis_method_combo.currentText()
             thresh = float(self.phase_params["rhythm_threshold"][0].text())
+
+            # Base rhythmicity mask from Cosinor or FFT
             if "Cosinor" in method:
                 r_thresh = float(self.phase_params["r_squared_threshold"][0].text())
                 rhythm_mask = (filter_scores <= thresh) & (sort_scores >= r_thresh)
@@ -2513,6 +2896,26 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 rhythm_mask = filter_scores >= thresh
                 self.log_message(f"Applying FFT filter: SNR >= {thresh}")
+
+            # Optional strict cycle-count filter (controlled by GUI checkbox)
+            if self.strict_cycle_check.isChecked():
+                minutes_per_frame = float(self.phase_params["minutes_per_frame"][0].text())
+                # Use the same trend window hours as the FFT/Cosinor detrending
+                try:
+                    trend_window_hours = float(self.phase_params["trend_window_hours"][0].text())
+                except Exception:
+                    trend_window_hours = RHYTHM_TREND_WINDOW_HOURS
+
+                rhythm_mask = strict_cycle_mask(
+                    self.state.loaded_data["traces"],
+                    minutes_per_frame=minutes_per_frame,
+                    period_hours=period,
+                    base_mask=rhythm_mask,
+                    min_cycles=2,
+                    trend_window_hours=trend_window_hours,
+                )
+                self.log_message("Strict cycle filter applied: requiring >= 2 cycles.")
+
             is_emphasized = self.emphasize_rhythm_check.isChecked()
             heatmap_viewer = self.visualization_widgets.get(self.heatmap_tab)
             if heatmap_viewer:
