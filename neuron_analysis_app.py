@@ -144,7 +144,8 @@ class AnalysisState:
         self.input_movie_path = ""
         self.output_basename = ""
         self.atlas_roi_path = ""
-        
+        self.reference_roi_path = ""
+
         # Lists for workflow panels
         self.target_roi_paths = []
         self.warp_param_paths = []
@@ -248,10 +249,20 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         btn_layout = QtWidgets.QHBoxLayout()
         self.include_btn = QtWidgets.QRadioButton("Include")
         self.exclude_btn = QtWidgets.QRadioButton("Exclude")
+        
+        self.ref_btn = QtWidgets.QRadioButton("Phase Reference")
+        self.ref_btn.setStyleSheet("color: blue;") # Make it visually distinct
+        
         self.include_btn.setChecked(True)
+        
+
         self.include_btn.toggled.connect(self.update_mode)
+        self.exclude_btn.toggled.connect(self.update_mode)
+        self.ref_btn.toggled.connect(self.update_mode)
+
         btn_layout.addWidget(self.include_btn)
         btn_layout.addWidget(self.exclude_btn)
+        btn_layout.addWidget(self.ref_btn)
 
         finish_btn = QtWidgets.QPushButton("Finish Polygon")
         finish_btn.clicked.connect(self.finish_polygon)
@@ -263,8 +274,28 @@ class ROIDrawerDialog(QtWidgets.QDialog):
 
         main_layout.addLayout(btn_layout)
 
-    def update_mode(self):
-        self.mode = "Include" if self.include_btn.isChecked() else "Exclude"
+    def update_plot(self):
+        if self.current_line is not None:
+            for artist in self.current_line:
+                artist.remove()
+        self.current_line = None
+
+        # --- COLOR LOGIC ---
+        color_map = {
+            "Include": ("g-", "g+"),
+            "Exclude": ("r-", "r+"),
+            "Phase Reference": ("b-", "b+")
+        }
+        line_color, point_color = color_map[self.mode]
+
+        if len(self.current_vertices) > 1:
+            xs, ys = zip(*self.current_vertices)
+            self.current_line = self.ax.plot(xs, ys, line_color)
+        elif self.current_vertices:
+            x, y = self.current_vertices[0]
+            self.current_line = self.ax.plot(x, y, point_color)
+
+        self.canvas.draw_idle()
 
     def on_click(self, event):
         if event.inaxes != self.ax:
@@ -313,62 +344,54 @@ class ROIDrawerDialog(QtWidgets.QDialog):
             self.canvas.draw_idle()
 
     def confirm_rois(self):
-        # Save anatomical ROI JSON
-        if self.rois and self.output_basename:
+        # Separate the ROIs by their purpose
+        anatomical_rois = [r for r in self.rois if r["mode"] in ("Include", "Exclude")]
+        phase_ref_rois = [r for r in self.rois if r["mode"] == "Phase Reference"]
+
+        # 1. Save the ANATOMICAL (warping) ROI JSON
+        if anatomical_rois and self.output_basename:
             filepath = f"{self.output_basename}_anatomical_roi.json"
             try:
                 serializable = [
                     {"path_vertices": roi["path_vertices"], "mode": roi["mode"]}
-                    for roi in self.rois
+                    for roi in anatomical_rois
                 ]
                 with open(filepath, "w") as f:
                     json.dump(serializable, f, indent=4)
             except Exception as e:
-                QtWidgets.QMessageBox.warning(
-                    self, "Save Error",
-                    f"Error saving ROI file:\n{e}"
-                )
+                QtWidgets.QMessageBox.warning(self, "Save Error", f"Error saving anatomical ROI file:\n{e}")
 
-        if not self.rois:
-            # no ROI → clear filter
+        # 2. Calculate the FILTERING based on Include/Exclude ROIs
+        if not anatomical_rois:
+            # No filter defined, pass back all data
             if self.callback:
-                self.callback(None, None)
+                self.callback(None, None, phase_ref_rois) # Still pass back phase ref
         else:
-            # build paths in memory
-            for roi in self.rois:
-                roi["path"] = Path(roi["path_vertices"])
+            # Build paths and calculate the final mask for filtering
             final_mask = np.zeros(len(self.roi_data), dtype=bool)
-
-            include_rois = [r for r in self.rois if r["mode"] == "Include"]
-            if include_rois:
-                for roi in include_rois:
-                    final_mask |= roi["path"].contains_points(self.roi_data)
+            include_paths = [Path(r["path_vertices"]) for r in anatomical_rois if r["mode"] == "Include"]
+            if include_paths:
+                for path in include_paths:
+                    final_mask |= path.contains_points(self.roi_data)
             else:
-                final_mask[:] = True
+                final_mask[:] = True # If only exclude ROIs are present, start with all points selected
 
-            for roi in self.rois:
+            for roi in anatomical_rois:
                 if roi["mode"] == "Exclude":
-                    final_mask &= ~roi["path"].contains_points(self.roi_data)
+                    final_mask &= ~Path(roi["path_vertices"]).contains_points(self.roi_data)
 
             filtered_indices = np.where(final_mask)[0]
 
-            # Save filtered ROI CSV
+            # Save the filtered ROI CSV
             if self.output_basename:
                 try:
-                    filtered = self.roi_data[filtered_indices]
-                    np.savetxt(
-                        f"{self.output_basename}_roi_filtered.csv",
-                        filtered,
-                        delimiter=",",
-                    )
+                    np.savetxt(f"{self.output_basename}_roi_filtered.csv", self.roi_data[filtered_indices], delimiter=",")
                 except Exception as e:
-                    QtWidgets.QMessageBox.warning(
-                        self, "Save Error",
-                        f"Error saving filtered ROI CSV:\n{e}"
-                    )
+                    QtWidgets.QMessageBox.warning(self, "Save Error", f"Error saving filtered ROI CSV:\n{e}")
 
+            # 3. Callback with ALL THREE pieces of information
             if self.callback:
-                self.callback(filtered_indices, self.rois)
+                self.callback(filtered_indices, anatomical_rois, phase_ref_rois)
 
         self.accept()
 
@@ -1747,6 +1770,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.phase_params = {}
         self.filtered_indices = None
         self.rois = None
+        self.phase_reference_rois = None
         self.vmin = None
         self.vmax = None
         self.visualization_widgets = {}
@@ -2120,6 +2144,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.analysis_method_combo = QtWidgets.QComboBox()
         self.analysis_method_combo.addItems(["FFT (SNR)", "Cosinor (p-value)"])
         phase_layout.addRow("Analysis Method:", self.analysis_method_combo)
+        
+        self.use_subregion_ref_check = QtWidgets.QCheckBox("Use Drawn Sub-Region as Phase Reference")
+        Tooltip.install(
+            self.use_subregion_ref_check,
+            "<b>What it does:</b> If checked, the mean phase of only the cells inside your drawn 'Phase Reference' polygon will be used as the 'zero point' for the phase map."
+        )
+        self.use_subregion_ref_check.setEnabled(False) # Disabled until a ref ROI is drawn
+        phase_layout.addRow(self.use_subregion_ref_check)        
 
         # Core rhythmicity parameters
         self._add_phase_field(phase_layout, "minutes_per_frame", 15.0, tooltips=param_tooltips)
@@ -2261,13 +2293,46 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self.btn_add_group)
         row.addWidget(self.btn_remove_group)
         b.addLayout(row)
-        form = QtWidgets.QFormLayout()
+        
+        
+        # Group box for analysis parameters
+        param_box = QtWidgets.QGroupBox("Group Analysis Parameters")
+        param_layout = QtWidgets.QFormLayout(param_box)
+
+        # Grid Resolution and Smoothing
         self.group_grid_res_edit = QtWidgets.QLineEdit("50")
         self.group_smooth_check = QtWidgets.QCheckBox("Smooth to fill empty bins")
         Tooltip.install(self.group_smooth_check, "<b>What it is:</b> A 3x3 circular mean smoothing filter.<br><b>How it works:</b> For each empty bin in the Group Average Map, it calculates the circular mean of its 8 neighbors. If any neighbors have data, the empty bin is filled with that mean value.<br><b>Trade-off:</b> Creates a visually smoother map but interpolates data. The unsmoothed map is a more direct representation of the raw data.")
-        form.addRow("Grid Resolution:", self.group_grid_res_edit)
-        form.addRow(self.group_smooth_check)
-        b.addLayout(form)
+        param_layout.addRow("Grid Resolution:", self.group_grid_res_edit)
+        param_layout.addRow(self.group_smooth_check)
+
+        # Normalization Method Radio Buttons
+        norm_label = QtWidgets.QLabel("Phase Normalization Method:")
+        self.norm_global_radio = QtWidgets.QRadioButton("Global Mean (per animal)")
+        self.norm_anatomical_radio = QtWidgets.QRadioButton("Anatomical Reference ROI")
+        self.norm_method_group = QtWidgets.QButtonGroup(self)
+        self.norm_method_group.addButton(self.norm_global_radio)
+        self.norm_method_group.addButton(self.norm_anatomical_radio)
+        self.norm_global_radio.setChecked(True) # Default option
+        
+        param_layout.addRow(norm_label)
+        param_layout.addRow(self.norm_global_radio)
+        param_layout.addRow(self.norm_anatomical_radio)
+
+        # Conditional widgets for Anatomical Reference
+        self.ref_roi_widget = QtWidgets.QWidget()
+        ref_roi_layout = QtWidgets.QHBoxLayout(self.ref_roi_widget)
+        ref_roi_layout.setContentsMargins(0, 0, 0, 0)
+        self.btn_select_ref_roi = QtWidgets.QPushButton("Load Reference ROI...")
+        self.ref_roi_path_edit = QtWidgets.QLineEdit()
+        self.ref_roi_path_edit.setReadOnly(True)
+        ref_roi_layout.addWidget(self.btn_select_ref_roi)
+        ref_roi_layout.addWidget(self.ref_roi_path_edit)
+        param_layout.addRow(self.ref_roi_widget)
+        self.ref_roi_widget.hide() # Hidden by default
+
+        b.addWidget(param_box)        
+        
         self.btn_view_group = QtWidgets.QPushButton("Generate Group Visualizations")
         Tooltip.install(self.btn_view_group, "Loads all specified warped ROI and trace files, calculates phases, and generates the Group Scatter and Group Average Map plots.")
         self.btn_view_group.setEnabled(False)
@@ -2318,10 +2383,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_export_data.clicked.connect(self.export_current_data)
         self.btn_regen_phase.clicked.connect(self.regenerate_phase_maps)
         self.emphasize_rhythm_check.stateChanged.connect(self.regenerate_phase_maps)
+        self.use_subregion_ref_check.stateChanged.connect(self.regenerate_phase_maps)
         
         # Connect the dropdown to the UI handler
         self.analysis_method_combo.currentIndexChanged.connect(self._on_analysis_method_changed)
-
+        
         self.btn_select_atlas.clicked.connect(self.select_atlas)
         self.btn_add_targets.clicked.connect(self.add_targets)
         self.btn_remove_target.clicked.connect(self.remove_target)
@@ -2334,6 +2400,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_add_group.clicked.connect(self.add_group_files)
         self.btn_remove_group.clicked.connect(self.remove_group_file)
         self.btn_view_group.clicked.connect(self.generate_group_visualizations)
+        
+        self.norm_anatomical_radio.toggled.connect(self._on_norm_method_changed)
+        self.btn_select_ref_roi.clicked.connect(self._select_reference_roi)
 
     # ------------ Mode & workflow helpers ------------
 
@@ -2628,9 +2697,17 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.exec_()
         self.update_workflow_from_files()
 
-    def apply_roi_filter(self, indices, rois):
+    def apply_roi_filter(self, indices, rois, phase_ref_rois):
         self.filtered_indices = indices
         self.rois = rois
+        self.phase_reference_rois = phase_ref_rois # Store the new data
+
+        # Enable/disable the checkbox based on whether a phase ref ROI was drawn
+        self.use_subregion_ref_check.setEnabled(bool(phase_ref_rois))
+        if not phase_ref_rois:
+            # If no phase ref ROI exists, ensure the checkbox is unchecked
+            self.use_subregion_ref_check.setChecked(False)
+
         if indices is None:
             self.state.loaded_data = dict(self.state.unfiltered_data)
             self.log_message("ROI filter cleared. Showing all data.")
@@ -2642,6 +2719,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.state.loaded_data["traces"] = self.state.unfiltered_data["traces"][:, trace_indices]
             self.log_message(f"ROI filter applied. {len(indices)} cells selected.")
             self.btn_clear_roi.setEnabled(True)
+        
         self.populate_visualizations()
 
     def clear_roi_filter(self):
@@ -2901,7 +2979,6 @@ class MainWindow(QtWidgets.QMainWindow):
             method = self.analysis_method_combo.currentText()
             thresh = float(self.phase_params["rhythm_threshold"][0].text())
 
-            # Base rhythmicity mask from Cosinor or FFT
             if "Cosinor" in method:
                 r_thresh = float(self.phase_params["r_squared_threshold"][0].text())
                 rhythm_mask = (filter_scores <= thresh) & (sort_scores >= r_thresh)
@@ -2910,15 +2987,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 rhythm_mask = filter_scores >= thresh
                 self.log_message(f"Applying FFT filter: SNR >= {thresh}")
 
-            # Optional strict cycle-count filter (controlled by GUI checkbox)
             if self.strict_cycle_check.isChecked():
                 minutes_per_frame = float(self.phase_params["minutes_per_frame"][0].text())
-                # Use the same trend window hours as the FFT/Cosinor detrending
                 try:
                     trend_window_hours = float(self.phase_params["trend_window_hours"][0].text())
                 except Exception:
                     trend_window_hours = RHYTHM_TREND_WINDOW_HOURS
-
                 rhythm_mask = strict_cycle_mask(
                     self.state.loaded_data["traces"],
                     minutes_per_frame=minutes_per_frame,
@@ -2937,12 +3011,10 @@ class MainWindow(QtWidgets.QMainWindow):
             com_viewer = self.visualization_widgets.get(self.com_tab)
             if com_viewer:
                 com_viewer.update_rhythm_emphasis(rhythm_mask, is_emphasized)
+            
             rhythmic_indices_relative = np.where(rhythm_mask)[0]
             self.log_message(f"{len(rhythmic_indices_relative)} cells pass rhythmicity threshold(s).")
-            if self.filtered_indices is not None:
-                rhythmic_indices_original = self.filtered_indices[rhythmic_indices_relative]
-            else:
-                rhythmic_indices_original = rhythmic_indices_relative
+            
             if len(rhythmic_indices_relative) == 0:
                 for t in [self.phase_tab, self.interp_tab]:
                     fig, canvas = add_mpl_to_tab(t)
@@ -2950,18 +3022,53 @@ class MainWindow(QtWidgets.QMainWindow):
                     ax.text(0.5, 0.5, "No cells passed the rhythmicity filter.", ha='center', va='center')
                     canvas.draw()
                 self.log_message("No cells passed rhythmicity filter.")
-                # Create an empty dataframe for the viewer to avoid crashing on export
+                
+                # Create an empty dataframe for the viewer to avoid crashing on export,
+                # but don't try to create a viewer with an undefined figure.
                 empty_df = pd.DataFrame()
+                fig_p, _ = add_mpl_to_tab(self.phase_tab) # This line was missing
                 viewer_p = PhaseMapViewer(fig_p, fig_p.add_subplot(111), self.state.unfiltered_data["background"], empty_df, None, vmin=self.vmin, vmax=self.vmax)
                 self.visualization_widgets[self.phase_tab] = viewer_p
                 return
 
-            ph_rad = (phases[rhythmic_indices_relative] % period) * (2 * np.pi / period)
-            mean_rad = circmean(ph_rad)
-            mean_h = mean_rad * (period / (2 * np.pi))
+            mean_h = 0.0
+            if self.use_subregion_ref_check.isChecked() and self.phase_reference_rois:
+                self.log_message("Using drawn sub-region as phase reference.")
+                
+                rhythmic_coords = self.state.loaded_data['roi'][rhythmic_indices_relative]
+                
+                ref_mask = np.zeros(len(rhythmic_coords), dtype=bool)
+                for roi in self.phase_reference_rois:
+                    path = Path(roi['path_vertices'])
+                    ref_mask |= path.contains_points(rhythmic_coords)
+                
+                ref_indices_in_rhythmic_array = np.where(ref_mask)[0]
+
+                if len(ref_indices_in_rhythmic_array) > 0:
+                    ref_phases = phases[rhythmic_indices_relative][ref_indices_in_rhythmic_array]
+                    ph_rad = (ref_phases % period) * (2 * np.pi / period)
+                    mean_rad = circmean(ph_rad)
+                    mean_h = mean_rad * (period / (2 * np.pi))
+                else:
+                    self.log_message("Warning: No rhythmic cells found in the reference sub-region. Falling back to global mean.")
+                    ph_rad = (phases[rhythmic_indices_relative] % period) * (2 * np.pi / period)
+                    mean_rad = circmean(ph_rad)
+                    mean_h = mean_rad * (period / (2 * np.pi))
+            else:
+                if self.use_subregion_ref_check.isChecked():
+                    self.log_message("Sub-region reference selected, but no sub-region is defined. Using global mean.")
+                
+                ph_rad = (phases[rhythmic_indices_relative] % period) * (2 * np.pi / period)
+                mean_rad = circmean(ph_rad)
+                mean_h = mean_rad * (period / (2 * np.pi))
+            
             rel_phases = (phases[rhythmic_indices_relative] - mean_h + period / 2) % period - period / 2
             
-            # --- DataFrame Creation with Dynamic Column Names ---
+            if self.filtered_indices is not None:
+                rhythmic_indices_original = self.filtered_indices[rhythmic_indices_relative]
+            else:
+                rhythmic_indices_original = rhythmic_indices_relative
+
             df_data = {
                 'Original_ROI_Index': rhythmic_indices_original + 1,
                 'X_Position': self.state.loaded_data['roi'][rhythmic_indices_relative, 0],
@@ -2994,6 +3101,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log_message("Phase-based plots updated.")
         except Exception as e:
             self.log_message(f"Could not update plots: {e}")
+            import traceback
+            self.log_message(traceback.format_exc())
             self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.phase_tab), False)
             self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.interp_tab), False)
 
@@ -3051,6 +3160,30 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg = RegistrationWindow(self, self.state, self.log_message)
         dlg.exec_()
         self.update_workflow_from_files()
+
+    @QtCore.pyqtSlot(bool)
+    def _on_norm_method_changed(self, checked):
+        """Shows or hides the reference ROI loader based on radio button selection."""
+        if self.norm_anatomical_radio.isChecked():
+            self.ref_roi_widget.show()
+        else:
+            self.ref_roi_widget.hide()
+            
+    def _select_reference_roi(self):
+        """Opens a file dialog to select the anatomical reference ROI."""
+        start_dir = self._get_last_dir()
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Anatomical Reference ROI File",
+            start_dir,
+            "JSON files (*.json)",
+        )
+        if not path:
+            return
+        self._set_last_dir(path)
+        self.state.reference_roi_path = path
+        self.ref_roi_path_edit.setText(path)
+        self.log_message(f"Loaded anatomical reference ROI: {os.path.basename(path)}")
 
     # ------------ Apply warp panel actions ------------
 
@@ -3199,10 +3332,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.state.group_data_paths:
             self.log_message("No group files selected.")
             return
+        
         self.log_message("Loading and processing group data...")
         single_animal_tabs = [self.heatmap_tab, self.com_tab, self.traj_tab, self.phase_tab, self.interp_tab]
         group_tabs = [self.group_scatter_tab, self.group_avg_tab]
+        
         try:
+            # --- Phase Calculation Setup ---
             valid_fft_keys = ["minutes_per_frame", "period_min", "period_max"]
             phase_args = {}
             for key in valid_fft_keys:
@@ -3213,46 +3349,139 @@ class MainWindow(QtWidgets.QMainWindow):
             if "minutes_per_frame" not in phase_args: raise ValueError("Minutes per Frame must be set for group analysis.")
             
             all_dfs = []
-            for i, roi_file in enumerate(self.state.group_data_paths):
-                self.log_message(f"  [{i + 1}/{len(self.state.group_data_paths)}] {os.path.basename(roi_file)}")
-                traces_file = roi_file.replace("_roi_warped.csv", "_traces.csv")
-                unfiltered_roi_file = roi_file.replace("_roi_warped.csv", "_roi.csv")
-                filtered_roi_file = roi_file.replace("_roi_warped.csv", "_roi_filtered.csv")
-                required_files = [traces_file, unfiltered_roi_file, filtered_roi_file, roi_file]
-                if not all(os.path.exists(f) for f in required_files):
-                    self.log_message("    Warning: missing one or more required files; skipping.")
-                    continue
-                warped_rois = np.atleast_2d(np.loadtxt(roi_file, delimiter=","))
-                filtered_rois = np.atleast_2d(np.loadtxt(filtered_roi_file, delimiter=","))
-                if warped_rois.shape[0] != filtered_rois.shape[0]:
-                    self.log_message(f"    ERROR: Data inconsistency detected. Warped file has {warped_rois.shape[0]} cells, but filtered file has {filtered_rois.shape[0]}. Skipping.")
-                    continue
-                traces = np.loadtxt(traces_file, delimiter=",")
-                unfiltered_rois = np.loadtxt(unfiltered_roi_file, delimiter=",")
-                indices = []
-                for point in filtered_rois:
-                    diff = np.sum((unfiltered_rois - point)**2, axis=1)
-                    idx = np.argmin(diff)
-                    if diff[idx] < 1e-9: indices.append(idx)
-                if len(indices) != filtered_rois.shape[0]:
-                    self.log_message("    Warning: Could not match filtered to unfiltered ROIs; skipping.")
-                    continue
-                trace_indices_to_keep = np.array(indices) + 1
-                filtered_traces_data = traces[:, np.concatenate(([0], trace_indices_to_keep))]
-                phases, period, _ = calculate_phases_fft(filtered_traces_data, **phase_args)
-                ph_rad = (phases % period) * (2 * np.pi / period)
-                mean_rad = circmean(ph_rad)
-                mean_h = mean_rad * (period / (2 * np.pi))
-                rel_phases = (phases - mean_h + period / 2) % period - period / 2
-                animal_df = pd.DataFrame({
-                    'Source_Animal': os.path.basename(roi_file).replace('_roi_warped.csv', ''),
-                    'Warped_X': warped_rois[:, 0],
-                    'Warped_Y': warped_rois[:, 1],
-                    'Relative_Phase_Hours': rel_phases,
-                    'Period_Hours': period
-                })
-                all_dfs.append(animal_df)
             
+            # --- METHOD DISPATCHER: Choose logic based on UI selection ---
+
+            # --- METHOD 1: Anatomical Reference Normalization ---
+            if self.norm_anatomical_radio.isChecked():
+                self.log_message("Using Anatomical Reference ROI normalization method.")
+                if not self.state.reference_roi_path or not os.path.exists(self.state.reference_roi_path):
+                    QtWidgets.QMessageBox.warning(self, "Error", "Anatomical Reference method selected, but no valid reference ROI file has been loaded.")
+                    return
+
+                # Load the reference ROI JSON file.
+                with open(self.state.reference_roi_path, 'r') as f:
+                    ref_rois_json = json.load(f)
+
+                for i, roi_file in enumerate(self.state.group_data_paths):
+                    self.log_message(f"  [{i + 1}/{len(self.state.group_data_paths)}] {os.path.basename(roi_file)}")
+                    # (File loading and index matching logic)
+                    traces_file = roi_file.replace("_roi_warped.csv", "_traces.csv")
+                    unfiltered_roi_file = roi_file.replace("_roi_warped.csv", "_roi.csv")
+                    filtered_roi_file = roi_file.replace("_roi_warped.csv", "_roi_filtered.csv")
+                    required_files = [traces_file, unfiltered_roi_file, filtered_roi_file, roi_file]
+                    if not all(os.path.exists(f) for f in required_files):
+                        self.log_message("    Warning: missing one or more required files; skipping.")
+                        continue
+                    warped_rois = np.atleast_2d(np.loadtxt(roi_file, delimiter=","))
+                    filtered_rois = np.atleast_2d(np.loadtxt(filtered_roi_file, delimiter=","))
+                    if warped_rois.shape[0] != filtered_rois.shape[0]:
+                        self.log_message(f"    ERROR: Data inconsistency detected. Skipping.")
+                        continue
+                    traces = np.loadtxt(traces_file, delimiter=",")
+                    unfiltered_rois = np.loadtxt(unfiltered_roi_file, delimiter=",")
+                    indices = []
+                    for point in filtered_rois:
+                        diff = np.sum((unfiltered_rois - point)**2, axis=1)
+                        idx = np.argmin(diff)
+                        if diff[idx] < 1e-9: indices.append(idx)
+                    if len(indices) != filtered_rois.shape[0]:
+                        self.log_message("    Warning: Could not match filtered to unfiltered ROIs; skipping.")
+                        continue
+                    trace_indices_to_keep = np.array(indices) + 1
+                    filtered_traces_data = traces[:, np.concatenate(([0], trace_indices_to_keep))]
+                    
+                    phases, period, _ = calculate_phases_fft(filtered_traces_data, **phase_args)
+
+                    # This logic correctly handles multiple "Include" polygons (e.g., for left and right SCN)
+                    # and any "Exclude" polygons, just like the main ROI tool.
+                    
+                    final_mask = np.zeros(len(warped_rois), dtype=bool)
+                    
+                    # Process all "Include" polygons first
+                    include_rois = [r for r in ref_rois_json if r.get("mode") == "Include"]
+                    if not include_rois:
+                        self.log_message("    Warning: The reference ROI file contains no 'Include' polygons. Skipping animal.")
+                        continue # A reference must have an include area.
+                    
+                    for roi in include_rois:
+                        path = Path(roi['path_vertices'])
+                        final_mask |= path.contains_points(warped_rois)
+
+                    # Process all "Exclude" polygons
+                    for roi in ref_rois_json:
+                        if roi.get("mode") == "Exclude":
+                            path = Path(roi['path_vertices'])
+                            final_mask &= ~path.contains_points(warped_rois)
+
+                    ref_indices = np.where(final_mask)[0]
+
+                    if len(ref_indices) == 0:
+                        self.log_message("    Warning: No rhythmic cells found inside the reference ROI for this animal; skipping.")
+                        continue
+
+                    ref_phases = phases[ref_indices]
+                    ref_rad = (ref_phases % period) * (2 * np.pi / period)
+                    ref_mean_rad = circmean(ref_rad)
+                    ref_mean_h = ref_mean_rad * (period / (2 * np.pi))
+
+                    rel_phases = (phases - ref_mean_h + period / 2) % period - period / 2
+
+                    animal_df = pd.DataFrame({
+                        'Source_Animal': os.path.basename(roi_file).replace('_roi_warped.csv', ''),
+                        'Warped_X': warped_rois[:, 0],
+                        'Warped_Y': warped_rois[:, 1],
+                        'Relative_Phase_Hours': rel_phases,
+                        'Period_Hours': period
+                    })
+                    all_dfs.append(animal_df)
+
+            # --- METHOD 2: Global Mean Normalization ---
+            else:
+                self.log_message("Using Global Mean (per animal) normalization method.")
+                for i, roi_file in enumerate(self.state.group_data_paths):
+                    self.log_message(f"  [{i + 1}/{len(self.state.group_data_paths)}] {os.path.basename(roi_file)}")
+                    traces_file = roi_file.replace("_roi_warped.csv", "_traces.csv")
+                    unfiltered_roi_file = roi_file.replace("_roi_warped.csv", "_roi.csv")
+                    filtered_roi_file = roi_file.replace("_roi_warped.csv", "_roi_filtered.csv")
+                    required_files = [traces_file, unfiltered_roi_file, filtered_roi_file, roi_file]
+                    if not all(os.path.exists(f) for f in required_files):
+                        self.log_message("    Warning: missing one or more required files; skipping.")
+                        continue
+                    warped_rois = np.atleast_2d(np.loadtxt(roi_file, delimiter=","))
+                    filtered_rois = np.atleast_2d(np.loadtxt(filtered_roi_file, delimiter=","))
+                    if warped_rois.shape[0] != filtered_rois.shape[0]:
+                        self.log_message(f"    ERROR: Data inconsistency detected. Skipping.")
+                        continue
+                    traces = np.loadtxt(traces_file, delimiter=",")
+                    unfiltered_rois = np.loadtxt(unfiltered_roi_file, delimiter=",")
+                    indices = []
+                    for point in filtered_rois:
+                        diff = np.sum((unfiltered_rois - point)**2, axis=1)
+                        idx = np.argmin(diff)
+                        if diff[idx] < 1e-9: indices.append(idx)
+                    if len(indices) != filtered_rois.shape[0]:
+                        self.log_message("    Warning: Could not match filtered to unfiltered ROIs; skipping.")
+                        continue
+                    trace_indices_to_keep = np.array(indices) + 1
+                    filtered_traces_data = traces[:, np.concatenate(([0], trace_indices_to_keep))]
+                    
+                    phases, period, _ = calculate_phases_fft(filtered_traces_data, **phase_args)
+                    ph_rad = (phases % period) * (2 * np.pi / period)
+                    mean_rad = circmean(ph_rad)
+                    mean_h = mean_rad * (period / (2 * np.pi))
+                    rel_phases = (phases - mean_h + period / 2) % period - period / 2
+                    
+                    animal_df = pd.DataFrame({
+                        'Source_Animal': os.path.basename(roi_file).replace('_roi_warped.csv', ''),
+                        'Warped_X': warped_rois[:, 0],
+                        'Warped_Y': warped_rois[:, 1],
+                        'Relative_Phase_Hours': rel_phases,
+                        'Period_Hours': period
+                    })
+                    all_dfs.append(animal_df)
+
+            # --- Downstream Processing (Identical for both methods) ---
             if not all_dfs: raise ValueError("No valid and consistent group data was loaded.")
             
             group_scatter_df = pd.concat(all_dfs, ignore_index=True)
