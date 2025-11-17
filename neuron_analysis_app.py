@@ -2781,6 +2781,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.visualization_widgets[self.heatmap_tab] = viewer_h
         
         fig_c, _ = add_mpl_to_tab(self.com_tab)
+        # Add filtered_indices=self.filtered_indices to the constructor call
         viewer_c = ContrastViewer(fig_c, fig_c.add_subplot(111), bg, self.state.loaded_data["roi"], self.on_contrast_change, self.on_roi_selected, filtered_indices=self.filtered_indices)
         self.visualization_widgets[self.com_tab] = viewer_c
         
