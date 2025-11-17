@@ -2191,9 +2191,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
         try:
             # Load small/fast files on the main thread
-            self.state.unfiltered_data["traces"] = np.loadtxt(f"{basename}_traces.csv", delimiter=",")
-            self.state.unfiltered_data["roi"] = np.loadtxt(f"{basename}_roi.csv", delimiter=",")
-            self.state.unfiltered_data["trajectories"] = np.load(f"{basename}_trajectories.npy")
+            traces = np.loadtxt(f"{basename}_traces.csv", delimiter=",")
+            roi = np.loadtxt(f"{basename}_roi.csv", delimiter=",")
+            traj = np.load(f"{basename}_trajectories.npy")
+
+            # --- Ensure consistent shapes, even for single-cell datasets ---
+            if isinstance(roi, np.ndarray) and roi.ndim == 1:
+                roi = roi.reshape(1, -1)
+            if isinstance(traces, np.ndarray) and traces.ndim == 1:
+                traces = traces.reshape(1, -1)
+
+            self.state.unfiltered_data["traces"] = traces
+            self.state.unfiltered_data["roi"] = roi
+            self.state.unfiltered_data["trajectories"] = traj
+
             self.log_message("Loaded ROI and trace data.")
         except Exception as e:
             self.log_message(f"Error loading result files: {e}")
@@ -2212,7 +2223,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._movie_loader_thread.started.connect(self._movie_loader_worker.run)
         self._movie_loader_worker.finished.connect(self._on_movie_loaded)
         self._movie_loader_worker.error.connect(self._on_movie_load_error)
-        
+
         # Clean up the thread when it's done
         self._movie_loader_worker.finished.connect(self._movie_loader_thread.quit)
         self._movie_loader_thread.finished.connect(self._movie_loader_thread.deleteLater)
