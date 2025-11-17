@@ -785,12 +785,13 @@ class HeatmapViewer:
         return df, "heatmap_data.csv"
 
 class ContrastViewer:
-    def __init__(self, fig, ax, bg_image, com_points, on_change_callback, on_select_callback):
+    def __init__(self, fig, ax, bg_image, com_points, on_change_callback, on_select_callback, filtered_indices=None):
         self.fig = fig
         self.ax = ax
         self.com_points = com_points
         self.on_change_callback = on_change_callback
         self.on_select_callback = on_select_callback
+        self.filtered_indices = filtered_indices
         self.highlight_artist = None
         self.scatter_artists = []
 
@@ -840,11 +841,22 @@ class ContrastViewer:
         if event.inaxes != self.ax or len(self.com_points) == 0:
             return
         distances = np.sqrt((self.com_points[:, 0] - event.xdata)**2 + (self.com_points[:, 1] - event.ydata)**2)
-        selected_index = np.argmin(distances)
+        selected_index = np.argmin(distances) # This is the local/filtered index
+
         if distances[selected_index] < 20:
+            # Highlight the point in this plot (uses the local index)
             self.highlight_point(selected_index)
+
             if self.on_select_callback:
-                self.on_select_callback(selected_index)
+                # If a filter is active, look up the true original index
+                if self.filtered_indices is not None:
+                    original_index = self.filtered_indices[selected_index]
+                # Otherwise, the local index IS the original index
+                else:
+                    original_index = selected_index
+                
+                # Send the CORRECT, original index to the main window
+                self.on_select_callback(original_index)
 
     def highlight_point(self, index):
         if self.highlight_artist:
@@ -2769,7 +2781,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.visualization_widgets[self.heatmap_tab] = viewer_h
         
         fig_c, _ = add_mpl_to_tab(self.com_tab)
-        viewer_c = ContrastViewer(fig_c, fig_c.add_subplot(111), bg, self.state.loaded_data["roi"], self.on_contrast_change, self.on_roi_selected)
+        viewer_c = ContrastViewer(fig_c, fig_c.add_subplot(111), bg, self.state.loaded_data["roi"], self.on_contrast_change, self.on_roi_selected, filtered_indices=self.filtered_indices)
         self.visualization_widgets[self.com_tab] = viewer_c
         
         fig_t, _ = add_mpl_to_tab(self.traj_tab)
