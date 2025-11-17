@@ -51,7 +51,7 @@ def cosinor_analysis(data, time, period):
     # --- Calculate Cosinor parameters ---
     mesor = M
     amplitude = np.sqrt(A**2 + B**2)
-    acrophase_rad = np.arctan2(-B, A)
+    acrophase_rad = np.arctan2(B, A)
     acrophase = (acrophase_rad / w) % period
 
     # --- Calculate goodness-of-fit statistics (p-value and R^2) ---

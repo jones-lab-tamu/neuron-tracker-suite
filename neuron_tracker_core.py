@@ -63,26 +63,51 @@ def process_frames(data, sigma1, sigma2, blur_sigma, max_features, progress_call
         im = data[t]
         ims.append(im)
 
+        # Difference of Gaussians on the negative image (to pick up bright blobs)
         fltrd = (
             scipy.ndimage.gaussian_filter(-im, sigma1)
             - scipy.ndimage.gaussian_filter(-im, sigma2)
         )
         fltrd = rescale(fltrd, 0.0, 1.0)
 
+        # Local minima in the filtered image
         locations = list(zip(*detect_local_minima(fltrd)))
-        if not locations:
-            # Ensure KDTree has at least one point
-            locations.append((-500, -500))
 
+        # If no detections in this frame, record an empty frame and skip KDTree
+        if not locations:
+            blob_lists.append([])
+            trees.append(None)
+
+            if (t + 1) % step == 0 or t == T - 1:
+                progress_callback(
+                    f"  Processed frame {t+1}/{T} ({100.0 * (t+1) / float(T):.1f}%)"
+                )
+            continue
+
+        # Rank by intensity on a blurred version of the original image
         blurred_im = scipy.ndimage.gaussian_filter(im, blur_sigma)
         mags = [blurred_im[i, j] for i, j in locations]
 
         indices = numpy.argsort(mags)
-        xys = [locations[i] for i in indices[-max_features:]]
+        indices = indices[-max_features:]  # safe even if len < max_features
+        xys = [locations[i] for i in indices]
 
+        # Guard against the degenerate case where xys somehow ends up empty
+        if not xys:
+            blob_lists.append([])
+            trees.append(None)
+
+            if (t + 1) % step == 0 or t == T - 1:
+                progress_callback(
+                    f"  Processed frame {t+1}/{T} ({100.0 * (t+1) / float(T):.1f}%)"
+                )
+            continue
+
+        # Assign unique IDs to each detected blob
         for x, y in xys:
             ids[(t, (x, y))] = len(ids)
 
+        # Store KDTree and blob list for this frame
         trees.append(scipy.spatial.KDTree(xys))
         blob_lists.append(xys)
 
@@ -113,7 +138,7 @@ def build_trajectories(
     graph = networkx.Graph()
 
     progress_callback("Stage 2/4: Building trajectories by connecting features...")
-    step = max(1, T // 20)
+    step = max(1, T // 20) if T > 0 else 1
 
     for t in range(1, T):
         if (t + 1) % step == 0 or t == T - 1:
@@ -122,11 +147,22 @@ def build_trajectories(
                 f"({100.0 * (t+1) / float(T):.1f}%)"
             )
 
+        # Skip frames with no detections in the current timepoint
+        if not blob_lists[t]:
+            continue
+
         for blob in blob_lists[t]:
             start = max(0, t - search_range)
+
+            # Walk backward through previous frames within search_range
             for bt in range(t - 1, start - 1, -1):
+                # Skip frames with no detections or no KDTree
+                if trees[bt] is None or not blob_lists[bt]:
+                    continue
+
                 distance, neighbor_idx = trees[bt].query(blob, 1)
                 cone_radius = cone_radius_base + cone_radius_multiplier * (t - bt)
+
                 if distance < cone_radius:
                     neighbor_coords = tuple(trees[bt].data[neighbor_idx])
                     graph.add_edge(ids[(bt, neighbor_coords)], ids[(t, blob)])
