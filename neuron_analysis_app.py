@@ -207,7 +207,7 @@ class ROIDrawerDialog(QtWidgets.QDialog):
     def __init__(self, parent, bg_image, roi_data, output_basename, callback, vmin=None, vmax=None):
         super().__init__(parent)
         self.setWindowTitle("Advanced ROI Definition Tool")
-        self.resize(900, 900)
+        self.resize(1100, 800) # Made slightly wider for the side panel
 
         self.bg_image = bg_image
         self.roi_data = roi_data
@@ -230,16 +230,14 @@ class ROIDrawerDialog(QtWidgets.QDialog):
                 except Exception as e:
                     print(f"Error loading existing ROIs: {e}")
 
-        main_layout = QtWidgets.QVBoxLayout(self)
+        # --- Layout Setup ---
+        # We use a Horizontal layout: Plot on Left, Controls on Right
+        main_layout = QtWidgets.QHBoxLayout(self)
 
-        info = QtWidgets.QLabel(
-            "Select mode, then left-click to draw polygon vertices.\n"
-            "Right-click to remove last point. Click 'Finish Polygon' to close."
-        )
-        info.setWordWrap(True)
-        main_layout.addWidget(info)
-
-        # Matplotlib
+        # LEFT: Plot Area
+        plot_widget = QtWidgets.QWidget()
+        plot_layout = QtWidgets.QVBoxLayout(plot_widget)
+        
         self.fig = Figure()
         self.ax = self.fig.add_subplot(111)
         self.ax.imshow(bg_image, cmap="gray", vmin=vmin, vmax=vmax)
@@ -251,55 +249,96 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         self.ax.set_title("Click to Define ROI Polygon")
         self.canvas = FigureCanvas(self.fig)
         toolbar = NavigationToolbar(self.canvas, self)
-        main_layout.addWidget(toolbar)
-        main_layout.addWidget(self.canvas)
-
-        self.cid = self.canvas.mpl_connect("button_press_event", self.on_click)
-
-        # Controls
-        btn_layout = QtWidgets.QHBoxLayout()
-        self.include_btn = QtWidgets.QRadioButton("Include")
-        self.exclude_btn = QtWidgets.QRadioButton("Exclude")
         
-        self.ref_btn = QtWidgets.QRadioButton("Phase Reference")
-        self.ref_btn.setStyleSheet("color: blue;")
+        plot_layout.addWidget(toolbar)
+        plot_layout.addWidget(self.canvas)
+        
+        main_layout.addWidget(plot_widget, stretch=3)
+
+        # RIGHT: Control Panel
+        ctrl_widget = QtWidgets.QWidget()
+        ctrl_layout = QtWidgets.QVBoxLayout(ctrl_widget)
+        
+        # Instructions
+        info = QtWidgets.QLabel(
+            "<b>Instructions:</b><br>"
+            "1. Select Mode below.<br>"
+            "2. Left-click on image to draw.<br>"
+            "3. Right-click to remove last point.<br>"
+            "4. Click 'Finish Polygon' to save.<br><br>"
+            "<b>To Delete:</b> Select from list and click Delete."
+        )
+        info.setWordWrap(True)
+        ctrl_layout.addWidget(info)
+        
+        # Mode Selection
+        mode_box = QtWidgets.QGroupBox("Drawing Mode")
+        mode_layout = QtWidgets.QVBoxLayout(mode_box)
+        self.include_btn = QtWidgets.QRadioButton("Include (Green)")
+        self.exclude_btn = QtWidgets.QRadioButton("Exclude (Red)")
+        self.ref_btn = QtWidgets.QRadioButton("Phase Ref (Blue)")
+        self.ref_btn.setStyleSheet("color: blue; font-weight: bold;")
         
         self.include_btn.setChecked(True)
-
         self.include_btn.toggled.connect(self.update_mode)
         self.exclude_btn.toggled.connect(self.update_mode)
         self.ref_btn.toggled.connect(self.update_mode)
-
-        btn_layout.addWidget(self.include_btn)
-        btn_layout.addWidget(self.exclude_btn)
-        btn_layout.addWidget(self.ref_btn)
-
-        finish_btn = QtWidgets.QPushButton("Finish Polygon")
-        finish_btn.clicked.connect(self.finish_polygon)
-        btn_layout.addWidget(finish_btn)
-
-        confirm_btn = QtWidgets.QPushButton("Confirm All ROIs")
-        confirm_btn.clicked.connect(self.confirm_rois)
-        btn_layout.addWidget(confirm_btn)
-
-        main_layout.addLayout(btn_layout)
         
-        # Draw any loaded ROIs immediately
+        mode_layout.addWidget(self.include_btn)
+        mode_layout.addWidget(self.exclude_btn)
+        mode_layout.addWidget(self.ref_btn)
+        ctrl_layout.addWidget(mode_box)
+
+        # Action Buttons
+        self.finish_btn = QtWidgets.QPushButton("Finish Polygon")
+        self.finish_btn.clicked.connect(self.finish_polygon)
+        ctrl_layout.addWidget(self.finish_btn)
+
+        # ROI List Management
+        list_label = QtWidgets.QLabel("Defined ROIs:")
+        ctrl_layout.addWidget(list_label)
+        
+        self.roi_list_widget = QtWidgets.QListWidget()
+        self.roi_list_widget.itemSelectionChanged.connect(self.highlight_selected_roi)
+        ctrl_layout.addWidget(self.roi_list_widget)
+        
+        self.delete_btn = QtWidgets.QPushButton("Delete Selected ROI")
+        self.delete_btn.clicked.connect(self.delete_selected_roi)
+        ctrl_layout.addWidget(self.delete_btn)
+        
+        ctrl_layout.addStretch()
+        
+        # Final Confirm
+        confirm_btn = QtWidgets.QPushButton("Save & Confirm All")
+        confirm_btn.setStyleSheet("font-weight: bold; padding: 5px;")
+        confirm_btn.clicked.connect(self.confirm_rois)
+        ctrl_layout.addWidget(confirm_btn)
+
+        main_layout.addWidget(ctrl_widget, stretch=1)
+
+        self.cid = self.canvas.mpl_connect("button_press_event", self.on_click)
+        
+        # Draw initial state
         self.redraw_finished_rois()
 
     def redraw_finished_rois(self):
-        # Remove old artists to avoid duplicates/ghosts
+        # 1. Clear Plot Artists
         for artist in self.finished_artists:
             artist.remove()
         self.finished_artists = []
+        
+        # 2. Clear List Widget (Block signals to prevent recursion/crash)
+        self.roi_list_widget.blockSignals(True)
+        self.roi_list_widget.clear()
 
         style_map = {
             "Include": {"color": "lime", "linestyle": "-"},
             "Exclude": {"color": "red", "linestyle": "-"},
-            "Phase Reference": {"color": "blue", "linestyle": "--"}
+            "Phase Reference": {"color": "cyan", "linestyle": "--"}
         }
 
-        for roi in self.rois:
+        # 3. Rebuild Everything
+        for i, roi in enumerate(self.rois):
             mode = roi.get("mode", "Include")
             verts = roi.get("path_vertices", [])
             if not verts:
@@ -307,18 +346,75 @@ class ROIDrawerDialog(QtWidgets.QDialog):
             
             style = style_map.get(mode, style_map["Include"])
             
+            # Draw on Plot
             poly = Polygon(
                 verts, 
                 closed=True, 
                 fill=False, 
                 edgecolor=style["color"], 
                 linestyle=style["linestyle"], 
-                linewidth=2
+                linewidth=2,
+                picker=True 
             )
             self.ax.add_patch(poly)
             self.finished_artists.append(poly)
+            
+            # Add to List
+            item = QtWidgets.QListWidgetItem(f"{i+1}. {mode}")
+            self.roi_list_widget.addItem(item)
         
+        self.roi_list_widget.blockSignals(False)
         self.canvas.draw_idle()
+
+    def highlight_selected_roi(self):
+        """Highlights the ROI selected in the list."""
+        selected_rows = [x.row() for x in self.roi_list_widget.selectedIndexes()]
+        idx = selected_rows[0] if selected_rows else -1
+        
+        style_map = {
+            "Include": {"color": "lime", "linestyle": "-"},
+            "Exclude": {"color": "red", "linestyle": "-"},
+            "Phase Reference": {"color": "cyan", "linestyle": "--"}
+        }
+        
+        # Iterate existing artists and update styles instead of calling redraw()
+        for i, artist in enumerate(self.finished_artists):
+            # Safety check: prevent index error if lists desync slightly
+            if i >= len(self.rois): 
+                break
+                
+            roi = self.rois[i]
+            mode = roi.get("mode", "Include")
+            base_style = style_map.get(mode, style_map["Include"])
+            
+            if i == idx:
+                # Highlight style
+                artist.set_edgecolor("yellow")
+                artist.set_linewidth(3.5)
+                artist.set_linestyle("-")
+                artist.set_zorder(10)
+            else:
+                # Normal style
+                artist.set_edgecolor(base_style["color"])
+                artist.set_linewidth(2)
+                artist.set_linestyle(base_style["linestyle"])
+                artist.set_zorder(1)
+                
+        self.canvas.draw_idle()
+
+    def delete_selected_roi(self):
+        selected_rows = [x.row() for x in self.roi_list_widget.selectedIndexes()]
+        if not selected_rows:
+            QtWidgets.QMessageBox.information(self, "Info", "Please select an ROI from the list to delete.")
+            return
+        
+        idx = selected_rows[0]
+        
+        # Remove from data
+        self.rois.pop(idx)
+        
+        # Update UI
+        self.redraw_finished_rois()
 
     def update_mode(self):
         if self.include_btn.isChecked():
@@ -330,19 +426,17 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         self.update_plot()
 
     def update_plot(self):
-        # Handles the CURRENTLY DRAWING line (not finished ones)
         if self.current_line is not None:
             for artist in self.current_line:
                 artist.remove()
         self.current_line = None
 
-        # --- COLOR LOGIC ---
         color_map = {
             "Include": ("g-", "g+"),
             "Exclude": ("r-", "r+"),
             "Phase Reference": ("b-", "b+")
         }
-        line_color, point_color = color_map[self.mode]
+        line_color, point_color = color_map.get(self.mode, ("g-", "g+"))
 
         if len(self.current_vertices) > 1:
             xs, ys = zip(*self.current_vertices)
@@ -356,48 +450,40 @@ class ROIDrawerDialog(QtWidgets.QDialog):
     def on_click(self, event):
         if event.inaxes != self.ax:
             return
-        # left-click
-        if event.button == 1:
+        if event.button == 1: # Left click
             if event.xdata is None or event.ydata is None:
                 return
             self.current_vertices.append((float(event.xdata), float(event.ydata)))
             self.update_plot()
-        # right-click: remove last
-        elif event.button == 3:
+        elif event.button == 3: # Right click
             if self.current_vertices:
                 self.current_vertices.pop()
                 self.update_plot()
-                
+
     def finish_polygon(self):
         if len(self.current_vertices) > 2:
-            # close loop for data consistency
-            self.current_vertices.append(self.current_vertices[0])
+            self.current_vertices.append(self.current_vertices[0]) # Close loop
             
-            # Save to memory
             self.rois.append({
                 "path_vertices": list(self.current_vertices),
                 "mode": self.mode,
             })
             
-            # Reset current drawing state
             self.current_vertices = []
             if self.current_line is not None:
                 for artist in self.current_line:
                     artist.remove()
                 self.current_line = None
             
-            # Redraw all finished ROIs so the new one appears permanently
             self.redraw_finished_rois()
-            
-            self.ax.set_title(f"{len(self.rois)} ROI(s) defined. Draw another or Confirm.")
+            self.ax.set_title(f"{len(self.rois)} ROI(s) defined.")
 
     def confirm_rois(self):
         # Separate the ROIs by their purpose
         anatomical_rois = [r for r in self.rois if r["mode"] in ("Include", "Exclude")]
         phase_ref_rois = [r for r in self.rois if r["mode"] == "Phase Reference"]
 
-        # 1. Save the ANATOMICAL (warping) ROI JSON
-        # Check if ANY ROIs exist (including Phase Ref), not just anatomical ones.
+        # Save ALL ROIs
         all_rois_to_save = anatomical_rois + phase_ref_rois
         
         if all_rois_to_save and self.output_basename:
@@ -412,20 +498,18 @@ class ROIDrawerDialog(QtWidgets.QDialog):
             except Exception as e:
                 QtWidgets.QMessageBox.warning(self, "Save Error", f"Error saving anatomical ROI file:\n{e}")
 
-        # 2. Calculate the FILTERING based on Include/Exclude ROIs
+        # Calculate Filtering
         if not anatomical_rois:
-            # No filter defined, pass back all data
             if self.callback:
-                self.callback(None, None, phase_ref_rois) # Still pass back phase ref
+                self.callback(None, None, phase_ref_rois)
         else:
-            # Build paths and calculate the final mask for filtering
             final_mask = np.zeros(len(self.roi_data), dtype=bool)
             include_paths = [Path(r["path_vertices"]) for r in anatomical_rois if r["mode"] == "Include"]
             if include_paths:
                 for path in include_paths:
                     final_mask |= path.contains_points(self.roi_data)
             else:
-                final_mask[:] = True # If only exclude ROIs are present, start with all points selected
+                final_mask[:] = True 
 
             for roi in anatomical_rois:
                 if roi["mode"] == "Exclude":
@@ -433,14 +517,12 @@ class ROIDrawerDialog(QtWidgets.QDialog):
 
             filtered_indices = np.where(final_mask)[0]
 
-            # Save the filtered ROI CSV
             if self.output_basename:
                 try:
                     np.savetxt(f"{self.output_basename}_roi_filtered.csv", self.roi_data[filtered_indices], delimiter=",")
                 except Exception as e:
                     QtWidgets.QMessageBox.warning(self, "Save Error", f"Error saving filtered ROI CSV:\n{e}")
 
-            # 3. Callback with ALL THREE pieces of information
             if self.callback:
                 self.callback(filtered_indices, anatomical_rois, phase_ref_rois)
 
