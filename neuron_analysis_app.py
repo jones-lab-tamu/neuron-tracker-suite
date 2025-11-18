@@ -204,8 +204,7 @@ class ROIDrawerDialog(QtWidgets.QDialog):
     Calls callback(filtered_indices, rois_dict_list)
     """
 
-    def __init__(self, parent, bg_image, roi_data, output_basename, callback,
-                 vmin=None, vmax=None):
+    def __init__(self, parent, bg_image, roi_data, output_basename, callback, vmin=None, vmax=None):
         super().__init__(parent)
         self.setWindowTitle("Advanced ROI Definition Tool")
         self.resize(900, 900)
@@ -218,7 +217,18 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         self.rois = []
         self.current_vertices = []
         self.current_line = None
+        self.finished_artists = []  # Track artists for finished polygons
         self.mode = "Include"
+
+        # Attempt to load existing anatomical ROI file
+        if self.output_basename:
+            json_path = f"{self.output_basename}_anatomical_roi.json"
+            if os.path.exists(json_path):
+                try:
+                    with open(json_path, "r") as f:
+                        self.rois = json.load(f)
+                except Exception as e:
+                    print(f"Error loading existing ROIs: {e}")
 
         main_layout = QtWidgets.QVBoxLayout(self)
 
@@ -252,10 +262,9 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         self.exclude_btn = QtWidgets.QRadioButton("Exclude")
         
         self.ref_btn = QtWidgets.QRadioButton("Phase Reference")
-        self.ref_btn.setStyleSheet("color: blue;") # Make it visually distinct
+        self.ref_btn.setStyleSheet("color: blue;")
         
         self.include_btn.setChecked(True)
-        
 
         self.include_btn.toggled.connect(self.update_mode)
         self.exclude_btn.toggled.connect(self.update_mode)
@@ -274,6 +283,42 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         btn_layout.addWidget(confirm_btn)
 
         main_layout.addLayout(btn_layout)
+        
+        # Draw any loaded ROIs immediately
+        self.redraw_finished_rois()
+
+    def redraw_finished_rois(self):
+        # Remove old artists to avoid duplicates/ghosts
+        for artist in self.finished_artists:
+            artist.remove()
+        self.finished_artists = []
+
+        style_map = {
+            "Include": {"color": "lime", "linestyle": "-"},
+            "Exclude": {"color": "red", "linestyle": "-"},
+            "Phase Reference": {"color": "blue", "linestyle": "--"}
+        }
+
+        for roi in self.rois:
+            mode = roi.get("mode", "Include")
+            verts = roi.get("path_vertices", [])
+            if not verts:
+                continue
+            
+            style = style_map.get(mode, style_map["Include"])
+            
+            poly = Polygon(
+                verts, 
+                closed=True, 
+                fill=False, 
+                edgecolor=style["color"], 
+                linestyle=style["linestyle"], 
+                linewidth=2
+            )
+            self.ax.add_patch(poly)
+            self.finished_artists.append(poly)
+        
+        self.canvas.draw_idle()
 
     def update_mode(self):
         if self.include_btn.isChecked():
@@ -285,6 +330,7 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         self.update_plot()
 
     def update_plot(self):
+        # Handles the CURRENTLY DRAWING line (not finished ones)
         if self.current_line is not None:
             for artist in self.current_line:
                 artist.remove()
@@ -324,17 +370,26 @@ class ROIDrawerDialog(QtWidgets.QDialog):
                 
     def finish_polygon(self):
         if len(self.current_vertices) > 2:
-            # close loop
+            # close loop for data consistency
             self.current_vertices.append(self.current_vertices[0])
-            self.update_plot()
+            
+            # Save to memory
             self.rois.append({
                 "path_vertices": list(self.current_vertices),
                 "mode": self.mode,
             })
+            
+            # Reset current drawing state
             self.current_vertices = []
-            self.current_line = None
+            if self.current_line is not None:
+                for artist in self.current_line:
+                    artist.remove()
+                self.current_line = None
+            
+            # Redraw all finished ROIs so the new one appears permanently
+            self.redraw_finished_rois()
+            
             self.ax.set_title(f"{len(self.rois)} ROI(s) defined. Draw another or Confirm.")
-            self.canvas.draw_idle()
 
     def confirm_rois(self):
         # Separate the ROIs by their purpose
@@ -3467,150 +3522,150 @@ class MainWindow(QtWidgets.QMainWindow):
                     if value_str: phase_args[key] = type_caster(value_str)
             if "minutes_per_frame" not in phase_args: raise ValueError("Minutes per Frame must be set for group analysis.")
             
-            all_dfs = []
-            
-            # --- METHOD DISPATCHER: Choose logic based on UI selection ---
-
-            # --- METHOD 1: Anatomical Reference Normalization ---
+            # --- Load Master Reference ROI (if enabled) ---
+            master_ref_rois = []
             if self.norm_anatomical_radio.isChecked():
-                self.log_message("Using Anatomical Reference ROI normalization method.")
                 if not self.state.reference_roi_path or not os.path.exists(self.state.reference_roi_path):
                     QtWidgets.QMessageBox.warning(self, "Error", "Anatomical Reference method selected, but no valid reference ROI file has been loaded.")
                     return
-
-                # Load the reference ROI JSON file.
                 with open(self.state.reference_roi_path, 'r') as f:
-                    ref_rois_json = json.load(f)
+                    master_ref_rois = json.load(f)
 
-                for i, roi_file in enumerate(self.state.group_data_paths):
-                    self.log_message(f"  [{i + 1}/{len(self.state.group_data_paths)}] {os.path.basename(roi_file)}")
-                    # (File loading and index matching logic)
-                    traces_file = roi_file.replace("_roi_warped.csv", "_traces.csv")
-                    unfiltered_roi_file = roi_file.replace("_roi_warped.csv", "_roi.csv")
-                    filtered_roi_file = roi_file.replace("_roi_warped.csv", "_roi_filtered.csv")
-                    required_files = [traces_file, unfiltered_roi_file, filtered_roi_file, roi_file]
-                    if not all(os.path.exists(f) for f in required_files):
-                        self.log_message("    Warning: missing one or more required files; skipping.")
-                        continue
-                    warped_rois = np.atleast_2d(np.loadtxt(roi_file, delimiter=","))
-                    filtered_rois = np.atleast_2d(np.loadtxt(filtered_roi_file, delimiter=","))
-                    if warped_rois.shape[0] != filtered_rois.shape[0]:
-                        self.log_message(f"    ERROR: Data inconsistency detected. Skipping.")
-                        continue
-                    traces = np.loadtxt(traces_file, delimiter=",")
-                    unfiltered_rois = np.loadtxt(unfiltered_roi_file, delimiter=",")
-                    indices = []
-                    for point in filtered_rois:
-                        diff = np.sum((unfiltered_rois - point)**2, axis=1)
-                        idx = np.argmin(diff)
-                        if diff[idx] < 1e-9: indices.append(idx)
-                    if len(indices) != filtered_rois.shape[0]:
-                        self.log_message("    Warning: Could not match filtered to unfiltered ROIs; skipping.")
-                        continue
-                    trace_indices_to_keep = np.array(indices) + 1
-                    filtered_traces_data = traces[:, np.concatenate(([0], trace_indices_to_keep))]
-                    
-                    phases, period, _ = calculate_phases_fft(filtered_traces_data, **phase_args)
+            all_dfs = []
+            
+            # --- Processing Loop ---
+            for i, roi_file in enumerate(self.state.group_data_paths):
+                self.log_message(f"  [{i + 1}/{len(self.state.group_data_paths)}] {os.path.basename(roi_file)}")
+                
+                # 1. Identify Files
+                traces_file = roi_file.replace("_roi_warped.csv", "_traces.csv")
+                unfiltered_roi_file = roi_file.replace("_roi_warped.csv", "_roi.csv")
+                filtered_roi_file = roi_file.replace("_roi_warped.csv", "_roi_filtered.csv")
+                
+                required_files = [traces_file, unfiltered_roi_file, filtered_roi_file, roi_file]
+                if not all(os.path.exists(f) for f in required_files):
+                    self.log_message("    Warning: missing one or more required files; skipping.")
+                    continue
+                
+                # 2. Load Data
+                warped_rois = np.atleast_2d(np.loadtxt(roi_file, delimiter=","))
+                # We load the filtered native ROIs to ensure 1:1 index alignment with warped_rois
+                native_filtered_rois = np.atleast_2d(np.loadtxt(filtered_roi_file, delimiter=",")) 
+                
+                if warped_rois.shape[0] != native_filtered_rois.shape[0]:
+                    self.log_message(f"    ERROR: Data inconsistency (warped vs filtered count). Skipping.")
+                    continue
+                
+                # 3. Match Traces 
+                # We must find which columns in the raw traces file correspond to our filtered cells.
+                traces = np.loadtxt(traces_file, delimiter=",")
+                unfiltered_rois = np.loadtxt(unfiltered_roi_file, delimiter=",")
+                
+                indices = []
+                # Match native_filtered back to unfiltered to get the original trace indices
+                for point in native_filtered_rois:
+                    diff = np.sum((unfiltered_rois - point)**2, axis=1)
+                    idx = np.argmin(diff)
+                    if diff[idx] < 1e-9: indices.append(idx)
+                
+                if len(indices) != native_filtered_rois.shape[0]:
+                    self.log_message("    Warning: Could not match filtered to unfiltered ROIs; skipping.")
+                    continue
+                
+                trace_indices_to_keep = np.array(indices) + 1 # +1 because col 0 is time
+                filtered_traces_data = traces[:, np.concatenate(([0], trace_indices_to_keep))]
+                
+                # 4. Calculate Phases (Raw)
+                phases, period, _ = calculate_phases_fft(filtered_traces_data, **phase_args)
 
-                    # This logic correctly handles multiple "Include" polygons (e.g., for left and right SCN)
-                    # and any "Exclude" polygons, just like the main ROI tool.
-                    
-                    final_mask = np.zeros(len(warped_rois), dtype=bool)
-                    
-                    # Process all "Include" polygons first
-                    include_rois = [r for r in ref_rois_json if r.get("mode") == "Include"]
-                    if not include_rois:
-                        self.log_message("    Warning: The reference ROI file contains no 'Include' polygons. Skipping animal.")
-                        continue # A reference must have an include area.
-                    
-                    for roi in include_rois:
-                        path = Path(roi['path_vertices'])
-                        final_mask |= path.contains_points(warped_rois)
+                # 5. Determine Reference Mean (Hybrid Logic)
+                mean_h = 0.0
+                
+                if self.norm_global_radio.isChecked():
+                     # Method A: Global Mean
+                     ph_rad = (phases % period) * (2 * np.pi / period)
+                     mean_rad = circmean(ph_rad)
+                     mean_h = mean_rad * (period / (2 * np.pi))
+                     self.log_message(f"    -> Norm: Global Mean ({mean_h:.2f}h)")
 
-                    # Process all "Exclude" polygons
-                    for roi in ref_rois_json:
-                        if roi.get("mode") == "Exclude":
+                else:
+                    # Method B: Anatomical Reference (Hybrid)
+                    
+                    # Check for Individual Override (Native Space)
+                    individual_roi_path = roi_file.replace("_roi_warped.csv", "_anatomical_roi.json")
+                    individual_ref_poly = []
+                    
+                    if os.path.exists(individual_roi_path):
+                        with open(individual_roi_path, 'r') as f:
+                            ind_rois = json.load(f)
+                            # Look specifically for "Phase Reference" polygons
+                            individual_ref_poly = [r for r in ind_rois if r.get("mode") == "Phase Reference"]
+
+                    ref_indices = []
+                    
+                    if individual_ref_poly:
+                        # CASE 1: Use Individual Native ROI
+                        self.log_message("    -> Norm: Individual 'Phase Reference' ROI (Native Space)")
+                        ref_mask = np.zeros(len(native_filtered_rois), dtype=bool)
+                        for roi in individual_ref_poly:
                             path = Path(roi['path_vertices'])
-                            final_mask &= ~path.contains_points(warped_rois)
-
-                    ref_indices = np.where(final_mask)[0]
+                            ref_mask |= path.contains_points(native_filtered_rois)
+                        ref_indices = np.where(ref_mask)[0]
+                        
+                    else:
+                        # CASE 2: Fallback to Master Atlas ROI (Warped Space)
+                        self.log_message("    -> Norm: Master Atlas ROI (Warped Space)")
+                        # Look specifically for "Phase Reference" polygons in the master atlas
+                        master_ref_poly = [r for r in master_ref_rois if r.get("mode") == "Phase Reference"]
+                        
+                        if not master_ref_poly:
+                            self.log_message("    ERROR: No 'Phase Reference' polygon found in Master Atlas file. Cannot normalize.")
+                            continue
+                            
+                        ref_mask = np.zeros(len(warped_rois), dtype=bool)
+                        for roi in master_ref_poly:
+                            path = Path(roi['path_vertices'])
+                            ref_mask |= path.contains_points(warped_rois)
+                        ref_indices = np.where(ref_mask)[0]
 
                     if len(ref_indices) == 0:
-                        self.log_message("    Warning: No rhythmic cells found inside the reference ROI for this animal; skipping.")
+                        self.log_message("    Warning: No rhythmic cells found in reference region. Skipping.")
                         continue
 
                     ref_phases = phases[ref_indices]
                     ref_rad = (ref_phases % period) * (2 * np.pi / period)
                     ref_mean_rad = circmean(ref_rad)
-                    ref_mean_h = ref_mean_rad * (period / (2 * np.pi))
+                    mean_h = ref_mean_rad * (period / (2 * np.pi))
+                    self.log_message(f"       Ref Mean: {mean_h:.2f}h (n={len(ref_indices)})")
 
-                    rel_phases = (phases - ref_mean_h + period / 2) % period - period / 2
+                # 6. Normalize
+                rel_phases = (phases - mean_h + period / 2) % period - period / 2
 
-                    animal_df = pd.DataFrame({
-                        'Source_Animal': os.path.basename(roi_file).replace('_roi_warped.csv', ''),
-                        'Warped_X': warped_rois[:, 0],
-                        'Warped_Y': warped_rois[:, 1],
-                        'Relative_Phase_Hours': rel_phases,
-                        'Period_Hours': period
-                    })
-                    all_dfs.append(animal_df)
+                animal_df = pd.DataFrame({
+                    'Source_Animal': os.path.basename(roi_file).replace('_roi_warped.csv', ''),
+                    'Warped_X': warped_rois[:, 0],
+                    'Warped_Y': warped_rois[:, 1],
+                    'Relative_Phase_Hours': rel_phases,
+                    'Period_Hours': period
+                })
+                all_dfs.append(animal_df)
 
-            # --- METHOD 2: Global Mean Normalization ---
-            else:
-                self.log_message("Using Global Mean (per animal) normalization method.")
-                for i, roi_file in enumerate(self.state.group_data_paths):
-                    self.log_message(f"  [{i + 1}/{len(self.state.group_data_paths)}] {os.path.basename(roi_file)}")
-                    traces_file = roi_file.replace("_roi_warped.csv", "_traces.csv")
-                    unfiltered_roi_file = roi_file.replace("_roi_warped.csv", "_roi.csv")
-                    filtered_roi_file = roi_file.replace("_roi_warped.csv", "_roi_filtered.csv")
-                    required_files = [traces_file, unfiltered_roi_file, filtered_roi_file, roi_file]
-                    if not all(os.path.exists(f) for f in required_files):
-                        self.log_message("    Warning: missing one or more required files; skipping.")
-                        continue
-                    warped_rois = np.atleast_2d(np.loadtxt(roi_file, delimiter=","))
-                    filtered_rois = np.atleast_2d(np.loadtxt(filtered_roi_file, delimiter=","))
-                    if warped_rois.shape[0] != filtered_rois.shape[0]:
-                        self.log_message(f"    ERROR: Data inconsistency detected. Skipping.")
-                        continue
-                    traces = np.loadtxt(traces_file, delimiter=",")
-                    unfiltered_rois = np.loadtxt(unfiltered_roi_file, delimiter=",")
-                    indices = []
-                    for point in filtered_rois:
-                        diff = np.sum((unfiltered_rois - point)**2, axis=1)
-                        idx = np.argmin(diff)
-                        if diff[idx] < 1e-9: indices.append(idx)
-                    if len(indices) != filtered_rois.shape[0]:
-                        self.log_message("    Warning: Could not match filtered to unfiltered ROIs; skipping.")
-                        continue
-                    trace_indices_to_keep = np.array(indices) + 1
-                    filtered_traces_data = traces[:, np.concatenate(([0], trace_indices_to_keep))]
-                    
-                    phases, period, _ = calculate_phases_fft(filtered_traces_data, **phase_args)
-                    ph_rad = (phases % period) * (2 * np.pi / period)
-                    mean_rad = circmean(ph_rad)
-                    mean_h = mean_rad * (period / (2 * np.pi))
-                    rel_phases = (phases - mean_h + period / 2) % period - period / 2
-                    
-                    animal_df = pd.DataFrame({
-                        'Source_Animal': os.path.basename(roi_file).replace('_roi_warped.csv', ''),
-                        'Warped_X': warped_rois[:, 0],
-                        'Warped_Y': warped_rois[:, 1],
-                        'Relative_Phase_Hours': rel_phases,
-                        'Period_Hours': period
-                    })
-                    all_dfs.append(animal_df)
-
-            # --- Downstream Processing (Identical for both methods) ---
-            if not all_dfs: raise ValueError("No valid and consistent group data was loaded.")
+            # --- Downstream Processing (Visualizations) ---
+            if not all_dfs: 
+                self.log_message("No valid group data generated.")
+                return
             
             group_scatter_df = pd.concat(all_dfs, ignore_index=True)
             period = group_scatter_df['Period_Hours'].iloc[0]
             grid_res = int(self.group_grid_res_edit.text())
             do_smooth = self.group_smooth_check.isChecked()
+            
             x_min, x_max = group_scatter_df['Warped_X'].min(), group_scatter_df['Warped_X'].max()
             y_min, y_max = group_scatter_df['Warped_Y'].min(), group_scatter_df['Warped_Y'].max()
+            
             grid_x_bins = np.linspace(x_min, x_max, grid_res + 1)
             grid_y_bins = np.linspace(y_min, y_max, grid_res + 1)
+            
             group_scatter_df['Grid_X_Index'] = pd.cut(group_scatter_df['Warped_X'], bins=grid_x_bins, labels=False, include_lowest=True).fillna(-1).astype(int)
             group_scatter_df['Grid_Y_Index'] = pd.cut(group_scatter_df['Warped_Y'], bins=grid_y_bins, labels=False, include_lowest=True).fillna(-1).astype(int)
 
@@ -3618,20 +3673,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 rad = (series / (period / 2.0)) * np.pi
                 mean_rad = circmean(rad)
                 return (mean_rad / np.pi) * (period / 2.0)
+            
             group_binned_df = group_scatter_df[group_scatter_df['Grid_X_Index'] >= 0].groupby(['Grid_X_Index', 'Grid_Y_Index'])['Relative_Phase_Hours'].apply(circmean_phase).reset_index()
             
             fig_s, _ = add_mpl_to_tab(self.group_scatter_tab)
             viewer_s = GroupScatterViewer(fig_s, fig_s.add_subplot(111), group_scatter_df)
             self.visualization_widgets[self.group_scatter_tab] = viewer_s
+            
             fig_g, _ = add_mpl_to_tab(self.group_avg_tab)
             viewer_g = GroupAverageMapViewer(fig_g, fig_g.add_subplot(111), group_binned_df, group_scatter_df, grid_res, do_smooth)
             self.visualization_widgets[self.group_avg_tab] = viewer_g
+            
             for tab in group_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), True)
             for tab in single_animal_tabs: self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(tab), False)
+            
             self.vis_tabs.setCurrentWidget(self.group_scatter_tab)
             self._mark_step_ready("group_view")
             self.log_message("Group visualizations generated.")
             self.btn_export_data.setEnabled(True)
+            
         except Exception as e:
             import traceback
             self.log_message(f"Error generating group visualizations: {e}")
