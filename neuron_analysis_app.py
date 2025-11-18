@@ -44,7 +44,7 @@ from matplotlib.backends.backend_qt5agg import (
     FigureCanvasQTAgg as FigureCanvas,
     NavigationToolbar2QT as NavigationToolbar,
 )
-from matplotlib.widgets import Slider, RadioButtons
+from matplotlib.widgets import Slider, RadioButtons, Button
 from matplotlib.patches import Polygon, Rectangle
 
 from PyQt5 import QtCore, QtWidgets, QtGui
@@ -1220,37 +1220,80 @@ class PhaseMapViewer:
         self.period_hours = self.rhythmic_df['Period_Hours'].iloc[0] if not self.rhythmic_df.empty else 24
         self.on_select_callback = on_select_callback
         self.highlight_artist = None
+        
+        # State for colormap
+        self.is_cyclic = True 
+        self.cmap_cyclic = cet.cm.cyclic_mygbm_30_95_c78
+        self.cmap_diverging = 'coolwarm'
+
         self.bg_artist = ax.imshow(bg_image, cmap="gray", vmin=vmin, vmax=vmax)
+        
         if not self.rhythmic_df.empty:
             self.scatter = ax.scatter(
                 self.rhythmic_df['X_Position'], self.rhythmic_df['Y_Position'],
                 c=self.rhythmic_df['Relative_Phase_Hours'],
-                cmap=cet.cm.cyclic_mygbm_30_95_c78, s=25, edgecolor="black", linewidth=0.5,
+                cmap=self.cmap_cyclic, s=25, edgecolor="black", linewidth=0.5,
             )
             self.cbar = fig.colorbar(self.scatter, ax=ax, fraction=0.046, pad=0.04)
             self.cbar.set_label("Relative Peak Time (hours)", fontsize=10)
+            
             ax_slider = fig.add_axes([0.25, 0.02, 0.65, 0.03])
             max_range = self.period_hours / 2.0
             self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- hrs)", valmin=1.0, valmax=max_range, valinit=max_range)
             self.range_slider.on_changed(self.update_clim)
+            
+            # Colormap Toggle Button
+            ax_button = fig.add_axes([0.05, 0.02, 0.12, 0.03])
+            self.cmap_btn = Button(ax_button, "Mode: Cyclic")
+            self.cmap_btn.on_clicked(self.toggle_cmap)
+            
             self.update_clim(max_range)
+
         ax.set_title("Spatiotemporal Phase Map (Click to Select Trajectory)")
         ax.set_xticks([]); ax.set_yticks([])
         self.fig.canvas.mpl_connect('button_press_event', self.on_click)
 
+    def toggle_cmap(self, event):
+        self.is_cyclic = not self.is_cyclic
+        new_cmap = self.cmap_cyclic if self.is_cyclic else self.cmap_diverging
+        label = "Mode: Cyclic" if self.is_cyclic else "Mode: Diverging"
+        self.scatter.set_cmap(new_cmap)
+        self.cmap_btn.label.set_text(label)
+        self.fig.canvas.draw_idle()
+
     def on_click(self, event):
         if event.inaxes != self.ax or self.rhythmic_df.empty: return
         distances = np.sqrt((self.roi_data[:, 0] - event.xdata)**2 + (self.roi_data[:, 1] - event.ydata)**2)
-        selected_index = np.argmin(distances)
+        selected_index = np.argmin(distances) # This is the ROW index of the dataframe
+        
         if distances[selected_index] < 20:
-            self.highlight_point(selected_index)
+            # Convert Row Index -> Global Index for consistency
+            # Original_ROI_Index is 1-based, convert to 0-based Global Index
+            global_index = int(self.rhythmic_df.iloc[selected_index]['Original_ROI_Index'] - 1)
+            
+            # Highlight using the Global Index (which internal logic converts back to Row Index)
+            self.highlight_point(global_index)
+            
+            # Pass the ROW index to the callback (as expected by the current wrapper in Main)
             if self.on_select_callback: self.on_select_callback(selected_index)
 
-    def highlight_point(self, index):
+    def highlight_point(self, original_index):
+        """
+        Highlights a point based on the Global Original Index.
+        Scans the dataframe to find the matching row.
+        """
         if self.highlight_artist: self.highlight_artist.remove(); self.highlight_artist = None
-        if index is not None and 0 <= index < len(self.roi_data):
-            point = self.roi_data[index]
-            self.highlight_artist = self.ax.plot(point[0], point[1], 'o', markersize=15, markerfacecolor='none', markeredgecolor='white', markeredgewidth=2)[0]
+        
+        if original_index is not None and not self.rhythmic_df.empty:
+            # Find the row corresponding to this global index
+            # 'Original_ROI_Index' is 1-based in the DF, so we add 1 to the 0-based input
+            matches = self.rhythmic_df.index[self.rhythmic_df['Original_ROI_Index'] == (original_index + 1)].tolist()
+            
+            if matches:
+                row_idx = matches[0]
+                point = self.roi_data[row_idx]
+                self.highlight_artist = self.ax.plot(point[0], point[1], 'o', markersize=15, markerfacecolor='none', markeredgecolor='white', markeredgewidth=2)[0]
+                
         self.fig.canvas.draw_idle()
 
     def update_contrast(self, vmin, vmax):
@@ -1261,29 +1304,51 @@ class PhaseMapViewer:
 
     def get_export_data(self):
         return self.rhythmic_df, "phase_map_data.csv"
-
+        
 class GroupScatterViewer:
     def __init__(self, fig, ax, group_df):
         self.fig = fig
         self.ax = ax
         self.group_df = group_df
         self.period_hours = self.group_df['Period_Hours'].iloc[0] if not self.group_df.empty else 24
+        
+        # State
+        self.is_cyclic = True 
+        self.cmap_cyclic = cet.cm.cyclic_mygbm_30_95_c78
+        self.cmap_diverging = 'coolwarm'
+
         ax.set_title("Group Phase Distribution")
         if not self.group_df.empty:
             self.scatter = ax.scatter(
                 self.group_df['Warped_X'], self.group_df['Warped_Y'],
-                c=self.group_df['Relative_Phase_Hours'], cmap=cet.cm.cyclic_mygbm_30_95_c78, s=10, alpha=0.8,
+                c=self.group_df['Relative_Phase_Hours'], cmap=self.cmap_cyclic, s=10, alpha=0.8,
             )
             cbar = fig.colorbar(self.scatter, ax=ax)
             cbar.set_label("Mean Relative Peak Time (hours)")
+            
             ax_slider = fig.add_axes([0.25, 0.02, 0.65, 0.03])
             max_range = self.period_hours / 2.0
             self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- hrs)", valmin=1.0, valmax=max_range, valinit=max_range)
             self.range_slider.on_changed(self.update_clim)
+            
+            # Colormap Toggle Button
+            ax_button = fig.add_axes([0.05, 0.02, 0.12, 0.03])
+            self.cmap_btn = Button(ax_button, "Mode: Cyclic")
+            self.cmap_btn.on_clicked(self.toggle_cmap)
+
             self.update_clim(max_range)
+            
         ax.set_aspect("equal", adjustable="box")
         ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
+
+    def toggle_cmap(self, event):
+        self.is_cyclic = not self.is_cyclic
+        new_cmap = self.cmap_cyclic if self.is_cyclic else self.cmap_diverging
+        label = "Mode: Cyclic" if self.is_cyclic else "Mode: Diverging"
+        self.scatter.set_cmap(new_cmap)
+        self.cmap_btn.label.set_text(label)
+        self.fig.canvas.draw_idle()
 
     def update_clim(self, val):
         if hasattr(self, "scatter"): self.scatter.set_clim(-val, val); self.fig.canvas.draw_idle()
@@ -1298,6 +1363,12 @@ class GroupAverageMapViewer:
         self.group_binned_df = group_binned_df
         self.group_scatter_df = group_scatter_df
         self.period_hours = self.group_scatter_df['Period_Hours'].iloc[0] if not self.group_scatter_df.empty else 24
+        
+        # State
+        self.is_cyclic = True 
+        self.cmap_cyclic = cet.cm.cyclic_mygbm_30_95_c78
+        self.cmap_diverging = 'coolwarm'
+
         ax.set_title("Group Average Phase Map")
         
         if self.group_binned_df.empty:
@@ -1316,16 +1387,31 @@ class GroupAverageMapViewer:
         x_min, x_max = self.group_scatter_df['Warped_X'].min(), self.group_scatter_df['Warped_X'].max()
         y_min, y_max = self.group_scatter_df['Warped_Y'].min(), self.group_scatter_df['Warped_Y'].max()
 
-        self.im = ax.imshow(binned_grid, origin="lower", extent=[x_min, x_max, y_min, y_max], cmap=cet.cm.cyclic_mygbm_30_95_c78)
+        self.im = ax.imshow(binned_grid, origin="lower", extent=[x_min, x_max, y_min, y_max], cmap=self.cmap_cyclic)
         ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
         cbar = fig.colorbar(self.im, ax=ax)
         cbar.set_label("Mean Relative Peak Time (hours)")
+        
         ax_slider = fig.add_axes([0.25, 0.02, 0.65, 0.03])
         max_range = self.period_hours / 2.0
         self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- hrs)", valmin=1.0, valmax=max_range, valinit=max_range)
         self.range_slider.on_changed(self.update_clim)
+
+        # Colormap Toggle Button
+        ax_button = fig.add_axes([0.05, 0.02, 0.12, 0.03])
+        self.cmap_btn = Button(ax_button, "Mode: Cyclic")
+        self.cmap_btn.on_clicked(self.toggle_cmap)
+
         self.update_clim(max_range)
+        self.fig.canvas.draw_idle()
+
+    def toggle_cmap(self, event):
+        self.is_cyclic = not self.is_cyclic
+        new_cmap = self.cmap_cyclic if self.is_cyclic else self.cmap_diverging
+        label = "Mode: Cyclic" if self.is_cyclic else "Mode: Diverging"
+        self.im.set_cmap(new_cmap)
+        self.cmap_btn.label.set_text(label)
         self.fig.canvas.draw_idle()
 
     def update_clim(self, val):
@@ -1341,6 +1427,11 @@ class InterpolatedMapViewer:
         self.fig = fig
         self.ax = ax
         self.period_hours = period_hours
+        
+        # State
+        self.is_cyclic = True 
+        self.cmap_cyclic = cet.cm.cyclic_mygbm_30_95_c78
+        self.cmap_diverging = 'coolwarm'
 
         ax.set_title("Interpolated Spatiotemporal Phase Map")
 
@@ -1407,7 +1498,7 @@ class InterpolatedMapViewer:
             mask = hpath.contains_points(grid_points).reshape(grid_x.shape)
             grid_z[~mask] = np.nan
 
-        im = ax.imshow(
+        self.im = ax.imshow(
             grid_z.T,
             origin="upper",
             extent=[
@@ -1416,7 +1507,7 @@ class InterpolatedMapViewer:
                 y_min - y_buf,
                 y_max + y_buf,
             ],
-            cmap=cet.cm.cyclic_mygbm_30_95_c78,
+            cmap=self.cmap_cyclic,
             interpolation="bilinear",
         )
 
@@ -1424,7 +1515,7 @@ class InterpolatedMapViewer:
         ax.set_yticks([])
 
         cbar = fig.colorbar(
-            im, ax=ax, fraction=0.046, pad=0.04
+            self.im, ax=ax, fraction=0.046, pad=0.04
         )
         cbar.set_label("Relative Peak Time (hours)", fontsize=10)
 
@@ -1438,14 +1529,27 @@ class InterpolatedMapViewer:
             valinit=max_range,
         )
         self.range_slider.on_changed(self.update_clim)
+        
+        # Colormap Toggle Button
+        ax_button = fig.add_axes([0.05, 0.02, 0.12, 0.03])
+        self.cmap_btn = Button(ax_button, "Mode: Cyclic")
+        self.cmap_btn.on_clicked(self.toggle_cmap)
+        
         self.update_clim(max_range)
+
+    def toggle_cmap(self, event):
+        self.is_cyclic = not self.is_cyclic
+        new_cmap = self.cmap_cyclic if self.is_cyclic else self.cmap_diverging
+        label = "Mode: Cyclic" if self.is_cyclic else "Mode: Diverging"
+        self.im.set_cmap(new_cmap)
+        self.cmap_btn.label.set_text(label)
+        self.fig.canvas.draw_idle()
 
     def update_clim(self, val):
         # assumes image exists
         for im in self.ax.images:
             im.set_clim(-val, val)
         self.fig.canvas.draw_idle()
-
 
 # ------------------------------------------------------------
 # Phase calculation
@@ -2999,56 +3103,34 @@ class MainWindow(QtWidgets.QMainWindow):
         """Callback for when a point is clicked in a spatial plot."""
         self.log_message(f"ROI {original_index + 1} selected.")
         
-        # Calculate the Local Index for the Trajectory Inspector.
-        # The Inspector displays 'loaded_data', which is the FILTERED subset.
-        # We must map the Global Original Index -> Local Filtered Index.
+        # 1. Trajectory Inspector (Requires Local Filtered Index)
         local_index = original_index
         if self.filtered_indices is not None:
             matches = np.where(self.filtered_indices == original_index)[0]
             if len(matches) > 0:
                 local_index = matches[0]
             else:
-                # The selected global index is not in the current filter view.
-                # This implies a state mismatch, but we should just ignore it for the trajectory viewer.
                 local_index = -1
 
-        # Update the trajectory inspector
         traj_viewer = self.visualization_widgets.get(self.traj_tab)
         if traj_viewer and local_index != -1:
-            traj_viewer.set_trajectory(local_index) # Pass the LOCAL index
+            traj_viewer.set_trajectory(local_index)
             self.vis_tabs.setCurrentWidget(self.traj_tab)
 
-        # Highlight the point in other relevant viewers
-        # (ContrastViewer and HeatmapViewer handle the Global Index -> Local Index conversion internally)
+        # 2. Center of Mass (Handles Index Translation Internally)
         com_viewer = self.visualization_widgets.get(self.com_tab)
         if com_viewer:
             com_viewer.highlight_point(original_index)
         
-        # Update the heatmap's selected trace plot
+        # 3. Heatmap Trace (Handles Index Translation Internally)
         heatmap_viewer = self.visualization_widgets.get(self.heatmap_tab)
         if heatmap_viewer:
             heatmap_viewer.update_selected_trace(original_index)
 
+        # 4. Phase Map (Handles Index Translation Internally)
         phase_viewer = self.visualization_widgets.get(self.phase_tab)
         if phase_viewer:
-            try:
-                rhythm = calculate_phases_fft(self.state.loaded_data["traces"], minutes_per_frame=float(self.phase_params["minutes_per_frame"][0].text()))[2]
-                thr = float(self.phase_params["rhythm_threshold"][0].text())
-                rhythmic_indices_relative = np.where(rhythm >= thr)[0]
-
-                if self.filtered_indices is not None:
-                    rhythmic_indices_original = self.filtered_indices[rhythmic_indices_relative]
-                else:
-                    rhythmic_indices_original = rhythmic_indices_relative
-                
-                match = np.where(rhythmic_indices_original == original_index)[0]
-                if len(match) > 0:
-                    phase_map_index = match[0]
-                    phase_viewer.highlight_point(phase_map_index)
-                else:
-                    phase_viewer.highlight_point(None) 
-            except Exception:
-                pass
+            phase_viewer.highlight_point(original_index)
                 
     def on_contrast_change(self, vmin, vmax):
         self.vmin = vmin
