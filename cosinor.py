@@ -21,7 +21,9 @@ def cosinor_analysis(data, time, period):
               'mesor', 'amplitude', 'acrophase', 'p_value', 'r_squared'.
               Returns a dict of NaNs if the fit fails.
     """
-    if len(data) < 3 or len(data) != len(time):
+    # The model has 3 parameters (Mesor, Amp, Phase). 
+    # If len(data) == 3, degrees of freedom (n - k) = 0, causing ZeroDivisionError later.
+    if len(data) <= 3 or len(data) != len(time):
         return {
             'mesor': np.nan, 'amplitude': np.nan, 'acrophase': np.nan,
             'p_value': np.nan, 'r_squared': np.nan

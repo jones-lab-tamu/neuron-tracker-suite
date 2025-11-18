@@ -45,6 +45,7 @@ from matplotlib.backends.backend_qt5agg import (
     NavigationToolbar2QT as NavigationToolbar,
 )
 from matplotlib.widgets import Slider, RadioButtons
+from matplotlib.patches import Polygon, Rectangle
 
 from PyQt5 import QtCore, QtWidgets, QtGui
 
@@ -274,6 +275,15 @@ class ROIDrawerDialog(QtWidgets.QDialog):
 
         main_layout.addLayout(btn_layout)
 
+    def update_mode(self):
+        if self.include_btn.isChecked():
+            self.mode = "Include"
+        elif self.exclude_btn.isChecked():
+            self.mode = "Exclude"
+        else:
+            self.mode = "Phase Reference"
+        self.update_plot()
+
     def update_plot(self):
         if self.current_line is not None:
             for artist in self.current_line:
@@ -311,24 +321,7 @@ class ROIDrawerDialog(QtWidgets.QDialog):
             if self.current_vertices:
                 self.current_vertices.pop()
                 self.update_plot()
-
-    def update_plot(self):
-        if self.current_line is not None:
-            for artist in self.current_line:
-                artist.remove()
-        self.current_line = None
-
-        if len(self.current_vertices) > 1:
-            xs, ys = zip(*self.current_vertices)
-            color = "g-" if self.mode == "Include" else "r-"
-            self.current_line = self.ax.plot(xs, ys, color)
-        elif self.current_vertices:
-            x, y = self.current_vertices[0]
-            color = "g+" if self.mode == "Include" else "r+"
-            self.current_line = self.ax.plot(x, y, color)
-
-        self.canvas.draw_idle()
-
+                
     def finish_polygon(self):
         if len(self.current_vertices) > 2:
             # close loop
@@ -349,12 +342,15 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         phase_ref_rois = [r for r in self.rois if r["mode"] == "Phase Reference"]
 
         # 1. Save the ANATOMICAL (warping) ROI JSON
-        if anatomical_rois and self.output_basename:
+        # FIX: Check if ANY ROIs exist (including Phase Ref), not just anatomical ones.
+        all_rois_to_save = anatomical_rois + phase_ref_rois
+        
+        if all_rois_to_save and self.output_basename:
             filepath = f"{self.output_basename}_anatomical_roi.json"
             try:
                 serializable = [
                     {"path_vertices": roi["path_vertices"], "mode": roi["mode"]}
-                    for roi in anatomical_rois
+                    for roi in all_rois_to_save
                 ]
                 with open(filepath, "w") as f:
                     json.dump(serializable, f, indent=4)
@@ -808,13 +804,14 @@ class HeatmapViewer:
         return df, "heatmap_data.csv"
 
 class ContrastViewer:
-    def __init__(self, fig, ax, bg_image, com_points, on_change_callback, on_select_callback, filtered_indices=None):
+    def __init__(self, fig, ax, bg_image, com_points, on_change_callback, on_select_callback, filtered_indices=None, rois=None):
         self.fig = fig
         self.ax = ax
         self.com_points = com_points
         self.on_change_callback = on_change_callback
         self.on_select_callback = on_select_callback
         self.filtered_indices = filtered_indices
+        self.rois = rois or [] # Store ROIs
         self.highlight_artist = None
         self.scatter_artists = []
 
@@ -830,7 +827,47 @@ class ContrastViewer:
         self.brightness_slider.on_changed(self.update)
         self.fig.canvas.mpl_connect('button_press_event', self.on_click)
         self.update(None)
+        
+        self._draw_rois()    # Draw polygons
         self._draw_scatter() # Initial drawing
+
+    def _draw_rois(self):
+        """Draws the Include/Exclude/Reference polygons on the axes."""
+        if not self.rois:
+            return
+
+        style_map = {
+            "Include": {"color": "lime", "linestyle": "-", "linewidth": 1.5},
+            "Exclude": {"color": "red", "linestyle": "-", "linewidth": 1.5},
+            "Phase Reference": {"color": "cyan", "linestyle": "--", "linewidth": 1.5}
+        }
+
+        for roi in self.rois:
+            mode = roi.get("mode", "Include")
+            verts = roi.get("path_vertices", [])
+            if not verts:
+                continue
+            
+            style = style_map.get(mode, style_map["Include"])
+            
+            # Create polygon patch
+            # fill=False keeps the inside empty so you can see the cells
+            poly = Polygon(
+                verts, 
+                closed=True, 
+                fill=False, 
+                edgecolor=style["color"], 
+                linestyle=style["linestyle"], 
+                linewidth=style["linewidth"],
+                label=mode
+            )
+            self.ax.add_patch(poly)
+        
+        # Optional: Add a simple legend if ROIs exist, handling duplicates
+        handles, labels = self.ax.get_legend_handles_labels()
+        if handles:
+            by_label = dict(zip(labels, handles))
+            self.ax.legend(by_label.values(), by_label.keys(), loc='upper right', fontsize='small', framealpha=0.5)
 
     def _draw_scatter(self, rhythm_mask=None, is_emphasized=False):
         for artist in self.scatter_artists:
@@ -868,26 +905,47 @@ class ContrastViewer:
 
         if distances[selected_index] < 20:
             # Highlight the point in this plot (uses the local index)
-            self.highlight_point(selected_index)
+            # Calculate the Original Index FIRST, then call highlight with it.
+            if self.filtered_indices is not None:
+                original_index = self.filtered_indices[selected_index]
+            else:
+                original_index = selected_index
+            
+            # This ensures the highlighting logic is consistent regardless of who called it
+            self.highlight_point(original_index)
 
             if self.on_select_callback:
-                # If a filter is active, look up the true original index
-                if self.filtered_indices is not None:
-                    original_index = self.filtered_indices[selected_index]
-                # Otherwise, the local index IS the original index
-                else:
-                    original_index = selected_index
-                
                 # Send the CORRECT, original index to the main window
                 self.on_select_callback(original_index)
 
     def highlight_point(self, index):
+        """
+        Highlights a point. 
+        'index' is treated as the GLOBAL (Original) index.
+        We must convert it to the Local index to plot it on the filtered view.
+        """
         if self.highlight_artist:
             self.highlight_artist.remove()
             self.highlight_artist = None
-        if index is not None and 0 <= index < len(self.com_points):
-            point = self.com_points[index]
+        
+        local_index = None
+        if index is not None:
+            if self.filtered_indices is not None:
+                # Find where the global index exists in the filtered array
+                # This handles the case where the global index might have been filtered out
+                matches = np.where(self.filtered_indices == index)[0]
+                if len(matches) > 0:
+                    local_index = matches[0]
+                else:
+                    local_index = None
+            else:
+                # No filter active, 1:1 mapping
+                local_index = index
+
+        if local_index is not None and 0 <= local_index < len(self.com_points):
+            point = self.com_points[local_index]
             self.highlight_artist = self.ax.plot(point[0], point[1], 'o', markersize=12, markerfacecolor='none', markeredgecolor='cyan', markeredgewidth=2)[0]
+        
         self.fig.canvas.draw_idle()
 
     def update(self, _):
@@ -2699,13 +2757,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def apply_roi_filter(self, indices, rois, phase_ref_rois):
         self.filtered_indices = indices
+        
+        # Generate Path objects for BOTH anatomical and phase reference ROIs
+        # This ensures downstream viewers can use 'path' consistently
+        if rois:
+            for r in rois:
+                if "path_vertices" in r:
+                    r["path"] = Path(r["path_vertices"])
+        
+        if phase_ref_rois:
+            for r in phase_ref_rois:
+                if "path_vertices" in r:
+                    r["path"] = Path(r["path_vertices"])
+
         self.rois = rois
-        self.phase_reference_rois = phase_ref_rois # Store the new data
+        self.phase_reference_rois = phase_ref_rois 
 
         # Enable/disable the checkbox based on whether a phase ref ROI was drawn
         self.use_subregion_ref_check.setEnabled(bool(phase_ref_rois))
         if not phase_ref_rois:
-            # If no phase ref ROI exists, ensure the checkbox is unchecked
             self.use_subregion_ref_check.setChecked(False)
 
         if indices is None:
@@ -2859,8 +2929,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.visualization_widgets[self.heatmap_tab] = viewer_h
         
         fig_c, _ = add_mpl_to_tab(self.com_tab)
-        # Add filtered_indices=self.filtered_indices to the constructor call
-        viewer_c = ContrastViewer(fig_c, fig_c.add_subplot(111), bg, self.state.loaded_data["roi"], self.on_contrast_change, self.on_roi_selected, filtered_indices=self.filtered_indices)
+        
+        # --- Gather all ROIs to visualize ---
+        current_rois = []
+        if self.rois: 
+            current_rois.extend(self.rois)
+        if self.phase_reference_rois: 
+            current_rois.extend(self.phase_reference_rois)
+
+        viewer_c = ContrastViewer(
+            fig_c, 
+            fig_c.add_subplot(111), 
+            bg, 
+            self.state.loaded_data["roi"], 
+            self.on_contrast_change, 
+            self.on_roi_selected, 
+            filtered_indices=self.filtered_indices,
+            rois=current_rois # Pass the list here
+        )
         self.visualization_widgets[self.com_tab] = viewer_c
         
         fig_t, _ = add_mpl_to_tab(self.traj_tab)
@@ -2983,9 +3069,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 r_thresh = float(self.phase_params["r_squared_threshold"][0].text())
                 rhythm_mask = (filter_scores <= thresh) & (sort_scores >= r_thresh)
                 self.log_message(f"Applying Cosinor filter: p <= {thresh} AND R² >= {r_thresh}")
+                # Cosinor returns phases in HOURS
+                phases_hours = phases
             else:
                 rhythm_mask = filter_scores >= thresh
                 self.log_message(f"Applying FFT filter: SNR >= {thresh}")
+                # FFT returns phases in RADIANS. Convert to Hours for consistency.
+                # Phase (rad) / 2pi * Period = Phase (hours)
+                phases_hours = (phases / (2 * np.pi)) * period
 
             if self.strict_cycle_check.isChecked():
                 minutes_per_frame = float(self.phase_params["minutes_per_frame"][0].text())
@@ -3006,7 +3097,7 @@ class MainWindow(QtWidgets.QMainWindow):
             is_emphasized = self.emphasize_rhythm_check.isChecked()
             heatmap_viewer = self.visualization_widgets.get(self.heatmap_tab)
             if heatmap_viewer:
-                heatmap_viewer.update_phase_data(phases, sort_scores, rhythm_mask, sort_desc)
+                heatmap_viewer.update_phase_data(phases_hours, sort_scores, rhythm_mask, sort_desc)
                 heatmap_viewer.update_rhythm_emphasis(rhythm_mask, is_emphasized)
             com_viewer = self.visualization_widgets.get(self.com_tab)
             if com_viewer:
@@ -3023,15 +3114,21 @@ class MainWindow(QtWidgets.QMainWindow):
                     canvas.draw()
                 self.log_message("No cells passed rhythmicity filter.")
                 
-                # Create an empty dataframe for the viewer to avoid crashing on export,
-                # but don't try to create a viewer with an undefined figure.
                 empty_df = pd.DataFrame()
-                fig_p, _ = add_mpl_to_tab(self.phase_tab) # This line was missing
+                fig_p, _ = add_mpl_to_tab(self.phase_tab) 
                 viewer_p = PhaseMapViewer(fig_p, fig_p.add_subplot(111), self.state.unfiltered_data["background"], empty_df, None, vmin=self.vmin, vmax=self.vmax)
                 self.visualization_widgets[self.phase_tab] = viewer_p
                 return
 
             mean_h = 0.0
+            # Helper to convert hours array to circular mean in hours
+            def calc_circ_mean_hours(h_vals, p):
+                rads = (h_vals % p) * (2 * np.pi / p)
+                m_rad = circmean(rads)
+                # Map back to -period/2 to period/2 or 0 to period
+                m_h = m_rad * (p / (2 * np.pi))
+                return m_h
+
             if self.use_subregion_ref_check.isChecked() and self.phase_reference_rois:
                 self.log_message("Using drawn sub-region as phase reference.")
                 
@@ -3039,30 +3136,35 @@ class MainWindow(QtWidgets.QMainWindow):
                 
                 ref_mask = np.zeros(len(rhythmic_coords), dtype=bool)
                 for roi in self.phase_reference_rois:
-                    path = Path(roi['path_vertices'])
+                    # Use the 'path' object we ensured exists in apply_roi_filter
+                    if "path" in roi:
+                        path = roi["path"]
+                    else:
+                        path = Path(roi['path_vertices'])
                     ref_mask |= path.contains_points(rhythmic_coords)
                 
                 ref_indices_in_rhythmic_array = np.where(ref_mask)[0]
+                
+                # DIAGNOSTIC LOGGING
+                self.log_message(f"  -> Found {len(ref_indices_in_rhythmic_array)} rhythmic cells inside reference ROI.")
 
                 if len(ref_indices_in_rhythmic_array) > 0:
-                    ref_phases = phases[rhythmic_indices_relative][ref_indices_in_rhythmic_array]
-                    ph_rad = (ref_phases % period) * (2 * np.pi / period)
-                    mean_rad = circmean(ph_rad)
-                    mean_h = mean_rad * (period / (2 * np.pi))
+                    ref_phases = phases_hours[rhythmic_indices_relative][ref_indices_in_rhythmic_array]
+                    mean_h = calc_circ_mean_hours(ref_phases, period)
+                    self.log_message(f"  -> Reference Mean Phase: {mean_h:.2f} hours")
                 else:
-                    self.log_message("Warning: No rhythmic cells found in the reference sub-region. Falling back to global mean.")
-                    ph_rad = (phases[rhythmic_indices_relative] % period) * (2 * np.pi / period)
-                    mean_rad = circmean(ph_rad)
-                    mean_h = mean_rad * (period / (2 * np.pi))
+                    self.log_message("  -> Warning: Reference ROI is empty of rhythmic cells. Falling back to global mean.")
+                    mean_h = calc_circ_mean_hours(phases_hours[rhythmic_indices_relative], period)
+                    self.log_message(f"  -> Global Mean Phase: {mean_h:.2f} hours")
             else:
                 if self.use_subregion_ref_check.isChecked():
                     self.log_message("Sub-region reference selected, but no sub-region is defined. Using global mean.")
                 
-                ph_rad = (phases[rhythmic_indices_relative] % period) * (2 * np.pi / period)
-                mean_rad = circmean(ph_rad)
-                mean_h = mean_rad * (period / (2 * np.pi))
+                mean_h = calc_circ_mean_hours(phases_hours[rhythmic_indices_relative], period)
+                self.log_message(f"Global Mean Phase: {mean_h:.2f} hours")
             
-            rel_phases = (phases[rhythmic_indices_relative] - mean_h + period / 2) % period - period / 2
+            # Calculate relative phases centered on the mean
+            rel_phases = (phases_hours[rhythmic_indices_relative] - mean_h + period / 2) % period - period / 2
             
             if self.filtered_indices is not None:
                 rhythmic_indices_original = self.filtered_indices[rhythmic_indices_relative]
@@ -3073,7 +3175,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 'Original_ROI_Index': rhythmic_indices_original + 1,
                 'X_Position': self.state.loaded_data['roi'][rhythmic_indices_relative, 0],
                 'Y_Position': self.state.loaded_data['roi'][rhythmic_indices_relative, 1],
-                'Phase_Hours': phases[rhythmic_indices_relative],
+                'Phase_Hours': phases_hours[rhythmic_indices_relative],
                 'Relative_Phase_Hours': rel_phases,
                 'Period_Hours': period
             }
@@ -3088,13 +3190,16 @@ class MainWindow(QtWidgets.QMainWindow):
             def phase_map_callback(selected_phase_index):
                 original_index = rhythmic_df['Original_ROI_Index'].iloc[selected_phase_index] - 1
                 self.on_roi_selected(original_index)
+            
             fig_p, _ = add_mpl_to_tab(self.phase_tab)
             viewer_p = PhaseMapViewer(fig_p, fig_p.add_subplot(111), self.state.unfiltered_data["background"], rhythmic_df, phase_map_callback, vmin=self.vmin, vmax=self.vmax)
             self.visualization_widgets[self.phase_tab] = viewer_p
+            
             grid_res = int(self.phase_params["grid_resolution"][0].text())
             fig_i, _ = add_mpl_to_tab(self.interp_tab)
             viewer_i = InterpolatedMapViewer(fig_i, fig_i.add_subplot(111), rhythmic_df[['X_Position', 'Y_Position']].values, rhythmic_df['Relative_Phase_Hours'].values, period, grid_res, rois=self.rois)
             self.visualization_widgets[self.interp_tab] = viewer_i
+            
             self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.phase_tab), True)
             self.vis_tabs.setTabEnabled(self.vis_tabs.indexOf(self.interp_tab), True)
             self.btn_regen_phase.setEnabled(True)
