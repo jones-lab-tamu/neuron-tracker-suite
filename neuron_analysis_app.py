@@ -397,7 +397,7 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         phase_ref_rois = [r for r in self.rois if r["mode"] == "Phase Reference"]
 
         # 1. Save the ANATOMICAL (warping) ROI JSON
-        # FIX: Check if ANY ROIs exist (including Phase Ref), not just anatomical ones.
+        # Check if ANY ROIs exist (including Phase Ref), not just anatomical ones.
         all_rois_to_save = anatomical_rois + phase_ref_rois
         
         if all_rois_to_save and self.output_basename:
@@ -740,7 +740,8 @@ class WarpInspectorWindow(QtWidgets.QDialog):
 # ------------------------------------------------------------
 
 class HeatmapViewer:
-    def __init__(self, fig, loaded_data, filtered_indices, phases, rhythm_scores, is_emphasized, rhythm_sort_desc):
+    def __init__(self, fig, loaded_data, filtered_indices, phases, rhythm_scores, is_emphasized, rhythm_sort_desc, 
+                 period=None, minutes_per_frame=None, reference_phase=None, trend_window_hours=None):
         self.fig = fig
         self.loaded_data = loaded_data
         self.traces_data = loaded_data["traces"]
@@ -751,8 +752,17 @@ class HeatmapViewer:
         self.emphasis_overlay = None
         self.rhythm_sort_desc = rhythm_sort_desc
         self.last_sort_indices = np.arange(len(self.roi_data))
+        
+        # Track the currently displayed trace so we can refresh it when params change
+        self.current_selected_index = None 
+        
+        # Analysis Parameters for On-Demand Visualization
+        self.period = period
+        self.minutes_per_frame = minutes_per_frame
+        self.reference_phase = reference_phase
+        self.trend_window_hours = trend_window_hours or 36.0
 
-        gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.3)
+        gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.45) 
         self.ax_heatmap = self.fig.add_subplot(gs[0])
         self.ax_trace = self.fig.add_subplot(gs[1])
         
@@ -771,17 +781,24 @@ class HeatmapViewer:
         self.radio_buttons.on_clicked(self.on_sort_change)
         
         self.ax_trace.set_xlabel("Time (frames)")
-        self.ax_trace.set_ylabel("Intensity")
+        self.ax_trace.set_ylabel("Detrended Intensity")
         self.ax_trace.set_title("Selected Cell Trace")
-        self.trace_line = self.ax_trace.plot([], [])[0]
+        
+        self.trace_line = self.ax_trace.plot([], [], 'b-', alpha=0.6, label="Data")[0]
+        self.fit_line = self.ax_trace.plot([], [], 'r-', linewidth=2, label="Fit")[0]
+        self.ax_trace.legend(loc="upper right", fontsize="small")
 
         if rhythm_scores is not None:
             main_win = self.fig.canvas.parent().window()
-            thr = float(main_win.phase_params["rhythm_threshold"][0].text())
+            try:
+                thr = float(main_win.phase_params["rhythm_threshold"][0].text())
+            except:
+                thr = 0.0
             if self.rhythm_sort_desc: self.rhythm_mask = rhythm_scores >= thr
             else: self.rhythm_mask = rhythm_scores <= thr
 
-        self.update_phase_data(phases, rhythm_scores, self.rhythm_mask, self.rhythm_sort_desc)
+        self.update_phase_data(phases, rhythm_scores, self.rhythm_mask, self.rhythm_sort_desc, 
+                               period, minutes_per_frame, reference_phase, trend_window_hours)
         
         if sort_options: self.on_sort_change(sort_options[0])
 
@@ -817,33 +834,110 @@ class HeatmapViewer:
         self.last_sort_indices = final_indices
         self.fig.canvas.draw_idle()
 
-    def update_phase_data(self, phases, rhythm_scores, rhythm_mask=None, sort_desc=True):
-        self.phases, self.rhythm_scores, self.rhythm_mask, self.rhythm_sort_desc = phases, rhythm_scores, rhythm_mask, sort_desc
+    def update_phase_data(self, phases, rhythm_scores, rhythm_mask=None, sort_desc=True, 
+                          period=None, minutes_per_frame=None, reference_phase=None, trend_window_hours=None):
+        self.phases = phases
+        self.rhythm_scores = rhythm_scores
+        self.rhythm_mask = rhythm_mask
+        self.rhythm_sort_desc = sort_desc
+        
+        # Update analysis params if provided
+        if period is not None: self.period = period
+        if minutes_per_frame is not None: self.minutes_per_frame = minutes_per_frame
+        self.reference_phase = reference_phase 
+        if trend_window_hours is not None: self.trend_window_hours = trend_window_hours
+
         self.sort_values = {"Y-coordinate": self.roi_data[:, 1]}
         if self.phases is not None: self.sort_values["Phase"] = self.phases
         if self.rhythm_scores is not None: self.sort_values["Rhythmicity"] = self.rhythm_scores
+        
         current_sort = self.radio_buttons.value_selected
         if current_sort in self.sort_values: self.on_sort_change(current_sort)
+
+        # Automatically refresh the selected trace with new params (e.g. new Ref Phase)
+        if self.current_selected_index is not None:
+            self.update_selected_trace(self.current_selected_index)
 
     def update_rhythm_emphasis(self, rhythm_mask, is_emphasized):
         self.is_emphasized, self.rhythm_mask = is_emphasized, rhythm_mask
         self.on_sort_change(self.radio_buttons.value_selected)
 
     def update_selected_trace(self, original_index):
+        # FIX: Store the current selection state
+        self.current_selected_index = original_index
+
+        # Clear previous vertical lines
+        while len(self.ax_trace.lines) > 2:
+            self.ax_trace.lines[-1].remove()
+            
         if self.filtered_indices is not None:
             try: current_index = np.where(self.filtered_indices == original_index)[0][0]
             except IndexError:
-                self.trace_line.set_data([], []); self.ax_trace.set_title("Selected Cell Trace (Not in current filter)")
-                self.ax_trace.relim(); self.ax_trace.autoscale_view(); self.fig.canvas.draw_idle()
+                self.trace_line.set_data([], [])
+                self.fit_line.set_data([], [])
+                self.ax_trace.set_title("Selected Cell Trace (Not in current filter)")
+                self.fig.canvas.draw_idle()
                 return
         else: current_index = original_index
+
         if 0 <= current_index < self.traces_data.shape[1] - 1:
-            time, intensity = self.traces_data[:, 0], self.traces_data[:, current_index + 1]
-            self.trace_line.set_data(time, intensity)
-            self.ax_trace.relim(); self.ax_trace.autoscale_view()
-            self.ax_trace.set_title(f"Trace for ROI {original_index + 1}")
+            # 1. Get Data
+            time_frames = self.traces_data[:, 0]
+            raw_intensity = self.traces_data[:, current_index + 1]
+            
+            # 2. Detrend 
+            mpf = self.minutes_per_frame or 15.0
+            trend_win = self.trend_window_hours or 36.0
+            win_frames = compute_median_window_frames(mpf, trend_win, len(raw_intensity))
+            detrended = preprocess_for_rhythmicity(raw_intensity, method="running_median", median_window_frames=win_frames)
+            
+            self.trace_line.set_data(time_frames, detrended)
+            
+            # 3. Calculate and Draw Fit
+            title_text = f"Trace for ROI {original_index + 1}"
+            
+            if self.period and self.minutes_per_frame:
+                time_hours = time_frames * (self.minutes_per_frame / 60.0)
+                res = csn.cosinor_analysis(detrended, time_hours, self.period)
+                
+                if not np.isnan(res['amplitude']):
+                    # Model: M + A * cos(w * (t - acrophase))
+                    w = 2 * np.pi / self.period
+                    model = res['mesor'] + res['amplitude'] * np.cos(w * (time_hours - res['acrophase']))
+                    self.fit_line.set_data(time_frames, model)
+                    
+                    # 4. Draw Markers and Stats
+                    cell_phase = res['acrophase']
+                    
+                    # Draw vertical line at first occurrence
+                    phase_frame = (cell_phase / (self.minutes_per_frame / 60.0))
+                    self.ax_trace.axvline(phase_frame, color='r', linestyle='-', alpha=0.8, label='Cell Peak')
+                    
+                    # Reference Line
+                    ref_text = ""
+                    if self.reference_phase is not None:
+                        ref_phase_frame = (self.reference_phase / (self.minutes_per_frame / 60.0))
+                        self.ax_trace.axvline(ref_phase_frame, color='k', linestyle='--', alpha=0.8, label='Ref Peak')
+                        
+                        # Calculate Delta
+                        diff = (cell_phase - self.reference_phase + self.period/2) % self.period - self.period/2
+                        sign = "+" if diff > 0 else ""
+                        ref_text = f" | Ref: {self.reference_phase:.1f}h | Δ: {sign}{diff:.1f}h"
+
+                    title_text += f" | Phase: {cell_phase:.1f}h{ref_text}"
+                else:
+                     self.fit_line.set_data([], [])
+            else:
+                self.fit_line.set_data([], [])
+
+            self.ax_trace.set_title(title_text, fontsize=10)
+            self.ax_trace.relim()
+            self.ax_trace.autoscale_view()
         else:
-            self.trace_line.set_data([], []); self.ax_trace.set_title("Selected Cell Trace")
+            self.trace_line.set_data([], [])
+            self.fit_line.set_data([], [])
+            self.ax_trace.set_title("Selected Cell Trace")
+            
         self.fig.canvas.draw_idle()
 
     def get_export_data(self):
@@ -2993,13 +3087,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         is_emphasized = self.emphasize_rhythm_check.isChecked()
         
+        # Initialize HeatmapViewer with new signature defaults
         fig_h, _ = add_mpl_to_tab(self.heatmap_tab)
-        viewer_h = HeatmapViewer(fig_h, self.state.loaded_data, self.filtered_indices, phases, sort_scores, is_emphasized, rhythm_sort_desc)
+        viewer_h = HeatmapViewer(fig_h, self.state.loaded_data, self.filtered_indices, phases, sort_scores, is_emphasized, rhythm_sort_desc,
+                                 period=period, minutes_per_frame=None, reference_phase=None)
         self.visualization_widgets[self.heatmap_tab] = viewer_h
         
         fig_c, _ = add_mpl_to_tab(self.com_tab)
         
-        # --- Gather all ROIs to visualize ---
         current_rois = []
         if self.rois: 
             current_rois.extend(self.rois)
@@ -3014,7 +3109,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.on_contrast_change, 
             self.on_roi_selected, 
             filtered_indices=self.filtered_indices,
-            rois=current_rois # Pass the list here
+            rois=current_rois
         )
         self.visualization_widgets[self.com_tab] = viewer_c
         
@@ -3134,6 +3229,13 @@ class MainWindow(QtWidgets.QMainWindow):
             method = self.analysis_method_combo.currentText()
             thresh = float(self.phase_params["rhythm_threshold"][0].text())
 
+            # Get extra params for visualization
+            mpf = float(self.phase_params["minutes_per_frame"][0].text())
+            try:
+                trend_win = float(self.phase_params["trend_window_hours"][0].text())
+            except:
+                trend_win = 36.0
+
             if "Cosinor" in method:
                 r_thresh = float(self.phase_params["r_squared_threshold"][0].text())
                 rhythm_mask = (filter_scores <= thresh) & (sort_scores >= r_thresh)
@@ -3148,26 +3250,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 phases_hours = (phases / (2 * np.pi)) * period
 
             if self.strict_cycle_check.isChecked():
-                minutes_per_frame = float(self.phase_params["minutes_per_frame"][0].text())
-                try:
-                    trend_window_hours = float(self.phase_params["trend_window_hours"][0].text())
-                except Exception:
-                    trend_window_hours = RHYTHM_TREND_WINDOW_HOURS
                 rhythm_mask = strict_cycle_mask(
                     self.state.loaded_data["traces"],
-                    minutes_per_frame=minutes_per_frame,
+                    minutes_per_frame=mpf,
                     period_hours=period,
                     base_mask=rhythm_mask,
                     min_cycles=2,
-                    trend_window_hours=trend_window_hours,
+                    trend_window_hours=trend_win,
                 )
                 self.log_message("Strict cycle filter applied: requiring >= 2 cycles.")
 
             is_emphasized = self.emphasize_rhythm_check.isChecked()
-            heatmap_viewer = self.visualization_widgets.get(self.heatmap_tab)
-            if heatmap_viewer:
-                heatmap_viewer.update_phase_data(phases_hours, sort_scores, rhythm_mask, sort_desc)
-                heatmap_viewer.update_rhythm_emphasis(rhythm_mask, is_emphasized)
+            
+            # We will update the HeatmapViewer AFTER we calculate mean_h below
+            
             com_viewer = self.visualization_widgets.get(self.com_tab)
             if com_viewer:
                 com_viewer.update_rhythm_emphasis(rhythm_mask, is_emphasized)
@@ -3187,6 +3283,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 fig_p, _ = add_mpl_to_tab(self.phase_tab) 
                 viewer_p = PhaseMapViewer(fig_p, fig_p.add_subplot(111), self.state.unfiltered_data["background"], empty_df, None, vmin=self.vmin, vmax=self.vmax)
                 self.visualization_widgets[self.phase_tab] = viewer_p
+                
+                # Even if no cells, update Heatmap to clear emphasis/lines if needed
+                heatmap_viewer = self.visualization_widgets.get(self.heatmap_tab)
+                if heatmap_viewer:
+                     heatmap_viewer.update_phase_data(phases_hours, sort_scores, rhythm_mask, sort_desc,
+                                                 period=period, minutes_per_frame=mpf, 
+                                                 reference_phase=None, trend_window_hours=trend_win)
                 return
 
             mean_h = 0.0
@@ -3214,7 +3317,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 
                 ref_indices_in_rhythmic_array = np.where(ref_mask)[0]
                 
-                # DIAGNOSTIC LOGGING
                 self.log_message(f"  -> Found {len(ref_indices_in_rhythmic_array)} rhythmic cells inside reference ROI.")
 
                 if len(ref_indices_in_rhythmic_array) > 0:
@@ -3232,6 +3334,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 mean_h = calc_circ_mean_hours(phases_hours[rhythmic_indices_relative], period)
                 self.log_message(f"Global Mean Phase: {mean_h:.2f} hours")
             
+            # --- UPDATE HEATMAP VIEWER WITH CALCULATED METRICS ---
+            heatmap_viewer = self.visualization_widgets.get(self.heatmap_tab)
+            if heatmap_viewer:
+                 heatmap_viewer.update_phase_data(phases_hours, sort_scores, rhythm_mask, sort_desc,
+                                             period=period, minutes_per_frame=mpf, 
+                                             reference_phase=mean_h, trend_window_hours=trend_win)
+                 heatmap_viewer.update_rhythm_emphasis(rhythm_mask, is_emphasized)
+
             # Calculate relative phases centered on the mean
             rel_phases = (phases_hours[rhythmic_indices_relative] - mean_h + period / 2) % period - period / 2
             
