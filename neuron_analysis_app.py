@@ -2656,7 +2656,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_load_results.setEnabled(True)
 
         # Now that all data is loaded, proceed with visualization
-        self.apply_roi_filter(None, None)
+        self.apply_roi_filter(None, None, None)
 
         # Clear thread handles
         self._movie_loader_thread = None
@@ -2723,7 +2723,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.populate_visualizations()
 
     def clear_roi_filter(self):
-        self.apply_roi_filter(None, None)
+        self.apply_roi_filter(None, None, None)
 
     def save_parameters(self):
         start_dir = self._get_last_dir()
