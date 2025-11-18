@@ -2850,13 +2850,27 @@ class MainWindow(QtWidgets.QMainWindow):
         """Callback for when a point is clicked in a spatial plot."""
         self.log_message(f"ROI {original_index + 1} selected.")
         
+        # Calculate the Local Index for the Trajectory Inspector.
+        # The Inspector displays 'loaded_data', which is the FILTERED subset.
+        # We must map the Global Original Index -> Local Filtered Index.
+        local_index = original_index
+        if self.filtered_indices is not None:
+            matches = np.where(self.filtered_indices == original_index)[0]
+            if len(matches) > 0:
+                local_index = matches[0]
+            else:
+                # The selected global index is not in the current filter view.
+                # This implies a state mismatch, but we should just ignore it for the trajectory viewer.
+                local_index = -1
+
         # Update the trajectory inspector
         traj_viewer = self.visualization_widgets.get(self.traj_tab)
-        if traj_viewer:
-            traj_viewer.set_trajectory(original_index)
+        if traj_viewer and local_index != -1:
+            traj_viewer.set_trajectory(local_index) # Pass the LOCAL index
             self.vis_tabs.setCurrentWidget(self.traj_tab)
 
         # Highlight the point in other relevant viewers
+        # (ContrastViewer and HeatmapViewer handle the Global Index -> Local Index conversion internally)
         com_viewer = self.visualization_widgets.get(self.com_tab)
         if com_viewer:
             com_viewer.highlight_point(original_index)
@@ -2886,7 +2900,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     phase_viewer.highlight_point(None) 
             except Exception:
                 pass
-
+                
     def on_contrast_change(self, vmin, vmax):
         self.vmin = vmin
         self.vmax = vmax
