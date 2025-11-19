@@ -832,6 +832,24 @@ class GroupScatterViewer:
             self.cmap_btn.on_clicked(self.toggle_cmap)
 
             self.update_clim(max_range)
+
+            # --- Force Square Field of View ---
+            xs = self.group_df['Warped_X']
+            ys = self.group_df['Warped_Y']
+            
+            # 1. Calculate Center
+            cx = (xs.min() + xs.max()) / 2
+            cy = (ys.min() + ys.max()) / 2
+            
+            # 2. Find Max Dimension
+            range_x = xs.max() - xs.min()
+            range_y = ys.max() - ys.min()
+            max_range = max(range_x, range_y)
+            
+            # 3. Apply Padding and Set Limits
+            half_span = (max_range * 1.05) / 2 
+            ax.set_xlim(cx - half_span, cx + half_span)
+            ax.set_ylim(cy - half_span, cy + half_span)
             
         ax.set_aspect("equal", adjustable="box")
         ax.invert_yaxis()
@@ -864,9 +882,8 @@ class GroupAverageMapViewer:
         self.cmap_cyclic = cet.cm.cyclic_mygbm_30_95_c78
         self.cmap_diverging = 'coolwarm'
 
-        # Reserve space - make axes square (height=0.65, so width should also be 0.65)
-        # Height: 0.9 - 0.25 = 0.65, Width: right(0.85) - left should = 0.65, so left = 0.20
-        self.fig.subplots_adjust(left=0.20, bottom=0.25, right=0.85, top=0.9)
+        # Match the margins of GroupScatterViewer
+        self.fig.subplots_adjust(left=0.1, bottom=0.25, right=0.85, top=0.9)
 
         ax.set_title("Group Average Phase Map")
         
@@ -883,8 +900,23 @@ class GroupAverageMapViewer:
         if do_smooth:
             pass
 
-        x_min, x_max = self.group_scatter_df['Warped_X'].min(), self.group_scatter_df['Warped_X'].max()
-        y_min, y_max = self.group_scatter_df['Warped_Y'].min(), self.group_scatter_df['Warped_Y'].max()
+        xs = self.group_scatter_df['Warped_X']
+        ys = self.group_scatter_df['Warped_Y']
+        
+        cx = (xs.min() + xs.max()) / 2
+        cy = (ys.min() + ys.max()) / 2
+        
+        range_x = xs.max() - xs.min()
+        range_y = ys.max() - ys.min()
+        max_range = max(range_x, range_y)
+        
+        # 5% padding
+        half_span = (max_range * 1.05) / 2 
+        
+        x_min = cx - half_span
+        x_max = cx + half_span
+        y_min = cy - half_span
+        y_max = cy + half_span
 
         self.im = ax.imshow(binned_grid, origin="lower", extent=[x_min, x_max, y_min, y_max], cmap=self.cmap_cyclic)
         ax.invert_yaxis()
@@ -955,15 +987,29 @@ class InterpolatedMapViewer:
 
         xs = roi_data[:, 0]
         ys = roi_data[:, 1]
-        x_min, x_max = xs.min(), xs.max()
-        y_min, y_max = ys.min(), ys.max()
-        x_buf = (x_max - x_min) * 0.05
-        y_buf = (y_max - y_min) * 0.05
+        
+        # 1. Calculate center of data
+        cx = (xs.min() + xs.max()) / 2
+        cy = (ys.min() + ys.max()) / 2
+        
+        # 2. Determine the largest dimension (width vs height)
+        range_x = xs.max() - xs.min()
+        range_y = ys.max() - ys.min()
+        max_range = max(range_x, range_y)
+        
+        # 3. Create square bounds with 5% padding
+        half_span = (max_range * 1.05) / 2 
+        
+        x_min = cx - half_span
+        x_max = cx + half_span
+        y_min = cy - half_span
+        y_max = cy + half_span
 
         grid_x, grid_y = np.mgrid[
-            x_min - x_buf:x_max + x_buf:complex(grid_resolution),
-            y_min - y_buf:y_max + y_buf:complex(grid_resolution),
+            x_min:x_max:complex(grid_resolution),
+            y_min:y_max:complex(grid_resolution),
         ]
+
         grid_points = np.vstack([grid_x.ravel(), grid_y.ravel()]).T
 
         rbf_x = RBFInterpolator(roi_data, x_comp, kernel="linear", smoothing=1.0)
@@ -1007,12 +1053,8 @@ class InterpolatedMapViewer:
         self.im = ax.imshow(
             grid_z.T,
             origin="upper",
-            extent=[
-                x_min - x_buf,
-                x_max + x_buf,
-                y_min - y_buf,
-                y_max + y_buf,
-            ],
+            # Use the square extent
+            extent=[x_min, x_max, y_min, y_max], 
             cmap=self.cmap_cyclic,
             interpolation="bilinear",
         )
