@@ -930,22 +930,42 @@ class GroupAverageMapViewer:
             self.fig.canvas.draw_idle()
             return
 
-        # Handle dimensions (nx, ny)
+        # Handle independent X/Y dimensions (Square Pixels)
         nx, ny = grid_dims
-
-        # Note: shape is (rows, cols) -> (ny, nx)
+        
+        # Main Phase Grid: shape is (rows, cols) -> (ny, nx)
         binned_grid = np.full((ny, nx), np.nan)
         
+        # Metadata Grids for Tooltip
+        self.count_grid = np.zeros((ny, nx), dtype=int)
+        self.animal_grid = {} # Key: (row, col), Value: set of animal names
+
+        # 1. Populate Grids from Data
+        # We iterate group_scatter_df to get counts and animals, 
+        # and group_binned_df to get the pre-calculated means.
+        
+        # Fill Phase Mean
         for _, row in self.group_binned_df.iterrows():
             ix = int(row['Grid_X_Index'])
             iy = int(row['Grid_Y_Index'])
             if 0 <= iy < ny and 0 <= ix < nx:
                 binned_grid[iy, ix] = row['Relative_Phase_Hours']
 
+        # Fill Metadata (Counts and Sources)
+        for _, row in self.group_scatter_df.iterrows():
+            ix = int(row['Grid_X_Index'])
+            iy = int(row['Grid_Y_Index'])
+            if 0 <= iy < ny and 0 <= ix < nx:
+                self.count_grid[iy, ix] += 1
+                if (iy, ix) not in self.animal_grid:
+                    self.animal_grid[(iy, ix)] = set()
+                self.animal_grid[(iy, ix)].add(str(row['Source_Animal']))
+
+        # 2. Apply Smoothing (if requested)
         if do_smooth:
-            from scipy.stats import circmean # Ensure this is imported
+            from scipy.stats import circmean
             
-            # Create a copy to avoid "daisy-chaining" the smoothing (only fill based on real data)
+            # Create a copy to avoid "daisy-chaining" (only fill based on original data)
             original_grid = binned_grid.copy()
             rows, cols = original_grid.shape
             
@@ -961,25 +981,23 @@ class GroupAverageMapViewer:
                         valid_neighbors = window[~np.isnan(window)]
                         
                         if valid_neighbors.size > 0:
-                            # 1. Convert valid neighbor hours to radians [-pi, pi]
-                            #    (Assumes data is centered around 0, e.g., -12 to +12)
+                            # Convert hours to radians [-pi, pi]
                             rads = (valid_neighbors / (self.period_hours / 2.0)) * np.pi
                             
-                            # 2. Calculate circular mean forcing the range to [-pi, pi]
-                            #    This prevents -2h (Blue) from wrapping to +22h (Red)
+                            # Circular mean centered at 0 (prevents Blue->Red wrapping error)
                             mean_rad = circmean(rads, low=-np.pi, high=np.pi)
                             
-                            # 3. Convert back to hours
+                            # Convert back to hours
                             mean_h = (mean_rad / np.pi) * (self.period_hours / 2.0)
                             binned_grid[r, c] = mean_h
 
-        # 1. Get Data Limits (Tight) - Needed for proper image placement (extent)
+        # 3. Get Data Limits (Tight) for Image Extent
         xs = self.group_scatter_df['Warped_X']
         ys = self.group_scatter_df['Warped_Y']
         data_x_min, data_x_max = xs.min(), xs.max()
         data_y_min, data_y_max = ys.min(), ys.max()
 
-        # 2. Calculate View Limits (Padded Square) - Needed for "Zoom" consistency
+        # 4. Calculate View Limits (Padded Square) for Camera Zoom
         cx = (data_x_min + data_x_max) / 2
         cy = (data_y_min + data_y_max) / 2
         
@@ -987,17 +1005,14 @@ class GroupAverageMapViewer:
         range_y = data_y_max - data_y_min
         max_range = max(range_x, range_y)
         
-        half_span = (max_range * 1.15) / 2  # 15% padding
+        half_span = (max_range * 1.15) / 2  # 15% padding matches other plots
 
-        # 3. Draw Image
-        # 'extent' must be the TIGHT data limits, not the padded limits.
-        # This ensures the pixels are drawn at the correct size and location.
+        # 5. Draw Image
         self.im = ax.imshow(binned_grid, origin="lower", 
                             extent=[data_x_min, data_x_max, data_y_min, data_y_max], 
                             cmap=self.cmap_cyclic)
 
-        # 4. Set View limits to the padded square box
-        # This "zooms out" the camera to match the Scatter Plot view.
+        # 6. Set View limits
         ax.set_xlim(cx - half_span, cx + half_span)
         ax.set_ylim(cy - half_span, cy + half_span)
         
@@ -1005,18 +1020,23 @@ class GroupAverageMapViewer:
         ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
         
-        # Manual colorbar placement
+        # 7. Tooltip Setup
+        self.annot = ax.annotate("", xy=(0,0), xytext=(20,20), textcoords="offset points",
+                                 bbox=dict(boxstyle="round", fc="w", alpha=0.9),
+                                 arrowprops=dict(arrowstyle="->"))
+        self.annot.set_visible(False)
+        self.fig.canvas.mpl_connect("motion_notify_event", self.hover)
+        
+        # Controls (Colorbar, Sliders)
         cax = fig.add_axes([0.86, 0.25, 0.02, 0.6])
         self.cbar = fig.colorbar(self.im, cax=cax)
         self.cbar.set_label("Mean Relative Peak Time (hours)")
         
-        # Position controls
         ax_slider = fig.add_axes([0.25, 0.10, 0.60, 0.03])
         max_range = self.period_hours / 2.0
         self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- hrs)", valmin=1.0, valmax=max_range, valinit=max_range)
         self.range_slider.on_changed(self.update_clim)
 
-        # Colormap Toggle Button
         ax_button = fig.add_axes([0.25, 0.05, 0.15, 0.04])
         self.cmap_btn = Button(ax_button, "Mode: Cyclic")
         self.cmap_btn.on_clicked(self.toggle_cmap)
@@ -1034,7 +1054,74 @@ class GroupAverageMapViewer:
 
     def update_clim(self, val):
         if hasattr(self, "im"): self.im.set_clim(-val, val); self.fig.canvas.draw_idle()
+        
+    def hover(self, event):
+        if event.inaxes != self.ax:
+            if self.annot.get_visible():
+                self.annot.set_visible(False)
+                self.fig.canvas.draw_idle()
+            return
 
+        # Get extent and shape to map mouse position to array index
+        extent = self.im.get_extent() # [xmin, xmax, ymin, ymax]
+        arr = self.im.get_array()
+        ny, nx = arr.shape
+        
+        xmin, xmax, ymin, ymax = extent
+        
+        # Calculate pixel size
+        dx = (xmax - xmin) / nx
+        dy = (ymax - ymin) / ny
+        
+        # Map mouse to index (origin='lower')
+        c = int((event.xdata - xmin) / dx)
+        r = int((event.ydata - ymin) / dy)
+        
+        if 0 <= r < ny and 0 <= c < nx:
+            val = arr[r, c]
+            
+            # 1. Check if the value is a MaskedConstant (common in mpl images)
+            if np.ma.is_masked(val):
+                self.annot.set_visible(False)
+                self.fig.canvas.draw_idle()
+                return
+            
+            # 2. Check if the value is explicitly NaN
+            if np.isnan(val):
+                self.annot.set_visible(False)
+                self.fig.canvas.draw_idle()
+                return
+            # -------------------------------------------------
+            
+            # It has a valid float value (Real or Smoothed)
+            count = self.count_grid[r, c]
+            text = f"Phase: {val:.2f} h"
+            
+            if count > 0:
+                # Real Data
+                animals = self.animal_grid.get((r, c), set())
+                # Truncate list if long
+                animal_list = sorted(list(animals))
+                if len(animal_list) > 3:
+                    source_str = f"{', '.join(animal_list[:3])}, +{len(animal_list)-3} more"
+                else:
+                    source_str = ", ".join(animal_list)
+                
+                text += f"\nN = {count} cells"
+                text += f"\nSources: {source_str}"
+            else:
+                # Smoothed Data
+                text += "\n(Interpolated)"
+                
+            self.annot.xy = (event.xdata, event.ydata)
+            self.annot.set_text(text)
+            self.annot.set_visible(True)
+            self.fig.canvas.draw_idle()
+        else:
+            if self.annot.get_visible():
+                self.annot.set_visible(False)
+                self.fig.canvas.draw_idle()
+                
     def get_export_data(self):
         return self.group_scatter_df, "group_binned_details_data.csv"
 
