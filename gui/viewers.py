@@ -983,51 +983,60 @@ class InterpolatedMapViewer:
         ax.set_title("Interpolated Spatiotemporal Phase Map")
 
         if len(roi_data) < 4:
-            ax.text(
-                0.5, 0.5,
-                "Not enough data points (<4) for interpolation.",
-                ha="center", va="center",
-            )
+            ax.text(0.5, 0.5, "Not enough data points (<4) for interpolation.", ha="center", va="center")
             return
 
         phase_angles_rad = (relative_phases / (period_hours / 2.0)) * pi
         x_comp = np.cos(phase_angles_rad)
         y_comp = np.sin(phase_angles_rad)
 
+        # 1. Determine Geometry Bounds
+        # Start with data bounds
         xs = roi_data[:, 0]
         ys = roi_data[:, 1]
+        bounds_x_min, bounds_x_max = xs.min(), xs.max()
+        bounds_y_min, bounds_y_max = ys.min(), ys.max()
         
-        # 1. Calculate center of data
-        cx = (xs.min() + xs.max()) / 2
-        cy = (ys.min() + ys.max()) / 2
+        # If "Include" ROIs exist, use their extent instead of just the points.
+        # This prevents clipping the anatomical border and matches the CoM view scale better.
+        if rois:
+            include_verts = []
+            for r in rois:
+                if r.get("mode") == "Include" and "path_vertices" in r:
+                    include_verts.append(np.array(r["path_vertices"]))
+            
+            if include_verts:
+                all_verts = np.vstack(include_verts)
+                roi_x_min, roi_x_max = all_verts[:, 0].min(), all_verts[:, 0].max()
+                roi_y_min, roi_y_max = all_verts[:, 1].min(), all_verts[:, 1].max()
+                
+                # Expand bounds to encompass the full ROI
+                bounds_x_min = min(bounds_x_min, roi_x_min)
+                bounds_x_max = max(bounds_x_max, roi_x_max)
+                bounds_y_min = min(bounds_y_min, roi_y_min)
+                bounds_y_max = max(bounds_y_max, roi_y_max)
+
+        # 2. Grid Generation (Buffer based on full bounds)
+        x_buf = (bounds_x_max - bounds_x_min) * 0.05
+        y_buf = (bounds_y_max - bounds_y_min) * 0.05
         
-        # 2. Determine the largest dimension (width vs height)
-        range_x = xs.max() - xs.min()
-        range_y = ys.max() - ys.min()
-        max_range = max(range_x, range_y)
-        
-        # 3. Create square bounds with 5% padding
-        half_span = (max_range * 1.05) / 2 
-        
-        x_min = cx - half_span
-        x_max = cx + half_span
-        y_min = cy - half_span
-        y_max = cy + half_span
+        grid_x_min, grid_x_max = bounds_x_min - x_buf, bounds_x_max + x_buf
+        grid_y_min, grid_y_max = bounds_y_min - y_buf, bounds_y_max + y_buf
 
         grid_x, grid_y = np.mgrid[
-            x_min:x_max:complex(grid_resolution),
-            y_min:y_max:complex(grid_resolution),
+            grid_x_min:grid_x_max:complex(grid_resolution),
+            grid_y_min:grid_y_max:complex(grid_resolution),
         ]
-
         grid_points = np.vstack([grid_x.ravel(), grid_y.ravel()]).T
 
         rbf_x = RBFInterpolator(roi_data, x_comp, kernel="linear", smoothing=1.0)
         rbf_y = RBFInterpolator(roi_data, y_comp, kernel="linear", smoothing=1.0)
-
+        
         gx = rbf_x(grid_points)
         gy = rbf_y(grid_points)
-
+        
         angles = arctan2(gy, gx)
+        
         grid_z = (angles / pi) * (period_hours / 2.0)
         grid_z = grid_z.reshape(grid_x.shape)
 
@@ -1037,21 +1046,15 @@ class InterpolatedMapViewer:
             include_paths = [r["path"] for r in rois if r["mode"] == "Include"]
             if include_paths:
                 for path in include_paths:
-                    final_mask |= path.contains_points(
-                        grid_points
-                    ).reshape(grid_x.shape)
+                    final_mask |= path.contains_points(grid_points).reshape(grid_x.shape)
             else:
                 if len(roi_data) > 2:
                     hull = ConvexHull(roi_data)
                     hpath = Path(roi_data[hull.vertices])
-                    final_mask = hpath.contains_points(
-                        grid_points
-                    ).reshape(grid_x.shape)
+                    final_mask = hpath.contains_points(grid_points).reshape(grid_x.shape)
             for roi in rois:
                 if roi["mode"] == "Exclude":
-                    final_mask &= ~roi["path"].contains_points(
-                        grid_points
-                    ).reshape(grid_x.shape)
+                    final_mask &= ~roi["path"].contains_points(grid_points).reshape(grid_x.shape)
             grid_z[~final_mask] = np.nan
         elif len(roi_data) > 2:
             hull = ConvexHull(roi_data)
@@ -1059,14 +1062,27 @@ class InterpolatedMapViewer:
             mask = hpath.contains_points(grid_points).reshape(grid_x.shape)
             grid_z[~mask] = np.nan
 
+        # 3. Draw Image (Corrected Orientation)
         self.im = ax.imshow(
             grid_z.T,
             origin="upper",
-            # Use the square extent
-            extent=[x_min, x_max, y_min, y_max], 
+            extent=[grid_x_min, grid_x_max, grid_y_max, grid_y_min], # y_max to y_min for correct orientation
             cmap=self.cmap_cyclic,
             interpolation="bilinear",
         )
+
+        # 4. Camera View (Centered on Bounds + 15% padding)
+        cx = (bounds_x_min + bounds_x_max) / 2
+        cy = (bounds_y_min + bounds_y_max) / 2
+        
+        range_x = bounds_x_max - bounds_x_min
+        range_y = bounds_y_max - bounds_y_min
+        max_range = max(range_x, range_y)
+        
+        half_span = (max_range * 1.15) / 2 
+        
+        ax.set_xlim(cx - half_span, cx + half_span)
+        ax.set_ylim(cy + half_span, cy - half_span) 
 
         ax.set_aspect("equal")
         ax.set_xticks([])
