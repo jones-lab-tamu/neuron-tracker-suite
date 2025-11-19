@@ -196,7 +196,15 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         self.btn_regen_phase = QtWidgets.QPushButton(get_icon('fa5s.sync'), "Update Plots")
         Tooltip.install(self.btn_regen_phase, "Re-calculates all relevant plots (Heatmap, Center of Mass, Phase Maps).")
         self.btn_regen_phase.setEnabled(False)
-        phase_layout.addRow(self.btn_regen_phase)
+        
+        self.btn_save_rhythm = QtWidgets.QPushButton(get_icon('fa5s.save'), "Save Rhythm Results")
+        Tooltip.install(self.btn_save_rhythm, "Saves the current rhythmicity status (Approved/Rejected) and phase data for every cell to a CSV file. This locks in these results for Group Analysis.")
+        self.btn_save_rhythm.setEnabled(False)
+        
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addWidget(self.btn_regen_phase)
+        btn_row.addWidget(self.btn_save_rhythm)
+        phase_layout.addRow(btn_row)
 
         layout.addWidget(phase_box)
         layout.addStretch(1)
@@ -217,6 +225,7 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         self.mw.btn_export_data.clicked.connect(self.export_current_data)
         
         self.btn_regen_phase.clicked.connect(self.regenerate_phase_maps)
+        self.btn_save_rhythm.clicked.connect(self.save_rhythm_results)
         self.emphasize_rhythm_check.stateChanged.connect(self.regenerate_phase_maps)
         self.use_subregion_ref_check.stateChanged.connect(self.regenerate_phase_maps)
         self.analysis_method_combo.currentIndexChanged.connect(self._on_analysis_method_changed)
@@ -639,6 +648,11 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             return
         self.mw.log_message("Updating plots based on phase parameters...")
         for tab in (self.mw.phase_tab, self.mw.interp_tab): clear_layout(tab.layout())
+        
+        # Disable save button until calculation is done
+        self.btn_save_rhythm.setEnabled(False)
+        self.latest_rhythm_df = None # Reset storage        
+        
         try:
             phases, period, sort_scores, filter_scores, sort_desc = self._calculate_rhythms()
             if phases is None: raise ValueError("Rhythm calculation failed.")
@@ -725,6 +739,29 @@ class SingleAnimalPanel(QtWidgets.QWidget):
                 mean_h = calc_circ_mean_hours(phases_hours[rhythmic_indices_relative], period)
                 self.mw.log_message(f"Global Mean Phase: {mean_h:.2f} hours")
             
+            
+            if "Cosinor" in method:
+                 final_phases_h = phases
+            else:
+                 final_phases_h = ((phases / (2 * np.pi)) * period) % period
+            
+            save_data = {
+                'Original_ROI_Index': np.arange(len(phases)) + 1,
+                'Phase_Hours': final_phases_h,
+                'Period_Hours': np.full(len(phases), period),
+                'Is_Rhythmic': rhythm_mask
+            }
+            
+            # Add scores for completeness
+            if "Cosinor" in method:
+                save_data['P_Value'] = filter_scores
+                save_data['R_Squared'] = sort_scores
+            else:
+                save_data['SNR'] = sort_scores
+                
+            self.latest_rhythm_df = pd.DataFrame(save_data)
+            self.btn_save_rhythm.setEnabled(True) # Enable the save button!
+            
             heatmap_viewer = self.mw.visualization_widgets.get(self.mw.heatmap_tab)
             if heatmap_viewer:
                  heatmap_viewer.update_phase_data(phases_hours, sort_scores, rhythm_mask, sort_desc,
@@ -770,10 +807,29 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.phase_tab), True)
             self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.interp_tab), True)
             self.btn_regen_phase.setEnabled(True)
-            self.mw.log_message("Phase-based plots updated.")
+            self.mw.log_message("Phase-based plots updated. Review and click 'Save Rhythm Results' to commit.")
+            
         except Exception as e:
             self.mw.log_message(f"Could not update plots: {e}")
             import traceback
             self.mw.log_message(traceback.format_exc())
             self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.phase_tab), False)
             self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.interp_tab), False)
+
+    def save_rhythm_results(self):
+        if self.latest_rhythm_df is None:
+            return
+        
+        basename = self.state.output_basename
+        if not basename:
+            self.mw.log_message("Error: No output basename defined.")
+            return
+            
+        filename = f"{basename}_rhythm_results.csv"
+        
+        try:
+            self.latest_rhythm_df.to_csv(filename, index=False)
+            self.mw.log_message(f"SUCCESS: Rhythm results saved to {os.path.basename(filename)}")
+            self.mw.log_message("These approved cells will now be used for Group Analysis.")
+        except Exception as e:
+            self.mw.log_message(f"Error saving rhythm results: {e}")
