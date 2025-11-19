@@ -183,25 +183,51 @@ class HeatmapViewer:
                     model = res['mesor'] + res['amplitude'] * np.cos(w * (time_hours - res['acrophase']))
                     self.fit_line.set_data(time_frames, model)
                     
-                    # 4. Draw Markers and Stats
-                    cell_phase = res['acrophase']
+                    # --- Nearest Neighbor Peak Plotting ---
                     
-                    # Draw vertical line at first occurrence
-                    phase_frame = (cell_phase / (self.minutes_per_frame / 60.0))
-                    self.ax_trace.axvline(phase_frame, color='r', linestyle='-', alpha=0.8, label='Cell Peak')
+                    cell_phase_hours = res['acrophase']
+                    period_frames = self.period / (self.minutes_per_frame / 60.0)
+                    cell_peak_frame_base = (cell_phase_hours / (self.minutes_per_frame / 60.0))
                     
-                    # Reference Line
                     ref_text = ""
+                    final_peak_frame = cell_peak_frame_base
+                    
                     if self.reference_phase is not None:
+                        # 1. Draw Reference Line (Black Dashed)
                         ref_phase_frame = (self.reference_phase / (self.minutes_per_frame / 60.0))
                         self.ax_trace.axvline(ref_phase_frame, color='k', linestyle='--', alpha=0.8, label='Ref Peak')
                         
-                        # Calculate Delta
-                        diff = (cell_phase - self.reference_phase + self.period/2) % self.period - self.period/2
+                        # 2. Find the Cell Peak cycle closest to the Reference Line
+                        # Candidates: base, base+P, base-P, base+2P...
+                        
+                        # Calculate shift to bring cell peak closest to ref
+                        delta = ref_phase_frame - cell_peak_frame_base
+                        cycles_shift = round(delta / period_frames)
+                        
+                        candidate_frame = cell_peak_frame_base + (cycles_shift * period_frames)
+                        
+                        # 3. Safety Check: Is the candidate visible?
+                        max_frame = time_frames[-1]
+                        if 0 <= candidate_frame <= max_frame:
+                            final_peak_frame = candidate_frame
+                        else:
+                            # Fallback: if nearest is invisible, try to find ANY visible peak
+                            if 0 <= cell_peak_frame_base <= max_frame:
+                                final_peak_frame = cell_peak_frame_base
+                            else:
+                                # Try one forward shift if base is negative
+                                if cell_peak_frame_base < 0:
+                                    final_peak_frame = cell_peak_frame_base + period_frames
+                        
+                        # Calculate Delta for Text
+                        diff = (cell_phase_hours - self.reference_phase + self.period/2) % self.period - self.period/2
                         sign = "+" if diff > 0 else ""
                         ref_text = f" | Ref: {self.reference_phase:.1f}h | Δ: {sign}{diff:.1f}h"
-
-                    title_text += f" | Phase: {cell_phase:.1f}h{ref_text}"
+                    
+                    # Draw Cell Peak Line (Red Solid) at the calculated "Best" frame
+                    self.ax_trace.axvline(final_peak_frame, color='r', linestyle='-', alpha=0.8, label='Cell Peak')
+                    
+                    title_text += f" | Phase: {cell_phase_hours:.1f}h{ref_text}"
                 else:
                      self.fit_line.set_data([], [])
             else:
@@ -333,84 +359,6 @@ class ContrastViewer:
     def update_rhythm_emphasis(self, rhythm_mask, is_emphasized):
         self.is_emphasized, self.rhythm_mask = is_emphasized, rhythm_mask
         self.on_sort_change(self.radio_buttons.value_selected)
-
-    def update_selected_trace(self, original_index):
-        # FIX: Store the current selection state
-        self.current_selected_index = original_index
-
-        # Clear previous vertical lines
-        while len(self.ax_trace.lines) > 2:
-            self.ax_trace.lines[-1].remove()
-            
-        if self.filtered_indices is not None:
-            try: current_index = np.where(self.filtered_indices == original_index)[0][0]
-            except IndexError:
-                self.trace_line.set_data([], [])
-                self.fit_line.set_data([], [])
-                self.ax_trace.set_title("Selected Cell Trace (Not in current filter)")
-                self.fig.canvas.draw_idle()
-                return
-        else: current_index = original_index
-
-        if 0 <= current_index < self.traces_data.shape[1] - 1:
-            # 1. Get Data
-            time_frames = self.traces_data[:, 0]
-            raw_intensity = self.traces_data[:, current_index + 1]
-            
-            # 2. Detrend 
-            mpf = self.minutes_per_frame or 15.0
-            trend_win = self.trend_window_hours or 36.0
-            win_frames = compute_median_window_frames(mpf, trend_win, len(raw_intensity))
-            detrended = preprocess_for_rhythmicity(raw_intensity, method="running_median", median_window_frames=win_frames)
-            
-            self.trace_line.set_data(time_frames, detrended)
-            
-            # 3. Calculate and Draw Fit
-            title_text = f"Trace for ROI {original_index + 1}"
-            
-            if self.period and self.minutes_per_frame:
-                time_hours = time_frames * (self.minutes_per_frame / 60.0)
-                res = csn.cosinor_analysis(detrended, time_hours, self.period)
-                
-                if not np.isnan(res['amplitude']):
-                    # Model: M + A * cos(w * (t - acrophase))
-                    w = 2 * np.pi / self.period
-                    model = res['mesor'] + res['amplitude'] * np.cos(w * (time_hours - res['acrophase']))
-                    self.fit_line.set_data(time_frames, model)
-                    
-                    # 4. Draw Markers and Stats
-                    cell_phase = res['acrophase']
-                    
-                    # Draw vertical line at first occurrence
-                    phase_frame = (cell_phase / (self.minutes_per_frame / 60.0))
-                    self.ax_trace.axvline(phase_frame, color='r', linestyle='-', alpha=0.8, label='Cell Peak')
-                    
-                    # Reference Line
-                    ref_text = ""
-                    if self.reference_phase is not None:
-                        ref_phase_frame = (self.reference_phase / (self.minutes_per_frame / 60.0))
-                        self.ax_trace.axvline(ref_phase_frame, color='k', linestyle='--', alpha=0.8, label='Ref Peak')
-                        
-                        # Calculate Delta
-                        diff = (cell_phase - self.reference_phase + self.period/2) % self.period - self.period/2
-                        sign = "+" if diff > 0 else ""
-                        ref_text = f" | Ref: {self.reference_phase:.1f}h | Δ: {sign}{diff:.1f}h"
-
-                    title_text += f" | Phase: {cell_phase:.1f}h{ref_text}"
-                else:
-                     self.fit_line.set_data([], [])
-            else:
-                self.fit_line.set_data([], [])
-
-            self.ax_trace.set_title(title_text, fontsize=10)
-            self.ax_trace.relim()
-            self.ax_trace.autoscale_view()
-        else:
-            self.trace_line.set_data([], [])
-            self.fit_line.set_data([], [])
-            self.ax_trace.set_title("Selected Cell Trace")
-            
-        self.fig.canvas.draw_idle()
 
     def get_export_data(self):
         if self.normalized_data.size == 0: return None, ""
