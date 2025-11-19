@@ -6,10 +6,15 @@ from PyQt5 import QtWidgets, QtCore
 from matplotlib.path import Path
 from scipy.stats import circmean
 
-from gui.utils import Tooltip, add_mpl_to_tab
-from gui.analysis import calculate_phases_fft
+from gui.utils import Tooltip, add_mpl_to_tab, clear_layout
 from gui.viewers import GroupScatterViewer, GroupAverageMapViewer
-
+from gui.analysis import (
+    calculate_phases_fft, 
+    preprocess_for_rhythmicity, 
+    compute_median_window_frames, 
+    RHYTHM_TREND_WINDOW_HOURS
+)
+import cosinor as csn
 from gui.theme import get_icon
 
 class GroupViewPanel(QtWidgets.QWidget):
@@ -47,7 +52,7 @@ class GroupViewPanel(QtWidgets.QWidget):
 
         norm_label = QtWidgets.QLabel("Phase Normalization Method:")
         self.norm_global_radio = QtWidgets.QRadioButton("Global Mean (per animal)")
-        self.norm_anatomical_radio = QtWidgets.QRadioButton("Anatomical Reference ROI")
+        self.norm_anatomical_radio = QtWidgets.QRadioButton("Individual Phase Reference ROI")
         self.norm_method_group = QtWidgets.QButtonGroup(self)
         self.norm_method_group.addButton(self.norm_global_radio)
         self.norm_method_group.addButton(self.norm_anatomical_radio)
@@ -115,16 +120,14 @@ class GroupViewPanel(QtWidgets.QWidget):
 
     @QtCore.pyqtSlot(bool)
     def _on_norm_method_changed(self, checked):
-        if self.norm_anatomical_radio.isChecked():
-            self.ref_roi_widget.show()
-        else:
-            self.ref_roi_widget.hide()
+        # We no longer show the master reference loader, as we rely on individual files.
+        self.ref_roi_widget.hide()
             
     def _select_reference_roi(self):
         start_dir = self.mw._get_last_dir()
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
-            "Select Anatomical Reference ROI File",
+            "Select Phase Reference ROI File",
             start_dir,
             "JSON files (*.json)",
         )
@@ -133,7 +136,7 @@ class GroupViewPanel(QtWidgets.QWidget):
         self.mw._set_last_dir(path)
         self.state.reference_roi_path = path
         self.ref_roi_path_edit.setText(path)
-        self.mw.log_message(f"Loaded anatomical reference ROI: {os.path.basename(path)}")
+        self.mw.log_message(f"Loaded phase reference ROI: {os.path.basename(path)}")
 
     def generate_group_visualizations(self):
         if not self.state.group_data_paths:
@@ -159,14 +162,11 @@ class GroupViewPanel(QtWidgets.QWidget):
                     if value_str: phase_args[key] = type_caster(value_str)
             if "minutes_per_frame" not in phase_args: raise ValueError("Minutes per Frame must be set for group analysis.")
             
-            master_ref_rois = []
-            if self.norm_anatomical_radio.isChecked():
-                if not self.state.reference_roi_path or not os.path.exists(self.state.reference_roi_path):
-                    QtWidgets.QMessageBox.warning(self, "Error", "Anatomical Reference method selected, but no valid reference ROI file has been loaded.")
-                    return
-                with open(self.state.reference_roi_path, 'r') as f:
-                    master_ref_rois = json.load(f)
-
+            # Retrieve additional filtering params
+            method = self.mw.single_panel.analysis_method_combo.currentText()
+            thresh = float(self.mw.single_panel.phase_params["rhythm_threshold"][0].text())
+            r_thresh = float(self.mw.single_panel.phase_params["r_squared_threshold"][0].text())
+            
             all_dfs = []
             
             for i, roi_file in enumerate(self.state.group_data_paths):
@@ -204,17 +204,69 @@ class GroupViewPanel(QtWidgets.QWidget):
                 trace_indices_to_keep = np.array(indices) + 1
                 filtered_traces_data = traces[:, np.concatenate(([0], trace_indices_to_keep))]
                 
-                phases, period, _ = calculate_phases_fft(filtered_traces_data, **phase_args)
+                # --- Calculate Phases and Scores ---
+                if "Cosinor" in method:
+                    # Cosinor Analysis
+                    mpf = phase_args["minutes_per_frame"]
+                    time_points_hours = filtered_traces_data[:, 0] * (mpf / 60.0)
+                    
+                    # Use FFT to get period estimate first (same as SingleAnimalPanel)
+                    _, period, _ = calculate_phases_fft(filtered_traces_data, **phase_args)
+                    
+                    phases_list = []
+                    p_values = []
+                    r_squareds = []
+                    
+                    # Detrend params
+                    trend_window_hours = phase_args.get("detrend_window_hours", RHYTHM_TREND_WINDOW_HOURS)
+                    median_window_frames = compute_median_window_frames(mpf, trend_window_hours, T=filtered_traces_data.shape[0])
+                    
+                    for col in range(1, filtered_traces_data.shape[1]):
+                        raw_trace = filtered_traces_data[:, col]
+                        detrended = preprocess_for_rhythmicity(raw_trace, method="running_median", median_window_frames=median_window_frames)
+                        res = csn.cosinor_analysis(detrended, time_points_hours, period)
+                        phases_list.append(res["acrophase"])
+                        p_values.append(res["p_value"])
+                        r_squareds.append(res["r_squared"])
+                    
+                    phases = np.array(phases_list) # In HOURS
+                    p_values = np.array(p_values)
+                    r_squareds = np.array(r_squareds)
+                    
+                    # Filter: p-value <= thresh AND R^2 >= r_thresh
+                    mask = (p_values <= thresh) & (r_squareds >= r_thresh)
+                    
+                else:
+                    # FFT Analysis
+                    phases_rad, period, scores = calculate_phases_fft(filtered_traces_data, **phase_args)
+                    mask = scores >= thresh
+                    
+                    # Convert radians to hours
+                    phases = (phases_rad / (2 * np.pi)) * period
+                    phases = phases % period # In HOURS
+                
+                # Apply mask
+                phases = phases[mask]
+                warped_rois = warped_rois[mask]
+                native_filtered_rois = native_filtered_rois[mask]
+                
+                if len(phases) == 0:
+                    self.mw.log_message("    Warning: No cells passed rhythmicity filter. Skipping.")
+                    continue
+                
+                self.mw.log_message(f"    -> Kept {len(phases)} cells (Threshold: {thresh})")
 
                 mean_h = 0.0
                 
                 if self.norm_global_radio.isChecked():
-                     ph_rad = (phases % period) * (2 * np.pi / period)
+                     # phases is in HOURS. Convert to radians for circular mean.
+                     ph_rad = (phases / period) * (2 * np.pi)
                      mean_rad = circmean(ph_rad)
                      mean_h = mean_rad * (period / (2 * np.pi))
+                     mean_h = mean_h % period
                      self.mw.log_message(f"    -> Norm: Global Mean ({mean_h:.2f}h)")
 
-                else:
+                elif self.norm_anatomical_radio.isChecked():
                     individual_roi_path = roi_file.replace("_roi_warped.csv", "_anatomical_roi.json")
                     individual_ref_poly = []
                     
@@ -234,28 +286,25 @@ class GroupViewPanel(QtWidgets.QWidget):
                         ref_indices = np.where(ref_mask)[0]
                         
                     else:
-                        self.mw.log_message("    -> Norm: Master Atlas ROI (Warped Space)")
-                        master_ref_poly = [r for r in master_ref_rois if r.get("mode") == "Phase Reference"]
-                        
-                        if not master_ref_poly:
-                            self.mw.log_message("    ERROR: No 'Phase Reference' polygon found in Master Atlas file. Cannot normalize.")
-                            continue
-                            
-                        ref_mask = np.zeros(len(warped_rois), dtype=bool)
-                        for roi in master_ref_poly:
-                            path = Path(roi['path_vertices'])
-                            ref_mask |= path.contains_points(warped_rois)
-                        ref_indices = np.where(ref_mask)[0]
+                        self.mw.log_message("    -> Warning: No 'Phase Reference' ROI found for this animal. Falling back to Global Mean.")
+                        ph_rad = (phases / period) * (2 * np.pi)
+                        mean_rad = circmean(ph_rad)
+                        mean_h = mean_rad * (period / (2 * np.pi))
+                        self.mw.log_message(f"       Global Mean: {mean_h:.2f}h")
+                        ref_indices = [] # Marker that we didn't use a specific ROI
 
-                    if len(ref_indices) == 0:
-                        self.mw.log_message("    Warning: No rhythmic cells found in reference region. Skipping.")
+                    if len(ref_indices) > 0:
+                        ref_phases = phases[ref_indices]
+                        ref_rad = (ref_phases / period) * (2 * np.pi)
+                        ref_mean_rad = circmean(ref_rad)
+                        mean_h = ref_mean_rad * (period / (2 * np.pi))
+                        self.mw.log_message(f"       Ref Mean: {mean_h:.2f}h (n={len(ref_indices)})")
+                    elif not individual_ref_poly:
+                        # Already handled global mean fallback above
+                        pass
+                    else:
+                        self.mw.log_message("    Warning: 'Phase Reference' ROI exists but contains no rhythmic cells. Skipping.")
                         continue
-
-                    ref_phases = phases[ref_indices]
-                    ref_rad = (ref_phases % period) * (2 * np.pi / period)
-                    ref_mean_rad = circmean(ref_rad)
-                    mean_h = ref_mean_rad * (period / (2 * np.pi))
-                    self.mw.log_message(f"       Ref Mean: {mean_h:.2f}h (n={len(ref_indices)})")
 
                 rel_phases = (phases - mean_h + period / 2) % period - period / 2
 
@@ -280,15 +329,36 @@ class GroupViewPanel(QtWidgets.QWidget):
             x_min, x_max = group_scatter_df['Warped_X'].min(), group_scatter_df['Warped_X'].max()
             y_min, y_max = group_scatter_df['Warped_Y'].min(), group_scatter_df['Warped_Y'].max()
             
-            grid_x_bins = np.linspace(x_min, x_max, grid_res + 1)
-            grid_y_bins = np.linspace(y_min, y_max, grid_res + 1)
+            # --- Calculate bins to ensure square pixels ---
+            width = x_max - x_min
+            height = y_max - y_min
+            
+            # Use grid_res for the longest dimension
+            if width >= height:
+                n_bins_x = grid_res
+                bin_size = width / n_bins_x
+                n_bins_y = int(round(height / bin_size))
+            else:
+                n_bins_y = grid_res
+                bin_size = height / n_bins_y
+                n_bins_x = int(round(width / bin_size))
+                
+            # Safety check
+            n_bins_x = max(1, n_bins_x)
+            n_bins_y = max(1, n_bins_y)
+            # ----------------------------------------------------
+            
+            grid_x_bins = np.linspace(x_min, x_max, n_bins_x + 1)
+            grid_y_bins = np.linspace(y_min, y_max, n_bins_y + 1)
             
             group_scatter_df['Grid_X_Index'] = pd.cut(group_scatter_df['Warped_X'], bins=grid_x_bins, labels=False, include_lowest=True).fillna(-1).astype(int)
             group_scatter_df['Grid_Y_Index'] = pd.cut(group_scatter_df['Warped_Y'], bins=grid_y_bins, labels=False, include_lowest=True).fillna(-1).astype(int)
 
             def circmean_phase(series):
                 rad = (series / (period / 2.0)) * np.pi
-                mean_rad = circmean(rad)
+                # Force circmean to return values centered at 0 (-pi to +pi) 
+                # instead of positive-only (0 to 2pi).
+                mean_rad = circmean(rad, low=-np.pi, high=np.pi)
                 return (mean_rad / np.pi) * (period / 2.0)
             
             group_binned_df = group_scatter_df[group_scatter_df['Grid_X_Index'] >= 0].groupby(['Grid_X_Index', 'Grid_Y_Index'])['Relative_Phase_Hours'].apply(circmean_phase).reset_index()
@@ -298,7 +368,8 @@ class GroupViewPanel(QtWidgets.QWidget):
             self.mw.visualization_widgets[self.mw.group_scatter_tab] = viewer_s
             
             fig_g, _ = add_mpl_to_tab(self.mw.group_avg_tab)
-            viewer_g = GroupAverageMapViewer(fig_g, fig_g.add_subplot(111), group_binned_df, group_scatter_df, grid_res, do_smooth)
+            # Pass the tuple (n_bins_x, n_bins_y) instead of the single integer grid_res
+            viewer_g = GroupAverageMapViewer(fig_g, fig_g.add_subplot(111), group_binned_df, group_scatter_df, (n_bins_x, n_bins_y), do_smooth)
             self.mw.visualization_widgets[self.mw.group_avg_tab] = viewer_g
             
             for tab in group_tabs: self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(tab), True)

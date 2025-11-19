@@ -4,6 +4,7 @@ import colorcet as cet
 from scipy.interpolate import RBFInterpolator
 from scipy.spatial import ConvexHull
 from numpy import pi, arctan2
+from scipy.stats import circmean
 
 from matplotlib.widgets import Slider, RadioButtons, Button
 from matplotlib.patches import Polygon, Rectangle
@@ -813,7 +814,9 @@ class GroupScatterViewer:
         if not self.group_df.empty:
             self.scatter = ax.scatter(
                 self.group_df['Warped_X'], self.group_df['Warped_Y'],
-                c=self.group_df['Relative_Phase_Hours'], cmap=self.cmap_cyclic, s=10, alpha=0.8,
+                c=self.group_df['Relative_Phase_Hours'], 
+                cmap=self.cmap_cyclic, 
+                s=25, edgecolor="black", linewidth=0.5, alpha=1.0
             )
             # Manual colorbar placement
             cax = fig.add_axes([0.86, 0.25, 0.02, 0.6])
@@ -846,14 +849,23 @@ class GroupScatterViewer:
             range_y = ys.max() - ys.min()
             max_range = max(range_x, range_y)
             
-            # 3. Apply Padding and Set Limits
-            half_span = (max_range * 1.05) / 2 
+            # 3. Apply Padding and Set Limits (Match InterpMapViewer padding)
+            half_span = (max_range * 1.15) / 2 
             ax.set_xlim(cx - half_span, cx + half_span)
             ax.set_ylim(cy - half_span, cy + half_span)
             
         ax.set_aspect("equal", adjustable="box")
         ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
+
+        # Tooltip setup
+        self.annot = ax.annotate("", xy=(0,0), xytext=(20,20),textcoords="offset points",
+                                 bbox=dict(boxstyle="round", fc="w", alpha=0.9),
+                                 arrowprops=dict(arrowstyle="->"))
+        self.annot.set_visible(False)
+        self.annot.set_zorder(100) # Ensure it's on top
+        
+        self.fig.canvas.mpl_connect("motion_notify_event", self.hover)
 
     def toggle_cmap(self, event):
         self.is_cyclic = not self.is_cyclic
@@ -866,11 +878,37 @@ class GroupScatterViewer:
     def update_clim(self, val):
         if hasattr(self, "scatter"): self.scatter.set_clim(-val, val); self.fig.canvas.draw_idle()
 
+    def update_annot(self, ind):
+        if len(ind["ind"]) == 0: return
+        
+        # Get data for the first point in the cluster
+        idx = ind["ind"][0]
+        pos = self.scatter.get_offsets()[idx]
+        self.annot.xy = pos
+        
+        row = self.group_df.iloc[idx]
+        
+        text = f"Animal: {row['Source_Animal']}\nPhase: {row['Relative_Phase_Hours']:.2f} h\nX: {row['Warped_X']:.1f}, Y: {row['Warped_Y']:.1f}"
+        self.annot.set_text(text)
+
+    def hover(self, event):
+        vis = self.annot.get_visible()
+        if event.inaxes == self.ax:
+            cont, ind = self.scatter.contains(event)
+            if cont:
+                self.update_annot(ind)
+                self.annot.set_visible(True)
+                self.fig.canvas.draw_idle()
+            else:
+                if vis:
+                    self.annot.set_visible(False)
+                    self.fig.canvas.draw_idle()
+
     def get_export_data(self):
         return self.group_df, "group_scatter_data.csv"
 
 class GroupAverageMapViewer:
-    def __init__(self, fig, ax, group_binned_df, group_scatter_df, grid_res, do_smooth):
+    def __init__(self, fig, ax, group_binned_df, group_scatter_df, grid_dims, do_smooth):
         self.fig = fig
         self.ax = ax
         self.group_binned_df = group_binned_df
@@ -892,13 +930,48 @@ class GroupAverageMapViewer:
             self.fig.canvas.draw_idle()
             return
 
-        binned_grid = np.full((grid_res, grid_res), np.nan)
+        # Handle dimensions (nx, ny)
+        nx, ny = grid_dims
+
+        # Note: shape is (rows, cols) -> (ny, nx)
+        binned_grid = np.full((ny, nx), np.nan)
+        
         for _, row in self.group_binned_df.iterrows():
-            if 0 <= row['Grid_Y_Index'] < grid_res and 0 <= row['Grid_X_Index'] < grid_res:
-                binned_grid[int(row['Grid_Y_Index']), int(row['Grid_X_Index'])] = row['Relative_Phase_Hours']
+            ix = int(row['Grid_X_Index'])
+            iy = int(row['Grid_Y_Index'])
+            if 0 <= iy < ny and 0 <= ix < nx:
+                binned_grid[iy, ix] = row['Relative_Phase_Hours']
 
         if do_smooth:
-            pass
+            from scipy.stats import circmean # Ensure this is imported
+            
+            # Create a copy to avoid "daisy-chaining" the smoothing (only fill based on real data)
+            original_grid = binned_grid.copy()
+            rows, cols = original_grid.shape
+            
+            for r in range(rows):
+                for c in range(cols):
+                    # Only fill empty bins
+                    if np.isnan(original_grid[r, c]):
+                        # Check 3x3 neighborhood
+                        r_min, r_max = max(0, r-1), min(rows, r+2)
+                        c_min, c_max = max(0, c-1), min(cols, c+2)
+                        
+                        window = original_grid[r_min:r_max, c_min:c_max]
+                        valid_neighbors = window[~np.isnan(window)]
+                        
+                        if valid_neighbors.size > 0:
+                            # 1. Convert valid neighbor hours to radians [-pi, pi]
+                            #    (Assumes data is centered around 0, e.g., -12 to +12)
+                            rads = (valid_neighbors / (self.period_hours / 2.0)) * np.pi
+                            
+                            # 2. Calculate circular mean forcing the range to [-pi, pi]
+                            #    This prevents -2h (Blue) from wrapping to +22h (Red)
+                            mean_rad = circmean(rads, low=-np.pi, high=np.pi)
+                            
+                            # 3. Convert back to hours
+                            mean_h = (mean_rad / np.pi) * (self.period_hours / 2.0)
+                            binned_grid[r, c] = mean_h
 
         # 1. Get Data Limits (Tight) - Needed for proper image placement (extent)
         xs = self.group_scatter_df['Warped_X']
@@ -914,7 +987,7 @@ class GroupAverageMapViewer:
         range_y = data_y_max - data_y_min
         max_range = max(range_x, range_y)
         
-        half_span = (max_range * 1.05) / 2  # 5% padding
+        half_span = (max_range * 1.15) / 2  # 15% padding
 
         # 3. Draw Image
         # 'extent' must be the TIGHT data limits, not the padded limits.
@@ -928,6 +1001,7 @@ class GroupAverageMapViewer:
         ax.set_xlim(cx - half_span, cx + half_span)
         ax.set_ylim(cy - half_span, cy + half_span)
         
+        ax.set_aspect("equal", adjustable="box")
         ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
         
@@ -1084,7 +1158,7 @@ class InterpolatedMapViewer:
         ax.set_xlim(cx - half_span, cx + half_span)
         ax.set_ylim(cy + half_span, cy - half_span) 
 
-        ax.set_aspect("equal")
+        ax.set_aspect("equal", adjustable="box")
         ax.set_xticks([])
         ax.set_yticks([])
 

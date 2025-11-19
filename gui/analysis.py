@@ -376,7 +376,7 @@ def calculate_phases_fft(traces_data,
         power_vals = np.abs(fft_vals) ** 2
 
         complex_val = fft_vals[peak_idx]
-        phases[i] = np.angle(complex_val)
+        phases[i] = -np.angle(complex_val)
 
         signal_power = power_vals[signal_band].sum()
         noise_power = power_vals[noise_band].mean() if len(noise_band) > 0 else 1e-9

@@ -658,7 +658,7 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             else:
                 rhythm_mask = filter_scores >= thresh
                 self.mw.log_message(f"Applying FFT filter: SNR >= {thresh}")
-                phases_hours = (phases / (2 * np.pi)) * period
+                phases_hours = ((phases / (2 * np.pi)) * period) % period
 
             if self.strict_cycle_check.isChecked():
                 rhythm_mask = strict_cycle_mask(
