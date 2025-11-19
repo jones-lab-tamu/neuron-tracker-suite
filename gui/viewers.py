@@ -900,25 +900,34 @@ class GroupAverageMapViewer:
         if do_smooth:
             pass
 
+        # 1. Get Data Limits (Tight) - Needed for proper image placement (extent)
         xs = self.group_scatter_df['Warped_X']
         ys = self.group_scatter_df['Warped_Y']
+        data_x_min, data_x_max = xs.min(), xs.max()
+        data_y_min, data_y_max = ys.min(), ys.max()
+
+        # 2. Calculate View Limits (Padded Square) - Needed for "Zoom" consistency
+        cx = (data_x_min + data_x_max) / 2
+        cy = (data_y_min + data_y_max) / 2
         
-        cx = (xs.min() + xs.max()) / 2
-        cy = (ys.min() + ys.max()) / 2
-        
-        range_x = xs.max() - xs.min()
-        range_y = ys.max() - ys.min()
+        range_x = data_x_max - data_x_min
+        range_y = data_y_max - data_y_min
         max_range = max(range_x, range_y)
         
-        # 5% padding
-        half_span = (max_range * 1.05) / 2 
-        
-        x_min = cx - half_span
-        x_max = cx + half_span
-        y_min = cy - half_span
-        y_max = cy + half_span
+        half_span = (max_range * 1.05) / 2  # 5% padding
 
-        self.im = ax.imshow(binned_grid, origin="lower", extent=[x_min, x_max, y_min, y_max], cmap=self.cmap_cyclic)
+        # 3. Draw Image
+        # 'extent' must be the TIGHT data limits, not the padded limits.
+        # This ensures the pixels are drawn at the correct size and location.
+        self.im = ax.imshow(binned_grid, origin="lower", 
+                            extent=[data_x_min, data_x_max, data_y_min, data_y_max], 
+                            cmap=self.cmap_cyclic)
+
+        # 4. Set View limits to the padded square box
+        # This "zooms out" the camera to match the Scatter Plot view.
+        ax.set_xlim(cx - half_span, cx + half_span)
+        ax.set_ylim(cy - half_span, cy + half_span)
+        
         ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
         
