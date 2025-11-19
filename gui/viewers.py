@@ -782,12 +782,12 @@ class GroupScatterViewer:
             # Manual colorbar placement
             cax = fig.add_axes([0.86, 0.25, 0.02, 0.6])
             self.cbar = fig.colorbar(self.scatter, cax=cax)
-            self.cbar.set_label("Mean Relative Peak Time (hours)")
+            self.cbar.set_label("Relative Peak Time (Circadian Hours, CT)")
             
             # Position controls
             ax_slider = fig.add_axes([0.25, 0.10, 0.60, 0.03])
             max_range = self.period_hours / 2.0
-            self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- hrs)", valmin=1.0, valmax=max_range, valinit=max_range)
+            self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- CT hrs)", valmin=1.0, valmax=max_range, valinit=max_range)
             self.range_slider.on_changed(self.update_clim)
             
             # Colormap Toggle Button
@@ -989,11 +989,11 @@ class GroupAverageMapViewer:
         # Controls (Colorbar, Sliders)
         cax = fig.add_axes([0.86, 0.25, 0.02, 0.6])
         self.cbar = fig.colorbar(self.im, cax=cax)
-        self.cbar.set_label("Mean Relative Peak Time (hours)")
+        self.cbar.set_label("Relative Peak Time (Circadian Hours, CT)")
         
         ax_slider = fig.add_axes([0.25, 0.10, 0.60, 0.03])
         max_range = self.period_hours / 2.0
-        self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- hrs)", valmin=1.0, valmax=max_range, valinit=max_range)
+        self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- CT hrs)", valmin=1.0, valmax=max_range, valinit=max_range)
         self.range_slider.on_changed(self.update_clim)
 
         ax_button = fig.add_axes([0.25, 0.05, 0.15, 0.04])

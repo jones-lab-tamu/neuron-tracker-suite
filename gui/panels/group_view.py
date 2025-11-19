@@ -276,6 +276,12 @@ class GroupViewPanel(QtWidgets.QWidget):
                 
                 self.mw.log_message(f"    -> Kept {len(phases)} cells")
 
+                # --- CONVERT TO CIRCADIAN TIME (CT) ---
+                # Normalize physical period to 24.0 CT hours
+                phases = phases * (24.0 / period)
+                period = 24.0 
+                self.mw.log_message(f"    -> Converted to Circadian Time (CT). Period set to 24.0h.")
+
                 # --- NORMALIZATION ---
                 mean_h = 0.0
                 
@@ -337,7 +343,12 @@ class GroupViewPanel(QtWidgets.QWidget):
                 return
             
             group_scatter_df = pd.concat(all_dfs, ignore_index=True)
-            period = group_scatter_df['Period_Hours'].iloc[0]
+            
+            if group_scatter_df.empty:
+                self.mw.log_message("No rhythmic cells found in any group file.")
+                return
+
+            period = 24.0 # Explicitly set to CT period
             grid_res = int(self.group_grid_res_edit.text())
             do_smooth = self.group_smooth_check.isChecked()
             
