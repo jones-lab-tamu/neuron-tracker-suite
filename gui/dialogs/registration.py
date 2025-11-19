@@ -124,12 +124,30 @@ class RegistrationWindow(QtWidgets.QDialog):
         self.ax_target.clear()
         self.ax_atlas.set_title("Atlas SCN")
         self.ax_target.set_title("Target SCN")
+
+        # --- Helper function to determine style based on mode ---
+        def get_style(roi_mode):
+            if roi_mode == "Phase Reference":
+                return {"color": "cyan", "linestyle": "--", "linewidth": 1}
+            elif roi_mode == "Exclude":
+                return {"color": "red", "linestyle": "-", "linewidth": 1}
+            else:
+                # Default / Include
+                return {"color": "black", "linestyle": "-", "linewidth": 2}
+        # -------------------------------------------------------
+
+        # Draw Atlas ROIs
         for roi in self.atlas_rois:
             xs, ys = zip(*roi["path_vertices"])
-            self.ax_atlas.plot(xs, ys, color="black")
+            style = get_style(roi.get("mode", "Include"))
+            self.ax_atlas.plot(xs, ys, **style)
+
+        # Draw Target ROIs
         for roi in getattr(self, "target_rois", []):
             xs, ys = zip(*roi["path_vertices"])
-            self.ax_target.plot(xs, ys, color="black")
+            style = get_style(roi.get("mode", "Include"))
+            self.ax_target.plot(xs, ys, **style)
+                        
         for i, (x, y) in enumerate(self.source_landmarks):
             self.ax_atlas.text(x, y, str(i + 1), color="red", ha="center", va="center", weight="bold")
         for i, (x, y) in enumerate(self.dest_landmarks):
@@ -137,7 +155,7 @@ class RegistrationWindow(QtWidgets.QDialog):
         if preview_shapes:
             for shape in preview_shapes:
                 xs, ys = shape[:, 0], shape[:, 1]
-                self.ax_atlas.plot(xs, ys, color="cyan", linestyle="--")
+                self.ax_atlas.plot(xs, ys, color="lime", linestyle="--", linewidth=1)
         if warp_vectors:
             ox, oy, dx, dy = warp_vectors
             self.ax_target.quiver(ox, oy, dx, dy, color="cyan", angles="xy", scale_units="xy", scale=1)
