@@ -346,13 +346,45 @@ class GroupViewPanel(QtWidgets.QWidget):
             # Safety check
             n_bins_x = max(1, n_bins_x)
             n_bins_y = max(1, n_bins_y)
-            # ----------------------------------------------------
             
-            grid_x_bins = np.linspace(x_min, x_max, n_bins_x + 1)
-            grid_y_bins = np.linspace(y_min, y_max, n_bins_y + 1)
+                       
+            # 1. Calculate the Center and Max Range (Same math as Viewers)
+            cx = (x_min + x_max) / 2
+            cy = (y_min + y_max) / 2
+            max_range = max(width, height)
+            half_span = (max_range * 1.15) / 2  # 15% padding
             
-            group_scatter_df['Grid_X_Index'] = pd.cut(group_scatter_df['Warped_X'], bins=grid_x_bins, labels=False, include_lowest=True).fillna(-1).astype(int)
-            group_scatter_df['Grid_Y_Index'] = pd.cut(group_scatter_df['Warped_Y'], bins=grid_y_bins, labels=False, include_lowest=True).fillna(-1).astype(int)
+            # 2. Define View Limits
+            view_x_min = cx - half_span
+            view_x_max = cx + half_span
+            view_y_min = cy - half_span
+            view_y_max = cy + half_span
+            
+            # 3. Generate Grid Lines covering the full View
+            # We use arange to extend outwards from the data min/max, aligning with bin_size
+            # Align to x_min/y_min so the grid matches the data bins exactly
+            start_x = x_min - np.ceil((x_min - view_x_min) / bin_size) * bin_size
+            end_x = x_max + np.ceil((view_x_max - x_max) / bin_size) * bin_size
+            
+            start_y = y_min - np.ceil((y_min - view_y_min) / bin_size) * bin_size
+            end_y = y_max + np.ceil((view_y_max - y_max) / bin_size) * bin_size
+            
+            grid_x_bins = np.arange(start_x, end_x + bin_size/1000, bin_size)
+            grid_y_bins = np.arange(start_y, end_y + bin_size/1000, bin_size)
+            
+            # NOTE: For the BINNING logic (pd.cut), we still want to rely on the original data limits
+            # or essentially use the bin_size. 
+            # However, since pd.cut bins data, and data is within x_min/x_max, 
+            # we must ensure the 'bins' passed to pd.cut align with these visual lines.
+            # The safest way is to generate bins specifically for the data range for pd.cut,
+            # but pass the extended bins to the viewer.
+            
+            # Bins for Calculation (Data Only)
+            calc_x_bins = np.linspace(x_min, x_max, n_bins_x + 1)
+            calc_y_bins = np.linspace(y_min, y_max, n_bins_y + 1)
+            
+            group_scatter_df['Grid_X_Index'] = pd.cut(group_scatter_df['Warped_X'], bins=calc_x_bins, labels=False, include_lowest=True).fillna(-1).astype(int)
+            group_scatter_df['Grid_Y_Index'] = pd.cut(group_scatter_df['Warped_Y'], bins=calc_y_bins, labels=False, include_lowest=True).fillna(-1).astype(int)
 
             def circmean_phase(series):
                 rad = (series / (period / 2.0)) * np.pi
@@ -364,7 +396,8 @@ class GroupViewPanel(QtWidgets.QWidget):
             group_binned_df = group_scatter_df[group_scatter_df['Grid_X_Index'] >= 0].groupby(['Grid_X_Index', 'Grid_Y_Index'])['Relative_Phase_Hours'].apply(circmean_phase).reset_index()
             
             fig_s, _ = add_mpl_to_tab(self.mw.group_scatter_tab)
-            viewer_s = GroupScatterViewer(fig_s, fig_s.add_subplot(111), group_scatter_df)
+            # Pass the EXTENDED grid bins to the viewer for visualization
+            viewer_s = GroupScatterViewer(fig_s, fig_s.add_subplot(111), group_scatter_df, grid_bins=(grid_x_bins, grid_y_bins))
             self.mw.visualization_widgets[self.mw.group_scatter_tab] = viewer_s
             
             fig_g, _ = add_mpl_to_tab(self.mw.group_avg_tab)

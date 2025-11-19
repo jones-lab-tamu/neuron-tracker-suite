@@ -796,7 +796,7 @@ class PhaseMapViewer:
         return self.rhythmic_df, "phase_map_data.csv"
         
 class GroupScatterViewer:
-    def __init__(self, fig, ax, group_df):
+    def __init__(self, fig, ax, group_df, grid_bins=None):
         self.fig = fig
         self.ax = ax
         self.group_df = group_df
@@ -812,11 +812,24 @@ class GroupScatterViewer:
 
         ax.set_title("Group Phase Distribution")
         if not self.group_df.empty:
+            # 1. Draw Grid Lines (Behind the scatter)
+            if grid_bins is not None:
+                xbins, ybins = grid_bins
+                # Use a very light style: faint gray, dotted, thin
+                grid_style = {'color': '#999999', 'linestyle': ':', 'linewidth': 0.5, 'alpha': 0.4, 'zorder': 0}
+                
+                for x in xbins:
+                    ax.axvline(x, **grid_style)
+                for y in ybins:
+                    ax.axhline(y, **grid_style)
+
+            # 2. Draw Scatter
             self.scatter = ax.scatter(
                 self.group_df['Warped_X'], self.group_df['Warped_Y'],
                 c=self.group_df['Relative_Phase_Hours'], 
                 cmap=self.cmap_cyclic, 
-                s=25, edgecolor="black", linewidth=0.5, alpha=1.0
+                s=25, edgecolor="black", linewidth=0.5, alpha=1.0,
+                zorder=10 # Ensure dots are on top of grid
             )
             # Manual colorbar placement
             cax = fig.add_axes([0.86, 0.25, 0.02, 0.6])
@@ -840,16 +853,14 @@ class GroupScatterViewer:
             xs = self.group_df['Warped_X']
             ys = self.group_df['Warped_Y']
             
-            # 1. Calculate Center
             cx = (xs.min() + xs.max()) / 2
             cy = (ys.min() + ys.max()) / 2
             
-            # 2. Find Max Dimension
             range_x = xs.max() - xs.min()
             range_y = ys.max() - ys.min()
             max_range = max(range_x, range_y)
             
-            # 3. Apply Padding and Set Limits (Match InterpMapViewer padding)
+            # Apply Padding and Set Limits (Match InterpMapViewer/AvgMap padding)
             half_span = (max_range * 1.15) / 2 
             ax.set_xlim(cx - half_span, cx + half_span)
             ax.set_ylim(cy - half_span, cy + half_span)
