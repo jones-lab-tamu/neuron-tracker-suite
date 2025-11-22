@@ -19,3 +19,7 @@ class AnalysisState:
         # In-memory data
         self.unfiltered_data = {}
         self.loaded_data = {}
+
+        # Group Comparison State 
+        self.reference_grid_def = None  # Stores (grid_x_bins, grid_y_bins, nx, ny)
+        self.reference_raw_data = None  # Stores dict {(y,x): {'phases':[], 'animals':[]}}

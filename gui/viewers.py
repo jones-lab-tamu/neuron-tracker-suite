@@ -6,7 +6,7 @@ from scipy.spatial import ConvexHull
 from numpy import pi, arctan2
 from scipy.stats import circmean
 
-from matplotlib.widgets import Slider, RadioButtons, Button
+from matplotlib.widgets import Slider, RadioButtons, Button, CheckButtons
 from matplotlib.patches import Polygon, Rectangle
 from matplotlib.path import Path
 
@@ -532,6 +532,169 @@ class ContrastViewer:
         if self.on_change_callback:
             self.on_change_callback(vmin, vmax)
 
+class GroupDifferenceViewer:
+    def __init__(self, fig, ax, diff_map, sig_mask, p_values, grid_def):
+        self.fig = fig
+        self.ax = ax
+        self.diff_map = diff_map
+        self.p_values = p_values
+        
+        # Masks
+        self.cluster_mask = sig_mask
+        self.uncorrected_mask = p_values < 0.05
+        self.current_mask = self.cluster_mask
+        self.is_uncorrected = False
+        
+        # Unpack Grid Definition
+        _, _, grid_x, grid_y, nx, ny = grid_def
+        extent = [grid_x[0], grid_x[-1], grid_y[0], grid_y[-1]]
+        
+        self.fig.subplots_adjust(left=0.1, bottom=0.25, right=0.85, top=0.9)
+        ax.set_title("Significant Phase Difference (Exp - Control)")
+        
+        # 1. Layer 1: Ghost (Context)
+        self.im_ghost = ax.imshow(
+            diff_map, extent=extent,
+            cmap='coolwarm', alpha=0.15, vmin=-6, vmax=6
+        )
+        
+        # 2. Layer 2: Significant (Active Data)
+        masked_diff = self._apply_mask(diff_map, self.current_mask)
+        self.im_sig = ax.imshow(
+            masked_diff, extent=extent,
+            cmap='coolwarm', alpha=1.0, vmin=-6, vmax=6
+        )
+        
+        # Draw Cluster Contours ---
+        # We contour the boolean mask. Levels at 0.5 separates False (0) from True (1).
+        # Extent aligns the contour with the image pixels.
+        
+        if np.any(self.cluster_mask):
+            self.contour = ax.contour(
+                self.cluster_mask, 
+                levels=[0.5], 
+                colors='black', 
+                linewidths=2,
+                extent=extent
+            )
+        
+        # 3. Camera Zoom (Forceful Padding)
+        x_min, x_max, y_min, y_max = extent
+        width = x_max - x_min
+        height = y_max - y_min
+        
+        cx = (x_min + x_max) / 2
+        cy = (y_min + y_max) / 2
+        
+        # Pad by 15% relative to the grid size
+        margin_x = width * 0.15
+        margin_y = height * 0.15
+        
+        ax.set_xlim(x_min - margin_x, x_max + margin_x)
+        ax.set_ylim(y_min - margin_y, y_max + margin_y)
+        
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        
+        # 4. Controls
+        cax = fig.add_axes([0.86, 0.25, 0.02, 0.6])
+        self.cbar = fig.colorbar(self.im_sig, cax=cax)
+        self.cbar.set_label("Phase Difference (Hours)")
+        
+        ax_slider = fig.add_axes([0.25, 0.10, 0.60, 0.03])
+        self.range_slider = Slider(ax=ax_slider, label="Diff Range (+/- h)", valmin=1.0, valmax=12.0, valinit=6.0)
+        self.range_slider.on_changed(self.update_clim)
+        
+        # 5. Toggle Checkbox
+        ax_check = fig.add_axes([0.05, 0.05, 0.25, 0.05], frame_on=False)
+        self.chk_uncorrected = CheckButtons(ax_check, ["Show Uncorrected (p<0.05)"], [False])
+        self.chk_uncorrected.on_clicked(self.toggle_mask)
+        
+        # 6. Tooltip
+        self.annot = ax.annotate("", xy=(0,0), xytext=(20,20), textcoords="offset points",
+                                 bbox=dict(boxstyle="round", fc="w", alpha=0.9),
+                                 arrowprops=dict(arrowstyle="->"))
+        self.annot.set_visible(False)
+        self.fig.canvas.mpl_connect("motion_notify_event", self.hover)
+
+    def _apply_mask(self, data, mask):
+        masked = data.copy()
+        masked[~mask] = np.nan
+        return masked
+
+    def toggle_mask(self, label):
+        self.is_uncorrected = not self.is_uncorrected
+        self.current_mask = self.uncorrected_mask if self.is_uncorrected else self.cluster_mask
+        
+        title = "Phase Difference (Uncorrected p<0.05)" if self.is_uncorrected else "Significant Phase Difference (Cluster-Corrected)"
+        self.ax.set_title(title)
+        
+        new_data = self._apply_mask(self.diff_map, self.current_mask)
+        self.im_sig.set_data(new_data)
+        
+        # Update Contours
+        # Remove old contours
+        if hasattr(self, 'contour'):
+            for c in self.contour.collections:
+                c.remove()
+                
+        # Draw new ones if mask has True values
+        if np.any(self.current_mask):
+            self.contour = self.ax.contour(
+                self.current_mask, 
+                levels=[0.5], 
+                colors='black', 
+                linewidths=1.5,
+                extent=self.im_sig.get_extent()
+            )
+        # -----------------------------
+        
+        self.fig.canvas.draw_idle()
+
+    def update_clim(self, val):
+        self.im_ghost.set_clim(-val, val)
+        self.im_sig.set_clim(-val, val)
+        self.fig.canvas.draw_idle()
+        
+    def hover(self, event):
+        if event.inaxes != self.ax:
+            if self.annot.get_visible():
+                self.annot.set_visible(False)
+                self.fig.canvas.draw_idle()
+            return
+
+        extent = self.im_sig.get_extent()
+        arr = self.diff_map
+        ny, nx = arr.shape
+        xmin, xmax, ymin, ymax = extent
+        dx = (xmax - xmin) / nx
+        dy = (ymax - ymin) / ny
+        
+        c = int((event.xdata - xmin) / dx)
+        r = int((event.ydata - ymin) / dy)
+        
+        if 0 <= r < ny and 0 <= c < nx:
+            val = arr[r, c]
+            is_sig = self.current_mask[r, c]
+            p_val = self.p_values[r, c]
+            
+            if np.isnan(val):
+                self.annot.set_visible(False)
+                self.fig.canvas.draw_idle()
+                return
+            
+            sig_str = "**SIGNIFICANT**" if is_sig else "(Not Significant)"
+            text = f"Diff: {val:+.2f} h\np={p_val:.4f}\n{sig_str}"
+            
+            self.annot.xy = (event.xdata, event.ydata)
+            self.annot.set_text(text)
+            self.annot.set_visible(True)
+            self.fig.canvas.draw_idle()
+        else:
+            if self.annot.get_visible():
+                self.annot.set_visible(False)
+                self.fig.canvas.draw_idle()
 
 class TrajectoryInspector:
     def __init__(self, fig, ax, trajectories, movie_stack):
