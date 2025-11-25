@@ -9,6 +9,7 @@ from matplotlib.backends.backend_qt5agg import (
 )
 from matplotlib.patches import Polygon
 from matplotlib.path import Path
+from matplotlib.lines import Line2D
 
 from gui.theme import get_icon
 
@@ -95,14 +96,20 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         self.ref_btn = QtWidgets.QRadioButton("Phase Ref (Blue)")
         self.ref_btn.setStyleSheet("color: blue; font-weight: bold;")
         
+        # Phase Axis Button
+        self.axis_btn = QtWidgets.QRadioButton("Phase Axis (Arrow)")
+        self.axis_btn.setStyleSheet("color: magenta; font-weight: bold;")
+        
         self.include_btn.setChecked(True)
         self.include_btn.toggled.connect(self.update_mode)
         self.exclude_btn.toggled.connect(self.update_mode)
         self.ref_btn.toggled.connect(self.update_mode)
+        self.axis_btn.toggled.connect(self.update_mode)
         
         mode_layout.addWidget(self.include_btn)
         mode_layout.addWidget(self.exclude_btn)
         mode_layout.addWidget(self.ref_btn)
+        mode_layout.addWidget(self.axis_btn)
         ctrl_layout.addWidget(mode_box)
 
         # Action Buttons
@@ -138,22 +145,20 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         self.redraw_finished_rois()
 
     def redraw_finished_rois(self):
-        # 1. Clear Plot Artists
         for artist in self.finished_artists:
             artist.remove()
         self.finished_artists = []
         
-        # 2. Clear List Widget (Block signals to prevent recursion/crash)
         self.roi_list_widget.blockSignals(True)
         self.roi_list_widget.clear()
 
         style_map = {
             "Include": {"color": "lime", "linestyle": "-"},
             "Exclude": {"color": "red", "linestyle": "-"},
-            "Phase Reference": {"color": "cyan", "linestyle": "--"}
+            "Phase Reference": {"color": "cyan", "linestyle": "--"},
+            "Phase Axis": {"color": "magenta", "linestyle": "-", "marker": ">"} # Arrow marker
         }
 
-        # 3. Rebuild Everything
         for i, roi in enumerate(self.rois):
             mode = roi.get("mode", "Include")
             verts = roi.get("path_vertices", [])
@@ -162,20 +167,36 @@ class ROIDrawerDialog(QtWidgets.QDialog):
             
             style = style_map.get(mode, style_map["Include"])
             
-            # Draw on Plot
-            poly = Polygon(
-                verts, 
-                closed=True, 
-                fill=False, 
-                edgecolor=style["color"], 
-                linestyle=style["linestyle"], 
-                linewidth=2,
-                picker=True 
-            )
-            self.ax.add_patch(poly)
-            self.finished_artists.append(poly)
+            # Distinguish Lines from Polygons
+            if mode == "Phase Axis":
+                # Draw Open Line
+                xs, ys = zip(*verts)
+                # Simple implementation: Line with markers
+                line = Line2D(
+                    xs, ys, 
+                    color=style["color"], 
+                    linestyle=style["linestyle"], 
+                    linewidth=2,
+                    marker=style.get("marker"),
+                    markersize=6,
+                    picker=True
+                )
+                self.ax.add_artist(line)
+                self.finished_artists.append(line)
+            else:
+                # Draw Closed Polygon
+                poly = Polygon(
+                    verts, 
+                    closed=True, 
+                    fill=False, 
+                    edgecolor=style["color"], 
+                    linestyle=style["linestyle"], 
+                    linewidth=2,
+                    picker=True 
+                )
+                self.ax.add_patch(poly)
+                self.finished_artists.append(poly)
             
-            # Add to List
             item = QtWidgets.QListWidgetItem(f"{i+1}. {mode}")
             self.roi_list_widget.addItem(item)
         
@@ -190,12 +211,11 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         style_map = {
             "Include": {"color": "lime", "linestyle": "-"},
             "Exclude": {"color": "red", "linestyle": "-"},
-            "Phase Reference": {"color": "cyan", "linestyle": "--"}
+            "Phase Reference": {"color": "cyan", "linestyle": "--"},
+            "Phase Axis": {"color": "magenta", "linestyle": "-", "marker": ">"}
         }
         
-        # Iterate existing artists and update styles instead of calling redraw()
         for i, artist in enumerate(self.finished_artists):
-            # Safety check: prevent index error if lists desync slightly
             if i >= len(self.rois): 
                 break
                 
@@ -203,16 +223,29 @@ class ROIDrawerDialog(QtWidgets.QDialog):
             mode = roi.get("mode", "Include")
             base_style = style_map.get(mode, style_map["Include"])
             
+            # Check if artist is a Line2D (Axis) or Polygon (ROI)
+            is_line = isinstance(artist, Line2D)
+            
             if i == idx:
                 # Highlight style
-                artist.set_edgecolor("yellow")
-                artist.set_linewidth(3.5)
+                if is_line:
+                    artist.set_color("yellow")
+                    artist.set_linewidth(3.5)
+                else:
+                    artist.set_edgecolor("yellow")
+                    artist.set_linewidth(3.5)
+                    
                 artist.set_linestyle("-")
                 artist.set_zorder(10)
             else:
                 # Normal style
-                artist.set_edgecolor(base_style["color"])
-                artist.set_linewidth(2)
+                if is_line:
+                    artist.set_color(base_style["color"])
+                    artist.set_linewidth(2)
+                else:
+                    artist.set_edgecolor(base_style["color"])
+                    artist.set_linewidth(2)
+                    
                 artist.set_linestyle(base_style["linestyle"])
                 artist.set_zorder(1)
                 
@@ -237,8 +270,10 @@ class ROIDrawerDialog(QtWidgets.QDialog):
             self.mode = "Include"
         elif self.exclude_btn.isChecked():
             self.mode = "Exclude"
-        else:
+        elif self.ref_btn.isChecked():
             self.mode = "Phase Reference"
+        else:
+            self.mode = "Phase Axis"
         self.update_plot()
 
     def update_plot(self):
@@ -277,8 +312,14 @@ class ROIDrawerDialog(QtWidgets.QDialog):
                 self.update_plot()
 
     def finish_polygon(self):
-        if len(self.current_vertices) > 2:
-            self.current_vertices.append(self.current_vertices[0]) # Close loop
+        # Logic: If it's a Polygon, we need > 2 points. If it's an Axis (Line), 2 points is enough.
+        min_points = 2 if self.mode == "Phase Axis" else 3
+        
+        if len(self.current_vertices) >= min_points:
+            
+            # Only close the loop if it is NOT a Phase Axis
+            if self.mode != "Phase Axis":
+                self.current_vertices.append(self.current_vertices[0]) # Close loop
             
             self.rois.append({
                 "path_vertices": list(self.current_vertices),
@@ -297,49 +338,59 @@ class ROIDrawerDialog(QtWidgets.QDialog):
     def confirm_rois(self):
         # Separate the ROIs by their purpose
         anatomical_rois = [r for r in self.rois if r["mode"] in ("Include", "Exclude")]
-        phase_ref_rois = [r for r in self.rois if r["mode"] == "Phase Reference"]
+        # Include Phase Axis here so it is passed back to the saver
+        phase_ref_rois = [r for r in self.rois if r["mode"] in ("Phase Reference", "Phase Axis")]
 
-        # Save ALL ROIs
+        # Save ALL ROIs (Standard Mode only)
         all_rois_to_save = anatomical_rois + phase_ref_rois
         
         if all_rois_to_save and self.output_basename:
             filepath = f"{self.output_basename}_anatomical_roi.json"
             try:
-                serializable = [
-                    {"path_vertices": roi["path_vertices"], "mode": roi["mode"]}
-                    for roi in all_rois_to_save
-                ]
+                serializable = []
+                for r in all_rois_to_save:
+                    # Handle Line2D vs Polygon data structures if necessary
+                    # But self.rois usually stores raw dicts, so this is fine.
+                    serializable.append({
+                        "path_vertices": r["path_vertices"], 
+                        "mode": r["mode"]
+                    })
+                    
                 with open(filepath, "w") as f:
                     json.dump(serializable, f, indent=4)
             except Exception as e:
                 QtWidgets.QMessageBox.warning(self, "Save Error", f"Error saving anatomical ROI file:\n{e}")
 
-        # Calculate Filtering
-        if not anatomical_rois:
-            if self.callback:
-                self.callback(None, None, phase_ref_rois)
-        else:
-            final_mask = np.zeros(len(self.roi_data), dtype=bool)
-            include_paths = [Path(r["path_vertices"]) for r in anatomical_rois if r["mode"] == "Include"]
-            if include_paths:
-                for path in include_paths:
-                    final_mask |= path.contains_points(self.roi_data)
-            else:
-                final_mask[:] = True 
+        # Calculate Filtering (Only if we have cell data)
+        filtered_indices = None
+        
+        # Check if roi_data exists
+        if self.roi_data is not None:
+            if anatomical_rois:
+                final_mask = np.zeros(len(self.roi_data), dtype=bool)
+                include_paths = [Path(r["path_vertices"]) for r in anatomical_rois if r["mode"] == "Include"]
+                
+                if include_paths:
+                    for path in include_paths:
+                        final_mask |= path.contains_points(self.roi_data)
+                else:
+                    # If only Excludes exist, start with everything included
+                    final_mask[:] = True 
 
-            for roi in anatomical_rois:
-                if roi["mode"] == "Exclude":
-                    final_mask &= ~Path(roi["path_vertices"]).contains_points(self.roi_data)
+                for roi in anatomical_rois:
+                    if roi["mode"] == "Exclude":
+                        final_mask &= ~Path(roi["path_vertices"]).contains_points(self.roi_data)
 
-            filtered_indices = np.where(final_mask)[0]
+                filtered_indices = np.where(final_mask)[0]
 
-            if self.output_basename:
-                try:
-                    np.savetxt(f"{self.output_basename}_roi_filtered.csv", self.roi_data[filtered_indices], delimiter=",")
-                except Exception as e:
-                    QtWidgets.QMessageBox.warning(self, "Save Error", f"Error saving filtered ROI CSV:\n{e}")
+                if self.output_basename:
+                    try:
+                        np.savetxt(f"{self.output_basename}_roi_filtered.csv", self.roi_data[filtered_indices], delimiter=",")
+                    except Exception as e:
+                        QtWidgets.QMessageBox.warning(self, "Save Error", f"Error saving filtered ROI CSV:\n{e}")
 
-            if self.callback:
-                self.callback(filtered_indices, anatomical_rois, phase_ref_rois)
+        # Return results via callback
+        if self.callback:
+            self.callback(filtered_indices, anatomical_rois, phase_ref_rois)
 
         self.accept()

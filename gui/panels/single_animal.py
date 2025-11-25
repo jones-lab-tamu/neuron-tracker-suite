@@ -409,10 +409,15 @@ class SingleAnimalPanel(QtWidgets.QWidget):
 
     def apply_roi_filter(self, indices, rois, phase_ref_rois):
         self.filtered_indices = indices
+        
         if rois:
             for r in rois:
+                # Only create Path objects for real Polygons
+                if r.get("mode") == "Phase Axis":
+                    continue # Skip path generation for axes
                 if "path_vertices" in r:
                     r["path"] = Path(r["path_vertices"])
+                    
         if phase_ref_rois:
             for r in phase_ref_rois:
                 if "path_vertices" in r:

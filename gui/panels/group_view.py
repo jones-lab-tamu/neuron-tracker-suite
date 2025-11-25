@@ -6,8 +6,8 @@ from PyQt5 import QtWidgets, QtCore
 from matplotlib.path import Path
 from scipy.stats import circmean
 
-from gui.utils import Tooltip, add_mpl_to_tab, clear_layout
-from gui.viewers import GroupScatterViewer, GroupAverageMapViewer, GroupDifferenceViewer
+from gui.utils import Tooltip, add_mpl_to_tab, clear_layout, project_points_to_polyline
+from gui.viewers import GroupScatterViewer, GroupAverageMapViewer, GroupDifferenceViewer, PhaseGradientViewer
 from gui.analysis import (
     calculate_phases_fft, 
     preprocess_for_rhythmicity, 
@@ -80,6 +80,21 @@ class GroupViewPanel(QtWidgets.QWidget):
         param_layout.addRow(self.ref_roi_widget)
         self.ref_roi_widget.hide()
 
+        # Atlas Template Loader (for Phase Axis)
+        atlas_box = QtWidgets.QWidget()
+        atlas_layout = QtWidgets.QHBoxLayout(atlas_box)
+        atlas_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.btn_load_atlas = QtWidgets.QPushButton(get_icon('fa5s.map'), "Load Atlas Template...")
+        Tooltip.install(self.btn_load_atlas, "Load the Master Atlas ROI file containing the 'Phase Axis' arrow. This enables the Gradient Analysis (Phase vs Anatomical Position).")
+        self.atlas_path_label = QtWidgets.QLineEdit()
+        self.atlas_path_label.setPlaceholderText("No Atlas Loaded (Gradient Analysis Disabled)")
+        self.atlas_path_label.setReadOnly(True)
+        
+        atlas_layout.addWidget(self.btn_load_atlas)
+        atlas_layout.addWidget(self.atlas_path_label)
+        param_layout.addRow("Atlas Template:", atlas_box)
+
         b.addWidget(param_box)        
         
         # Comparison Controls (Added as sibling to param_box)
@@ -118,6 +133,27 @@ class GroupViewPanel(QtWidgets.QWidget):
             self.btn_set_reference.setEnabled(False) 
         else:
             self.mw.log_message("Error: No valid data. Run analysis first.")
+
+    def load_atlas_template(self):
+            start_dir = self.mw._get_last_dir()
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Select Master Atlas ROI", start_dir, "JSON files (*.json)"
+            )
+            if not path:
+                return
+            self.mw._set_last_dir(path)
+            self.state.atlas_roi_path = path
+            self.atlas_path_label.setText(os.path.basename(path))
+            
+            # Quick validation
+            with open(path, 'r') as f:
+                data = json.load(f)
+            
+            has_axis = any(r.get('mode') == 'Phase Axis' for r in data)
+            if has_axis:
+                self.mw.log_message("Atlas loaded. 'Phase Axis' found -> Gradient Analysis enabled.")
+            else:
+                self.mw.log_message("Atlas loaded. Warning: No 'Phase Axis' found. Gradient Analysis will be skipped.")
 
     def run_comparison_analysis(self):
         if self.state.reference_raw_data is None or not hasattr(self, 'current_raw_data'):
@@ -197,7 +233,39 @@ class GroupViewPanel(QtWidgets.QWidget):
         self.btn_select_ref_roi.clicked.connect(self._select_reference_roi)
         self.btn_set_reference.clicked.connect(self.set_reference_data)
         self.btn_compare.clicked.connect(self.run_comparison_analysis)
+        self.btn_load_atlas.clicked.connect(self.load_atlas_template)
+        try: self.mw.btn_export_data.clicked.disconnect() 
+        except: pass
+        self.mw.btn_export_data.clicked.connect(self.export_current_data)
+            
+    def export_current_data(self):
+        """
+        Exports data from the currently visible tab/viewer.
+        """
+        current_tab = self.mw.vis_tabs.currentWidget()
+        viewer = self.mw.visualization_widgets.get(current_tab)
         
+        if viewer and hasattr(viewer, 'get_export_data'):
+            try:
+                df, filename = viewer.get_export_data()
+                if df is None or df.empty:
+                    self.mw.log_message("No data available to export.")
+                    return
+                
+                start_dir = self.mw._get_last_dir()
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self, "Export Data", os.path.join(start_dir, filename), "CSV files (*.csv)"
+                )
+                
+                if path:
+                    df.to_csv(path, index=False)
+                    self.mw.log_message(f"Data exported to {os.path.basename(path)}")
+                    self.mw._set_last_dir(path)
+            except Exception as e:
+                self.mw.log_message(f"Export failed: {e}")
+        else:
+            self.mw.log_message("The current view does not support data export.")
+    
     def add_group_files(self):
         start_dir = self.mw._get_last_dir()
         files, _ = QtWidgets.QFileDialog.getOpenFileNames(
@@ -540,7 +608,139 @@ class GroupViewPanel(QtWidgets.QWidget):
             
             if self.state.reference_raw_data is not None:
                 self.btn_compare.setEnabled(True)
-            
+        
+            # Gradient Analysis (Anatomical Lobe Assignment, Phase vs. Axis)
+            if self.state.atlas_roi_path and os.path.exists(self.state.atlas_roi_path):
+                try:
+                    with open(self.state.atlas_roi_path, 'r') as f:
+                        atlas_data = json.load(f)
+                    
+                    # 1. Find Phase Axes
+                    axis_rois = [r for r in atlas_data if r.get('mode') == 'Phase Axis']
+                    
+                    if not axis_rois:
+                        self.mw.log_message("Atlas loaded, but no 'Phase Axis' found. Gradient skipped.")
+                    else:
+                        self.mw.log_message(f"Running Gradient Analysis ({len(axis_rois)} Axes)...")
+                        
+                        # Sort Axes Left-to-Right
+                        axes_polys = [] # List of {'poly': array, 'cx': float}
+                        for r in axis_rois:
+                            p = np.array(r['path_vertices'])
+                            axes_polys.append({'poly': p, 'cx': np.mean(p[:, 0])})
+                        axes_polys.sort(key=lambda x: x['cx'])
+                        
+                        # 2. Find Anatomical Regions (Green Outlines)
+                        # We need these to assign cells to the correct axis
+                        anat_rois = [r for r in atlas_data if r.get('mode') == 'Include']
+                        anat_polys = []
+                        for r in anat_rois:
+                            p = np.array(r['path_vertices'])
+                            anat_polys.append({'path': Path(p), 'cx': np.mean(p[:, 0]), 'poly': p})
+                        anat_polys.sort(key=lambda x: x['cx']) # Sort Left-to-Right
+                        
+                        # 3. Pair Axes with Regions
+                        # Scenario A: 2 Axes, >=2 Regions. Pair Left-Left, Right-Right.
+                        # Scenario B: 1 Axis. Use it for everything.
+                        
+                        gradient_data = []
+                        animals = group_scatter_df['Source_Animal'].unique()
+                        
+                        for animal in animals:
+                            subset = group_scatter_df[group_scatter_df['Source_Animal'] == animal]
+                            points = subset[['Warped_X', 'Warped_Y']].values
+                            phases = subset['Relative_Phase_Hours'].values
+                            
+                            s_final = []
+                            p_final = []
+                            
+                            # --- DUAL LOBE LOGIC ---
+                            if len(axes_polys) >= 2 and len(anat_polys) >= 2:
+                                # Assume index 0 is Left, index 1 is Right for both lists
+                                axis_L, axis_R = axes_polys[0]['poly'], axes_polys[1]['poly']
+                                path_L, path_R = anat_polys[0]['path'], anat_polys[1]['path']
+                                
+                                # Masking
+                                is_in_L = path_L.contains_points(points)
+                                is_in_R = path_R.contains_points(points)
+                                
+                                # Handle Edge Cases (Outside both or Inside both?)
+                                # Assign to whichever centroid is closer
+                                cx_L, cx_R = anat_polys[0]['cx'], anat_polys[1]['cx']
+                                dist_L = np.abs(points[:, 0] - cx_L)
+                                dist_R = np.abs(points[:, 0] - cx_R)
+                                
+                                # Final Decision Mask
+                                # If strictly in one, use it. If in neither/both, use distance.
+                                use_L = (is_in_L & ~is_in_R) | ((~is_in_L & ~is_in_R) & (dist_L < dist_R))
+                                use_R = ~use_L # The rest go Right
+                                
+                                if np.any(use_L):
+                                    s_L = project_points_to_polyline(points[use_L], axis_L)
+                                    s_final.extend(s_L)
+                                    p_final.extend(phases[use_L])
+                                    
+                                if np.any(use_R):
+                                    s_R = project_points_to_polyline(points[use_R], axis_R)
+                                    s_final.extend(s_R)
+                                    p_final.extend(phases[use_R])
+                                    
+                            # --- SINGLE AXIS LOGIC ---
+                            elif len(axes_polys) == 1:
+                                axis = axes_polys[0]['poly']
+                                s_vals = project_points_to_polyline(points, axis)
+                                s_final.extend(s_vals)
+                                p_final.extend(phases)
+                                
+                            else:
+                                self.mw.log_message("Warning: Mismatch between Axes and Anatomical Regions. Cannot assign lobes.")
+                                continue
+
+                            # Convert to numpy
+                            s_final = np.array(s_final)
+                            p_final = np.array(p_final)
+                            
+                            if len(s_final) == 0: continue
+                            
+                            # Binning Logic (Same as before)
+                            bins = np.linspace(0, 1, 11)
+                            bin_centers = (bins[:-1] + bins[1:]) / 2
+                            
+                            binned_phases = []
+                            for k in range(len(bins)-1):
+                                mask = (s_final >= bins[k]) & (s_final < bins[k+1])
+                                if np.sum(mask) > 0:
+                                    p_bin = p_final[mask]
+                                    rads = (p_bin / 24.0) * 2 * np.pi
+                                    m_rad = circmean(rads, low=-np.pi, high=np.pi)
+                                    m_h = (m_rad / (2 * np.pi)) * 24.0
+                                    binned_phases.append(m_h)
+                                else:
+                                    binned_phases.append(np.nan)
+                            
+                            gradient_data.append({
+                                'animal': animal,
+                                's': bin_centers,
+                                'phases': np.array(binned_phases)
+                            })
+                        
+                        # Create Tab
+                        if not hasattr(self.mw, 'grad_tab'):
+                            self.mw.grad_tab = QtWidgets.QWidget()
+                            self.mw.vis_tabs.addTab(self.mw.grad_tab, "Gradient")
+                            
+                        from gui.viewers import PhaseGradientViewer
+                        fig, _ = add_mpl_to_tab(self.mw.grad_tab)
+                        viewer_g = PhaseGradientViewer(fig, fig.add_subplot(111), gradient_data)
+                        self.mw.visualization_widgets[self.mw.grad_tab] = viewer_g
+                        self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.grad_tab), True)
+                        self.mw.log_message("Gradient Analysis Complete.")
+
+                except Exception as e:
+                    self.mw.log_message(f"Gradient Analysis Failed: {e}")
+                    import traceback
+                    self.mw.log_message(traceback.format_exc())
+        
         except Exception as e:
             import traceback
             self.mw.log_message(f"Error generating group visualizations: {e}")

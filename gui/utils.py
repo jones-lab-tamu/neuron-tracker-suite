@@ -155,3 +155,69 @@ def add_mpl_to_tab(tab: QtWidgets.QWidget):
     layout.addWidget(canvas, 1)
 
     return fig, canvas
+
+def project_points_to_polyline(points, polyline):
+    """
+    Projects 2D points onto a multi-segment polyline.
+    Returns the normalized arc-length position 's' [0.0, 1.0] for each point.
+    
+    Args:
+        points (Nx2 array): Cell coordinates.
+        polyline (Mx2 array): Ordered vertices of the Phase Axis.
+        
+    Returns:
+        s (N array): Position along the curve (0=Start, 1=End).
+    """
+    points = np.asarray(points)
+    polyline = np.asarray(polyline)
+    
+    if len(polyline) < 2:
+        return np.zeros(len(points))
+        
+    # 1. Calculate segment lengths and total length
+    # diffs = P[i+1] - P[i]
+    seg_vecs = np.diff(polyline, axis=0)
+    seg_lens = np.linalg.norm(seg_vecs, axis=1)
+    total_len = np.sum(seg_lens)
+    
+    # Cumulative length at each vertex [0, L1, L1+L2, ...]
+    cum_len = np.concatenate(([0], np.cumsum(seg_lens)))
+    
+    s_values = []
+    
+    for p in points:
+        best_dist = np.inf
+        best_s = 0.0
+        
+        # Check each segment
+        for i in range(len(seg_vecs)):
+            # Segment from A to B
+            A = polyline[i]
+            B = polyline[i+1]
+            vec_AB = seg_vecs[i]
+            len_AB = seg_lens[i]
+            
+            if len_AB == 0: continue
+                
+            # Vector from A to Point
+            vec_AP = p - A
+            
+            # Project AP onto AB (t = dot(AP, AB) / |AB|^2)
+            t = np.dot(vec_AP, vec_AB) / (len_AB**2)
+            
+            # Clamp t to segment [0, 1]
+            t_clamped = np.clip(t, 0.0, 1.0)
+            
+            # Closest point on segment
+            closest = A + t_clamped * vec_AB
+            dist = np.linalg.norm(p - closest)
+            
+            if dist < best_dist:
+                best_dist = dist
+                # Calculate absolute distance along the whole polyline
+                abs_pos = cum_len[i] + (t_clamped * len_AB)
+                best_s = abs_pos / total_len
+                
+        s_values.append(best_s)
+        
+    return np.array(s_values)
