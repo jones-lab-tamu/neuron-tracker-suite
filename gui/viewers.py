@@ -586,7 +586,6 @@ class GroupDifferenceViewer:
             )
 
         # 4. Camera Zoom (Forceful Padding)
-        # We calculate this from the Tight Extent to ensure consistency with GroupAverageMap
         x_min, x_max, y_min, y_max = extent
         width = x_max - x_min
         height = y_max - y_min
@@ -594,12 +593,12 @@ class GroupDifferenceViewer:
         cx = (x_min + x_max) / 2
         cy = (y_min + y_max) / 2
         
-        # Pad by 15% relative to the grid size
-        margin_x = width * 0.15
-        margin_y = height * 0.15
+        # Force Square Viewport
+        max_range = max(width, height)
+        half_span = (max_range * 1.15) / 2 
         
-        ax.set_xlim(x_min - margin_x, x_max + margin_x)
-        ax.set_ylim(y_min - margin_y, y_max + margin_y)
+        ax.set_xlim(cx - half_span, cx + half_span)
+        ax.set_ylim(cy - half_span, cy + half_span)
         
         ax.set_aspect("equal", adjustable="box")
         ax.set_xticks([])

@@ -17,7 +17,7 @@ from gui.analysis import (
 )
 import cosinor as csn
 from gui.theme import get_icon
-from gui.statistics import cluster_based_permutation_test
+from gui.statistics import build_animal_phase_matrix, cluster_based_permutation_test_by_animal
 
 class GroupViewPanel(QtWidgets.QWidget):
     def __init__(self, main_window):
@@ -99,18 +99,28 @@ class GroupViewPanel(QtWidgets.QWidget):
         
         # Comparison Controls (Added as sibling to param_box)
         comp_box = QtWidgets.QGroupBox("Group Comparison")
-        comp_layout = QtWidgets.QHBoxLayout(comp_box)
+        # Use a Form Layout for clarity
+        comp_layout = QtWidgets.QFormLayout(comp_box)
         
+        # Row 1: Buttons
+        btn_row = QtWidgets.QHBoxLayout()
         self.btn_set_reference = QtWidgets.QPushButton("Set Current as Control (Ref)")
-        Tooltip.install(self.btn_set_reference, "Locks the current grid and data as the 'Control' group. Subsequent groups will be aligned to this grid.")
+        Tooltip.install(self.btn_set_reference, "...")
         self.btn_set_reference.setEnabled(False)
         
         self.btn_compare = QtWidgets.QPushButton("Run CBPT Analysis")
-        Tooltip.install(self.btn_compare, "Runs Cluster-Based Permutation Testing (Control vs Current).")
+        Tooltip.install(self.btn_compare, "...")
         self.btn_compare.setEnabled(False)
         
-        comp_layout.addWidget(self.btn_set_reference)
-        comp_layout.addWidget(self.btn_compare)
+        btn_row.addWidget(self.btn_set_reference)
+        btn_row.addWidget(self.btn_compare)
+        comp_layout.addRow(btn_row)
+        
+        # Dedicated Checkbox for Bridging
+        self.bridge_gaps_check = QtWidgets.QCheckBox("Bridge Gaps in Cluster Test")
+        Tooltip.install(self.bridge_gaps_check, "Connects significant pixels separated by small gaps, allowing larger clusters to form. Use this if your data is sparse.")
+        self.bridge_gaps_check.setChecked(True) # Default to ON
+        comp_layout.addRow(self.bridge_gaps_check)
         
         b.addWidget(comp_box)
         
@@ -160,47 +170,51 @@ class GroupViewPanel(QtWidgets.QWidget):
             self.mw.log_message("Error: Missing Reference or Experimental data.")
             return
 
-        self.mw.log_message("Running Cluster-Based Permutation Test (1000 shuffles)...")
-        self.mw.log_message("Please wait, this may take 10-20 seconds.")
+        self.mw.log_message("Running Animal-Level Cluster Permutation Test...")
+        self.mw.log_message("Please wait, this may take 20-40 seconds.")
         
-        # Force UI update
         QtWidgets.QApplication.processEvents()
-        
-        # Set Busy Cursor
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         
         try:
+            # 1. Get Grid Shape
+            # grid_def is (calc_x, calc_y, grid_x, grid_y, nx, ny)
             nx = self.state.reference_grid_def[4]
             ny = self.state.reference_grid_def[5]
-            
-            period = 24.0 
+            grid_shape = (ny, nx)
+            period = 24.0
 
-            # Pass Smooth Checkbox as Bridge Gaps Flag
-            do_bridge = self.group_smooth_check.isChecked()
+            # 2. Build Per-Animal Matrices
+            self.mw.log_message("  -> Collapsing cell data to per-animal means...")
+            ref_ids, ref_matrix = build_animal_phase_matrix(self.state.reference_raw_data, grid_shape, period)
+            exp_ids, exp_matrix = build_animal_phase_matrix(self.current_raw_data, grid_shape, period)
+            self.mw.log_message(f"  -> Found {len(ref_ids)} Control animals and {len(exp_ids)} Experimental animals.")
+
+            # 3. Run the new CBPT
+            do_bridge = self.bridge_gaps_check.isChecked()
             if do_bridge:
-                self.mw.log_message("  -> Bridging gaps for cluster detection (Spatial Smoothing)...")
+                self.mw.log_message("  -> Bridging gaps for cluster detection...")
 
-            results = cluster_based_permutation_test(
-                ref_data_map=self.state.reference_raw_data,
-                exp_data_map=self.current_raw_data,
-                grid_shape=(ny, nx),
+            results = cluster_based_permutation_test_by_animal(
+                ref_matrix=ref_matrix,
+                exp_matrix=exp_matrix,
+                grid_shape=grid_shape,
                 period=period,
-                n_permutations=1000,
-                min_n=3,
+                n_permutations=10000,
+                min_n=2,
+                cluster_alpha=0.4,
                 bridge_gaps=do_bridge
             )
             
             if results is None:
                 self.mw.log_message("Error: No valid overlapping pixels found (Min N=3).")
+                QtWidgets.QApplication.restoreOverrideCursor()
                 return
             
-            # Dynamic Tab Creation
+            # 4. Visualization
             if not hasattr(self.mw, 'diff_tab'):
                 self.mw.diff_tab = QtWidgets.QWidget()
                 self.mw.vis_tabs.addTab(self.mw.diff_tab, "Diff Map")
-            
-            # Import Viewer
-            from gui.viewers import GroupDifferenceViewer
             
             fig, _ = add_mpl_to_tab(self.mw.diff_tab)
             
@@ -208,12 +222,11 @@ class GroupViewPanel(QtWidgets.QWidget):
                 fig, fig.add_subplot(111),
                 results['difference_map'],
                 results['significance_mask'],
-                results['p_values'], # <--- Pass the raw p-values
+                results['p_values'],
                 self.state.reference_grid_def
             )
             
             self.mw.visualization_widgets[self.mw.diff_tab] = viewer
-            
             self.mw.vis_tabs.setCurrentWidget(self.mw.diff_tab)
             self.mw.log_message("Analysis Complete. Significant clusters displayed.")
             
@@ -222,7 +235,6 @@ class GroupViewPanel(QtWidgets.QWidget):
             import traceback
             self.mw.log_message(traceback.format_exc())
         finally:
-            # Restore Normal Cursor
             QtWidgets.QApplication.restoreOverrideCursor()
 
     def connect_signals(self):

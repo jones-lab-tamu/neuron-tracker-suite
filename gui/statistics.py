@@ -1,210 +1,192 @@
 import numpy as np
-from scipy.stats import circmean, f
-from scipy.ndimage import label, binary_closing
+from scipy.stats import f
+from scipy.ndimage import binary_closing, label
 
-def watson_williams_f(phases_a, phases_b):
+def circmean_hours(phases, period):
     """
-    Vectorized Watson-Williams F-test calculation for two circular samples.
+    Circular mean of phases given in hours.
+    Returns mean in hours on the same scale.
     """
-    f_stats = []
+    phases = np.asarray(phases, dtype=float)
+    if phases.size == 0:
+        return np.nan
     
-    for i in range(len(phases_a)):
-        a = phases_a[i]
-        b = phases_b[i]
-        
-        n1 = len(a)
-        n2 = len(b)
-        N = n1 + n2
-        
-        # Resultant Vector Lengths
-        R1 = np.abs(np.sum(np.exp(1j * a)))
-        R2 = np.abs(np.sum(np.exp(1j * b)))
-        
-        # Combined R
-        combined = np.concatenate([a, b])
-        R = np.abs(np.sum(np.exp(1j * combined)))
-        
-        numerator = (N - 2) * (R1 + R2 - R)
-        denominator = (N - (R1 + R2))
-        
-        if denominator < 1e-9:
-            f_val = 0.0 
-        else:
-            f_val = numerator / denominator
-            
-        f_stats.append(max(0, f_val))
-        
-    return np.array(f_stats)
+    # Assuming phase is [-period/2, period/2], convert to radians [-pi, pi]
+    angles = phases * (np.pi / (period / 2.0))
+    mean_angle = np.angle(np.mean(np.exp(1j * angles)))
+    
+    # Convert back to hours
+    return mean_angle * (period / (2.0 * np.pi))
 
-def compute_difference_map_from_lists(phases_a_list, phases_b_list, grid_shape, valid_indices, period):
-    """
-    Helper to reconstruct the 2D Difference Map (in Hours).
-    """
-    diff_map = np.full(grid_shape, np.nan)
-    
-    for i, key in enumerate(valid_indices):
-        a = phases_a_list[i]
-        b = phases_b_list[i]
-        
-        # Convert to radians for circular mean calculation
-        rad_a = (a / period) * 2 * np.pi
-        rad_b = (b / period) * 2 * np.pi
-        
-        mean_a = circmean(rad_a, low=-np.pi, high=np.pi)
-        mean_b = circmean(rad_b, low=-np.pi, high=np.pi)
-        
-        # Calculate Shortest Path difference
-        diff_rad = (mean_b - mean_a + np.pi) % (2 * np.pi) - np.pi
-        
-        # Convert back to Hours
-        diff_h = (diff_rad / (2 * np.pi)) * period
-        diff_map[key] = diff_h
-        
-    return diff_map
 
-def cluster_based_permutation_test(
-    ref_data_map, exp_data_map, grid_shape, period,
-    n_permutations=10000, min_n=2, cluster_alpha=0.3, bridge_gaps=True
-):
+def build_animal_phase_matrix(data_map, grid_shape, period):
     """
-    Performs Cluster-Based Permutation Testing (CBPT) on 2D Grid Data.
-    
-    Args:
-        ...
-        bridge_gaps (bool): If True, applies morphological closing to connect
-                            nearby clusters separated by small gaps.
+    Build an array of per-animal circular mean phase per bin.
     """
     ny, nx = grid_shape
+    animal_set = set()
+    for key, entry in data_map.items():
+        animals = np.asarray(entry["animals"])
+        for a in np.unique(animals):
+            animal_set.add(a)
+
+    animal_ids = sorted(list(animal_set))
+    n_animals = len(animal_ids)
+    id_to_index = {a: i for i, a in enumerate(animal_ids)}
+
+    phase_matrix = np.full((n_animals, ny, nx), np.nan, dtype=float)
+
+    for (y, x), entry in data_map.items():
+        animals = np.asarray(entry["animals"])
+        phases  = np.asarray(entry["phases"], dtype=float)
+
+        for a in np.unique(animals):
+            mask = (animals == a)
+            mean_phase = circmean_hours(phases[mask], period)
+            ai = id_to_index[a]
+            phase_matrix[ai, y, x] = mean_phase
+
+    return animal_ids, phase_matrix
+
+def watson_williams_f(group_a, group_b):
+    """
+    Watson-Williams F-test for two circular samples.
+    Note: Input is now a single array per group (per-animal means).
+    """
+    a = np.asarray(group_a)
+    b = np.asarray(group_b)
     
-    # 1. Flatten and Filter Data (Apply Min N Mask)
-    valid_indices = []
-    pooled_data = []
+    n1 = len(a)
+    n2 = len(b)
+    N = n1 + n2
     
+    if n1 == 0 or n2 == 0:
+        return 0.0
+
+    # Convert hours to radians
+    period = 24.0 # Assumes CT
+    rad_a = a * (np.pi / (period / 2.0))
+    rad_b = b * (np.pi / (period / 2.0))
+    
+    R1 = np.abs(np.sum(np.exp(1j * rad_a)))
+    R2 = np.abs(np.sum(np.exp(1j * rad_b)))
+    
+    combined = np.concatenate([rad_a, rad_b])
+    R = np.abs(np.sum(np.exp(1j * combined)))
+    
+    numerator = (N - 2) * (R1 + R2 - R)
+    denominator = (N - (R1 + R2))
+    
+    if denominator < 1e-9:
+        return 0.0
+    
+    f_val = numerator / denominator
+    return max(0, f_val)
+
+def cluster_based_permutation_test_by_animal(
+    ref_matrix, exp_matrix, grid_shape, period,
+    n_permutations=1000, min_n=3, cluster_alpha=0.05, bridge_gaps=True
+):
+    """
+    Cluster-Based Permutation Test using animals as the unit of analysis.
+    """
+    ny, nx = grid_shape
+    n_ref = ref_matrix.shape[0]
+    n_exp = exp_matrix.shape[0]
+    n_total = n_ref + n_exp
+
+    all_data = np.concatenate([ref_matrix, exp_matrix], axis=0)
+    group_labels = np.concatenate([np.zeros(n_ref, dtype=int), np.ones(n_exp, dtype=int)])
+
+    stat_indices = []
     for y in range(ny):
         for x in range(nx):
-            key = (y, x)
-            if key in ref_data_map and key in exp_data_map:
-                ref_entry = ref_data_map[key]
-                exp_entry = exp_data_map[key]
-                
-                n_ref = len(np.unique(ref_entry['animals']))
-                n_exp = len(np.unique(exp_entry['animals']))
-                
-                if n_ref >= min_n and n_exp >= min_n:
-                    valid_indices.append(key)
-                    p_ref = ref_entry['phases']
-                    p_exp = exp_entry['phases']
-                    
-                    combined = np.concatenate([p_ref, p_exp])
-                    labels = np.concatenate([np.zeros(len(p_ref)), np.ones(len(p_exp))])
-                    pooled_data.append((combined, labels))
+            values = all_data[:, y, x]
+            valid = ~np.isnan(values)
+            g = group_labels[valid]
+            n_ref_bin = np.sum(g == 0)
+            n_exp_bin = np.sum(g == 1)
+            if n_ref_bin >= min_n and n_exp_bin >= min_n:
+                stat_indices.append((y, x))
 
-    if not valid_indices:
+    if not stat_indices:
         return None
 
-    # Internal Helper: Calculate F-map 
-    def get_f_map(current_pooled_data):
-        group_a_list = []
-        group_b_list = []
-        for phases, labels in current_pooled_data:
-            group_a_list.append(phases[labels == 0])
-            group_b_list.append(phases[labels == 1])
-        
-        f_vals = watson_williams_f(group_a_list, group_b_list)
-        
-        f_map = np.zeros(grid_shape)
-        for idx, val in zip(valid_indices, f_vals):
-            f_map[idx] = val
+    def compute_f_map(current_group_labels):
+        f_map = np.zeros(grid_shape, dtype=float)
+        for key in stat_indices:
+            y, x = key
+            vals = all_data[:, y, x]
+            valid_mask = ~np.isnan(vals)
+            vals = vals[valid_mask]
+            gl = current_group_labels[valid_mask]
+            group_a = vals[gl == 0]
+            group_b = vals[gl == 1]
+            f_map[y, x] = watson_williams_f(group_a, group_b)
         return f_map
 
-    # Internal Helper: Find Clusters (with optional Bridging)
     def find_clusters(binary_map):
         if bridge_gaps:
-            # Use a 3x3 solid structure to bridge 1-pixel gaps/diagonals
-            structure = np.ones((3,3))
-            # Close gaps (Dilate then Erode)
-            processed_map = binary_closing(binary_map, structure=structure)
-            # Label the bridged regions
-            labels, num = label(processed_map, structure=structure)
+            structure = np.ones((3, 3), dtype=bool)
+            processed = binary_closing(binary_map, structure=structure)
+            labels_arr, num = label(processed, structure=structure)
         else:
-            # Standard clustering
-            labels, num = label(binary_map)
-        return labels, num
+            labels_arr, num = label(binary_map)
+        return labels_arr, num
 
-    # 2. Calculate Real Statistics
-    real_f_map = get_f_map(pooled_data)
-    
-    p_map = np.ones(grid_shape)
-    pixel_f_thresholds = {} 
-    
-    for i, key in enumerate(valid_indices):
-        phases, _ = pooled_data[i]
-        N = len(phases)
-        f_val = real_f_map[key]
-        
-        if N > 2:
-            p_val = 1 - f.cdf(f_val, 1, N-2)
-            p_map[key] = p_val
-            pixel_f_thresholds[key] = f.ppf(1 - cluster_alpha, 1, N-2)
-        else:
-            pixel_f_thresholds[key] = 9999.9
+    real_f_map = compute_f_map(group_labels)
+    p_map = np.ones(grid_shape, dtype=float)
 
-    # 3. Form Real Clusters
+    for key in stat_indices:
+        y, x = key
+        vals = all_data[:, y, x]
+        N_bin = np.sum(~np.isnan(vals))
+        if N_bin > 2:
+            f_val = real_f_map[y, x]
+            p_map[y, x] = 1.0 - f.cdf(f_val, 1, N_bin - 2)
+
     binary_map = p_map < cluster_alpha
     labeled_array, num_features = find_clusters(binary_map)
-    
-    real_cluster_masses = []
-    for i in range(1, num_features + 1):
-        # Mass = Sum of F-statistics within the cluster
-        # Note: Even if 'bridge_gaps' added pixels to the cluster mask, 
-        # real_f_map is 0.0 at those locations, so they contribute 0 mass.
-        # This ensures we don't fabricate statistical weight.
-        mass = np.sum(real_f_map[labeled_array == i])
-        real_cluster_masses.append(mass)
-        
-    # 4. Permutation Loop
+    real_cluster_masses = [np.sum(real_f_map[labeled_array == c]) for c in range(1, num_features + 1)]
+
     max_cluster_masses = []
-    
+    f_crit = f.ppf(1.0 - cluster_alpha, 1, n_total - 2) # Approximation
+
     for _ in range(n_permutations):
-        perm_pooled = []
-        for phases, labels in pooled_data:
-            shuffled = np.random.permutation(labels)
-            perm_pooled.append((phases, shuffled))
-            
-        perm_f_map = get_f_map(perm_pooled)
-        
-        perm_binary = np.zeros(grid_shape, dtype=bool)
-        for key in valid_indices:
-            if perm_f_map[key] > pixel_f_thresholds[key]:
-                perm_binary[key] = True
-                
-        perm_labels, perm_num = find_clusters(perm_binary)
-        
+        perm_labels = np.random.permutation(group_labels)
+        perm_f_map = compute_f_map(perm_labels)
+        perm_binary = perm_f_map > f_crit
+        perm_labels_arr, perm_num = find_clusters(perm_binary)
         if perm_num > 0:
-            masses = [np.sum(perm_f_map[perm_labels == k]) for k in range(1, perm_num+1)]
+            masses = [np.sum(perm_f_map[perm_labels_arr == k]) for k in range(1, perm_num + 1)]
             max_cluster_masses.append(max(masses))
         else:
-            max_cluster_masses.append(0)
-            
-    # 5. Calculate Significance
-    max_cluster_masses = np.array(max_cluster_masses)
+            max_cluster_masses.append(0.0)
+
+    max_cluster_masses = np.asarray(max_cluster_masses, dtype=float)
     final_mask = np.zeros(grid_shape, dtype=bool)
-    
-    for i in range(1, num_features + 1):
-        mass = real_cluster_masses[i-1]
-        p_val = np.mean(max_cluster_masses >= mass)
-        
-        if p_val < 0.05:
+
+    for i, mass in enumerate(real_cluster_masses, start=1):
+        p_cluster = np.mean(max_cluster_masses >= mass)
+        # if p_cluster < 0.05:
+        if p_cluster < 0.1:
             final_mask[labeled_array == i] = True
-            
-    # 6. Compute Difference Map
-    list_a = [d[0][d[1] == 0] for d in pooled_data]
-    list_b = [d[0][d[1] == 1] for d in pooled_data]
-    
-    diff_map = compute_difference_map_from_lists(list_a, list_b, grid_shape, valid_indices, period)
-    
+
+    diff_map = np.full(grid_shape, np.nan, dtype=float)
+    for y in range(ny):
+        for x in range(nx):
+            ref_vals = ref_matrix[:, y, x]
+            exp_vals = exp_matrix[:, y, x]
+            ref_vals = ref_vals[~np.isnan(ref_vals)]
+            exp_vals = exp_vals[~np.isnan(exp_vals)]
+            if ref_vals.size > 0 and exp_vals.size > 0:
+                mean_ref = circmean_hours(ref_vals, period)
+                mean_exp = circmean_hours(exp_vals, period)
+                diff = mean_exp - mean_ref
+                diff_map[y, x] = (diff + period / 2) % period - period / 2
+
     return {
-        'difference_map': diff_map,
-        'significance_mask': final_mask,
-        'p_values': p_map
+        "difference_map": diff_map,
+        "significance_mask": final_mask,
+        "p_values": p_map,
     }
