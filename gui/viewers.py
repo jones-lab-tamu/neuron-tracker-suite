@@ -547,41 +547,46 @@ class GroupDifferenceViewer:
         self.uncorrected_mask = p_values < 0.05
         self.current_mask = self.cluster_mask
         self.is_uncorrected = False
-        
+        self.show_all_mask = np.ones_like(sig_mask, dtype=bool)
+        self.is_masked = False 
+
         # Unpack Grid Definition
-        _, _, grid_x, grid_y, nx, ny = grid_def
-        extent = [grid_x[0], grid_x[-1], grid_y[0], grid_y[-1]]
+        # grid_def is (calc_x, calc_y, grid_x, grid_y, nx, ny)
+        calc_x, calc_y, _, _, _, _ = grid_def
+        
+        # Use Calculation Bins for Extent (Tight Data Limits)
+        # This matches the dimensions of diff_map (ny, nx)
+        extent = [calc_x[0], calc_x[-1], calc_y[0], calc_y[-1]]
         
         self.fig.subplots_adjust(left=0.1, bottom=0.25, right=0.85, top=0.9)
-        ax.set_title("Significant Phase Difference (Exp - Control)")
+        ax.set_title("Significant Phase Difference (Cluster-Corrected)")
         
         # 1. Layer 1: Ghost (Context)
         self.im_ghost = ax.imshow(
-            diff_map, extent=extent,
+            diff_map, origin="lower", extent=extent,
             cmap='coolwarm', alpha=0.15, vmin=-6, vmax=6
         )
         
         # 2. Layer 2: Significant (Active Data)
         masked_diff = self._apply_mask(diff_map, self.current_mask)
         self.im_sig = ax.imshow(
-            masked_diff, extent=extent,
+            masked_diff, origin="lower", extent=extent,
             cmap='coolwarm', alpha=1.0, vmin=-6, vmax=6
         )
         
-        # Draw Cluster Contours ---
-        # We contour the boolean mask. Levels at 0.5 separates False (0) from True (1).
-        # Extent aligns the contour with the image pixels.
-        
+        # 3. Contour
         if np.any(self.cluster_mask):
             self.contour = ax.contour(
                 self.cluster_mask, 
                 levels=[0.5], 
                 colors='black', 
                 linewidths=2,
+                origin='lower', 
                 extent=extent
             )
-        
-        # 3. Camera Zoom (Forceful Padding)
+
+        # 4. Camera Zoom (Forceful Padding)
+        # We calculate this from the Tight Extent to ensure consistency with GroupAverageMap
         x_min, x_max, y_min, y_max = extent
         width = x_max - x_min
         height = y_max - y_min
@@ -600,21 +605,29 @@ class GroupDifferenceViewer:
         ax.set_xticks([])
         ax.set_yticks([])
         
-        # 4. Controls
+        ax.invert_yaxis()
+        
+        # 5. Colorbar
         cax = fig.add_axes([0.86, 0.25, 0.02, 0.6])
         self.cbar = fig.colorbar(self.im_sig, cax=cax)
         self.cbar.set_label("Phase Difference (Hours)")
         
+        # 6. Controls
         ax_slider = fig.add_axes([0.25, 0.10, 0.60, 0.03])
         self.range_slider = Slider(ax=ax_slider, label="Diff Range (+/- h)", valmin=1.0, valmax=12.0, valinit=6.0)
         self.range_slider.on_changed(self.update_clim)
         
-        # 5. Toggle Checkbox
-        ax_check = fig.add_axes([0.05, 0.05, 0.25, 0.05], frame_on=False)
-        self.chk_uncorrected = CheckButtons(ax_check, ["Show Uncorrected (p<0.05)"], [False])
-        self.chk_uncorrected.on_clicked(self.toggle_mask)
+        # Checkbox 1: Uncorrected
+        ax_check1 = fig.add_axes([0.05, 0.05, 0.25, 0.05], frame_on=False)
+        self.chk_uncorrected = CheckButtons(ax_check1, ["Show Uncorrected (p<0.05)"], [False])
+        self.chk_uncorrected.on_clicked(self.toggle_mode)
         
-        # 6. Tooltip
+        # Checkbox 2: Mask
+        ax_check2 = fig.add_axes([0.30, 0.05, 0.20, 0.05], frame_on=False)
+        self.chk_mask = CheckButtons(ax_check2, ["Mask Non-Sig"], [False])
+        self.chk_mask.on_clicked(self.toggle_mask)
+        
+        # 7. Tooltip
         self.annot = ax.annotate("", xy=(0,0), xytext=(20,20), textcoords="offset points",
                                  bbox=dict(boxstyle="round", fc="w", alpha=0.9),
                                  arrowprops=dict(arrowstyle="->"))
@@ -623,36 +636,44 @@ class GroupDifferenceViewer:
 
     def _apply_mask(self, data, mask):
         masked = data.copy()
-        masked[~mask] = np.nan
+        if self.is_masked:
+             masked[~mask] = np.nan
         return masked
 
-    def toggle_mask(self, label):
+    def toggle_mode(self, label):
         self.is_uncorrected = not self.is_uncorrected
         self.current_mask = self.uncorrected_mask if self.is_uncorrected else self.cluster_mask
+        self._refresh_plot()
+
+    def toggle_mask(self, label):
+        self.is_masked = not self.is_masked
+        self._refresh_plot()
         
-        title = "Phase Difference (Uncorrected p<0.05)" if self.is_uncorrected else "Significant Phase Difference (Cluster-Corrected)"
-        self.ax.set_title(title)
-        
+    def _refresh_plot(self):
+        # Update Title
+        base_title = "Phase Difference"
+        if self.is_uncorrected: base_title += " (Uncorrected p<0.05)"
+        else: base_title += " (Cluster-Corrected)"
+        self.ax.set_title(base_title)
+
+        # Update Data
         new_data = self._apply_mask(self.diff_map, self.current_mask)
         self.im_sig.set_data(new_data)
         
         # Update Contours
-        # Remove old contours
         if hasattr(self, 'contour'):
             for c in self.contour.collections:
                 c.remove()
                 
-        # Draw new ones if mask has True values
         if np.any(self.current_mask):
             self.contour = self.ax.contour(
                 self.current_mask, 
                 levels=[0.5], 
                 colors='black', 
                 linewidths=1.5,
+                origin='lower', 
                 extent=self.im_sig.get_extent()
             )
-        # -----------------------------
-        
         self.fig.canvas.draw_idle()
 
     def update_clim(self, val):

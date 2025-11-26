@@ -64,7 +64,7 @@ def compute_difference_map_from_lists(phases_a_list, phases_b_list, grid_shape, 
 
 def cluster_based_permutation_test(
     ref_data_map, exp_data_map, grid_shape, period,
-    n_permutations=10000, min_n=3, cluster_alpha=0.1, bridge_gaps=True
+    n_permutations=10000, min_n=2, cluster_alpha=0.3, bridge_gaps=True
 ):
     """
     Performs Cluster-Based Permutation Testing (CBPT) on 2D Grid Data.
