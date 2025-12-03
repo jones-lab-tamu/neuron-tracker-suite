@@ -497,9 +497,36 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             self.mw.log_message(f"Error saving plot: {e}")
 
     def export_current_data(self):
-        # This was missing in the original snippet but referenced in signals.
-        # Implementing a basic version or placeholder.
-        self.mw.log_message("Export data not fully implemented in this refactor step.")
+        """
+        Exports the underlying data of the currently visible plot to a CSV file.
+        """
+        widget = self.mw.vis_tabs.currentWidget()
+        viewer = self.mw.visualization_widgets.get(widget)
+        
+        # Check if the viewer exists and has the export capability
+        if viewer and hasattr(viewer, "get_export_data"):
+            df, default_name = viewer.get_export_data()
+            
+            if df is not None and not df.empty:
+                start_dir = self.mw._get_last_dir()
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self, 
+                    "Export Data", 
+                    os.path.join(start_dir, default_name), 
+                    "CSV files (*.csv)"
+                )
+                
+                if path:
+                    self.mw._set_last_dir(path)
+                    try:
+                        df.to_csv(path, index=False)
+                        self.mw.log_message(f"Data exported to {os.path.basename(path)}")
+                    except Exception as e:
+                        self.mw.log_message(f"Error exporting data: {e}")
+            else:
+                self.mw.log_message("No data available to export from this view.")
+        else:
+            self.mw.log_message("The current tab does not support data export.")
 
     def on_roi_selected(self, original_index):
         self.mw.log_message(f"ROI {original_index + 1} selected.")

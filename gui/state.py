@@ -1,7 +1,7 @@
+# gui/state.py
 class AnalysisState:
     """A simple class to hold all application state."""
     def __init__(self):
-        self.node_scaffold = None
         self.reset()
 
     def reset(self):
@@ -12,8 +12,6 @@ class AnalysisState:
         self.atlas_roi_path = ""
         self.reference_roi_path = ""
         
-        self.node_scaffold = None
-
         # Lists for workflow panels
         self.target_roi_paths = []
         self.warp_param_paths = []
@@ -24,5 +22,5 @@ class AnalysisState:
         self.loaded_data = {}
 
         # Group Comparison State 
-        self.reference_grid_def = None  # Stores (grid_x_bins, grid_y_bins, nx, ny)
-        self.reference_raw_data = None  # Stores dict {(y,x): {'phases':[], 'animals':[]}}
+        self.reference_grid_def = None  
+        self.reference_raw_data = None
