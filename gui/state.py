@@ -1,6 +1,7 @@
 class AnalysisState:
     """A simple class to hold all application state."""
     def __init__(self):
+        self.node_scaffold = None
         self.reset()
 
     def reset(self):
@@ -10,6 +11,8 @@ class AnalysisState:
         self.output_basename = ""
         self.atlas_roi_path = ""
         self.reference_roi_path = ""
+        
+        self.node_scaffold = None
 
         # Lists for workflow panels
         self.target_roi_paths = []

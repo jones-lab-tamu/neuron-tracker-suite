@@ -13,6 +13,38 @@ from matplotlib.lines import Line2D
 
 from gui.theme import get_icon
 
+class RegionAttributesDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Region Attributes")
+        self.layout = QtWidgets.QFormLayout(self)
+        
+        self.zone_id_spin = QtWidgets.QSpinBox()
+        self.zone_id_spin.setRange(1, 20)
+        self.layout.addRow("Zone ID (1=Dorsal, etc):", self.zone_id_spin)
+        
+        self.lobe_combo = QtWidgets.QComboBox()
+        self.lobe_combo.addItems(["Left", "Right"])
+        self.layout.addRow("Lobe:", self.lobe_combo)
+        
+        self.name_edit = QtWidgets.QLineEdit()
+        self.name_edit.setPlaceholderText("e.g. Dorsal Shell")
+        self.layout.addRow("Name (Optional):", self.name_edit)
+        
+        self.btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        self.btns.accepted.connect(self.accept)
+        self.btns.rejected.connect(self.reject)
+        self.layout.addWidget(self.btns)
+
+    def get_data(self):
+        return {
+            "zone_id": self.zone_id_spin.value(),
+            "lobe": self.lobe_combo.currentText(),
+            "name": self.name_edit.text()
+        }
+
 class ROIDrawerDialog(QtWidgets.QDialog):
     """
     ROI drawing dialog: include/exclude polygons, writes:
@@ -21,15 +53,17 @@ class ROIDrawerDialog(QtWidgets.QDialog):
     Calls callback(filtered_indices, rois_dict_list)
     """
 
-    def __init__(self, parent, bg_image, roi_data, output_basename, callback, vmin=None, vmax=None):
+    def __init__(self, parent, bg_image, roi_data, output_basename, callback, vmin=None, vmax=None, is_region_mode=False):
         super().__init__(parent)
         self.setWindowTitle("Advanced ROI Definition Tool")
-        self.resize(1100, 800) # Made slightly wider for the side panel
+        self.resize(1100, 800)
 
         self.bg_image = bg_image
         self.roi_data = roi_data
         self.output_basename = output_basename
         self.callback = callback
+        self.is_region_mode = is_region_mode  # Store the flag
+
 
         self.rois = []
         self.current_vertices = []
@@ -48,7 +82,6 @@ class ROIDrawerDialog(QtWidgets.QDialog):
                     print(f"Error loading existing ROIs: {e}")
 
         # --- Layout Setup ---
-        # We use a Horizontal layout: Plot on Left, Controls on Right
         main_layout = QtWidgets.QHBoxLayout(self)
 
         # LEFT: Plot Area
@@ -156,7 +189,7 @@ class ROIDrawerDialog(QtWidgets.QDialog):
             "Include": {"color": "lime", "linestyle": "-"},
             "Exclude": {"color": "red", "linestyle": "-"},
             "Phase Reference": {"color": "cyan", "linestyle": "--"},
-            "Phase Axis": {"color": "magenta", "linestyle": "-", "marker": ">"} # Arrow marker
+            "Phase Axis": {"color": "magenta", "linestyle": "-", "marker": ">"} 
         }
 
         for i, roi in enumerate(self.rois):
@@ -167,11 +200,8 @@ class ROIDrawerDialog(QtWidgets.QDialog):
             
             style = style_map.get(mode, style_map["Include"])
             
-            # Distinguish Lines from Polygons
             if mode == "Phase Axis":
-                # Draw Open Line
                 xs, ys = zip(*verts)
-                # Simple implementation: Line with markers
                 line = Line2D(
                     xs, ys, 
                     color=style["color"], 
@@ -184,7 +214,6 @@ class ROIDrawerDialog(QtWidgets.QDialog):
                 self.ax.add_artist(line)
                 self.finished_artists.append(line)
             else:
-                # Draw Closed Polygon
                 poly = Polygon(
                     verts, 
                     closed=True, 
@@ -197,7 +226,12 @@ class ROIDrawerDialog(QtWidgets.QDialog):
                 self.ax.add_patch(poly)
                 self.finished_artists.append(poly)
             
-            item = QtWidgets.QListWidgetItem(f"{i+1}. {mode}")
+            # Show Zone/Lobe in list
+            label = f"{i+1}. {mode}"
+            if "zone_id" in roi:
+                label += f" (Zone {roi['zone_id']} {roi['lobe']})"
+            item = QtWidgets.QListWidgetItem(label)
+            
             self.roi_list_widget.addItem(item)
         
         self.roi_list_widget.blockSignals(False)
@@ -317,14 +351,29 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         
         if len(self.current_vertices) >= min_points:
             
+            # Region Tagging
+            attributes = {}
+            if self.is_region_mode and self.mode == "Include":
+                # Pop up the dialog
+                dlg = RegionAttributesDialog(self)
+                if dlg.exec_() == QtWidgets.QDialog.Accepted:
+                    attributes = dlg.get_data()
+                else:
+                    # User cancelled, abort polygon creation
+                    return 
+
             # Only close the loop if it is NOT a Phase Axis
             if self.mode != "Phase Axis":
                 self.current_vertices.append(self.current_vertices[0]) # Close loop
             
-            self.rois.append({
+            roi_data = {
                 "path_vertices": list(self.current_vertices),
                 "mode": self.mode,
-            })
+            }
+            # Merge attributes (Zone ID, Lobe) into the ROI data
+            roi_data.update(attributes)
+            
+            self.rois.append(roi_data)
             
             self.current_vertices = []
             if self.current_line is not None:

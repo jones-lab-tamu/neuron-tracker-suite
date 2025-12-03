@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.stats import f
+from scipy.sparse.csgraph import connected_components
 from scipy.ndimage import binary_closing, label
 
 def circmean_hours(phases, period):
@@ -189,4 +190,163 @@ def cluster_based_permutation_test_by_animal(
         "difference_map": diff_map,
         "significance_mask": final_mask,
         "p_values": p_map,
+    }
+    
+def run_graph_cbpt(phase_matrix, group_labels, scaffold,
+                   min_animals_per_group=3, cluster_alpha=0.2, n_permutations=5000):
+    """
+    Performs a Graph-Based Cluster Permutation Test on per-animal, per-node data.
+
+    Args:
+        phase_matrix (np.ndarray): Shape (n_animals, n_nodes). Contains mean phases or NaNs.
+        group_labels (np.ndarray): Shape (n_animals,). Labels (0 or 1) for each animal.
+        scaffold (AnatomicalNodeScaffold): The scaffold object containing node and edge info.
+        min_animals_per_group (int): Minimum N per group to test a node.
+        cluster_alpha (float): Initial p-value threshold for cluster formation.
+        n_permutations (int): Number of permutations for the null distribution.
+
+    Returns:
+        dict: A dictionary containing the results of the test.
+    """
+    n_animals, n_nodes = phase_matrix.shape
+    unique_labels = np.unique(group_labels)
+    if len(unique_labels) != 2:
+        raise ValueError("group_labels must contain exactly two unique groups.")
+
+    # --- Helper function to compute node-wise stats ---
+    def compute_node_stats(current_phase_matrix, current_group_labels):
+        f_vals = np.zeros(n_nodes)
+        p_vals = np.ones(n_nodes)
+        
+        for i in range(n_nodes):
+            node_phases = current_phase_matrix[:, i]
+            valid_mask = ~np.isnan(node_phases)
+            
+            if not np.any(valid_mask):
+                continue
+
+            valid_phases = node_phases[valid_mask]
+            valid_labels = current_group_labels[valid_mask]
+            
+            group_a = valid_phases[valid_labels == 0]
+            group_b = valid_phases[valid_labels == 1]
+            
+            if len(group_a) < min_animals_per_group or len(group_b) < min_animals_per_group:
+                continue
+            
+            f_stat = watson_williams_f(group_a, group_b)
+            f_vals[i] = f_stat
+            
+            # Degrees of freedom for the F-test
+            df1 = 1
+            df2 = len(group_a) + len(group_b) - 2
+            if df2 > 0:
+                p_vals[i] = 1.0 - f.cdf(f_stat, df1, df2)
+        
+        return f_vals, p_vals
+
+    # --- Helper function to find cluster masses ---
+    def find_cluster_masses(stat_map, p_map):
+        # 1. Identify suprathreshold nodes
+        suprathreshold_nodes = np.where(p_map < cluster_alpha)[0]
+        
+        if len(suprathreshold_nodes) == 0:
+            return [0.0]
+
+        # 2. Build the subgraph of only significant nodes
+        # Cosecant-Sagittal-Graph (CSGraph) operates on sparse matrices
+        adjacency = scaffold.adjacency_matrix
+        
+        # Select the part of the adjacency matrix corresponding to significant nodes
+        subgraph_adj = adjacency[suprathreshold_nodes, :][:, suprathreshold_nodes]
+        
+        # 3. Find connected components on this subgraph
+        n_clusters, labels = connected_components(
+            csgraph=subgraph_adj, directed=False, return_labels=True
+        )
+        
+        if n_clusters == 0:
+            return [0.0]
+
+        # 4. Compute cluster masses
+        cluster_masses = []
+        for i in range(n_clusters):
+            # Find which original nodes belong to this cluster
+            cluster_node_indices = suprathreshold_nodes[labels == i]
+            mass = np.sum(stat_map[cluster_node_indices])
+            cluster_masses.append(mass)
+
+        return cluster_masses
+
+    # --- 1. Compute real statistics on original data ---
+    print("Computing stats on original data...")
+    real_f_map, real_p_map = compute_node_stats(phase_matrix, group_labels)
+    real_cluster_masses = find_cluster_masses(real_f_map, real_p_map)
+    
+    # --- 2. Build null distribution via permutation ---
+    print(f"Running {n_permutations} permutations...")
+    max_cluster_mass_null = []
+    for i in range(n_permutations):
+        if (i + 1) % (n_permutations // 10 or 1) == 0:
+            print(f"  Permutation {i+1}/{n_permutations}...")
+        
+        permuted_labels = np.random.permutation(group_labels)
+        perm_f_map, perm_p_map = compute_node_stats(phase_matrix, permuted_labels)
+        perm_cluster_masses = find_cluster_masses(perm_f_map, perm_p_map)
+        max_cluster_mass_null.append(np.max(perm_cluster_masses))
+
+    max_cluster_mass_null = np.array(max_cluster_mass_null)
+
+    # --- 3. Determine significance of real clusters ---
+    print("Finalizing results...")
+    significant_cluster_indices = []
+    cluster_p_values = []
+    
+    for mass in real_cluster_masses:
+        if mass == 0:
+            p_val = 1.0
+        else:
+            # Calculate p-value as the proportion of the null distribution >= real mass
+            p_val = np.mean(max_cluster_mass_null >= mass)
+        cluster_p_values.append(p_val)
+        
+        if p_val < 0.05: # Standard significance level
+            significant_cluster_indices.append(len(significant_cluster_indices))
+    
+    # --- 4. Create final output mask and difference map ---
+    # Re-run cluster finding on real data to get labels
+    suprathreshold = np.where(real_p_map < cluster_alpha)[0]
+    subgraph_adj = scaffold.adjacency_matrix[suprathreshold, :][:, suprathreshold]
+    _, labels = connected_components(csgraph=subgraph_adj, directed=False, return_labels=True)
+    
+    final_sig_mask = np.zeros(n_nodes, dtype=bool)
+    for i, p_val in enumerate(cluster_p_values):
+        if p_val < 0.05:
+            cluster_node_indices = suprathreshold[labels == i]
+            final_sig_mask[cluster_node_indices] = True
+    
+    # Compute circular difference map for visualization
+    diff_map = np.full(n_nodes, np.nan)
+    for i in range(n_nodes):
+        node_phases = phase_matrix[:, i]
+        valid_mask = ~np.isnan(node_phases)
+        if not np.any(valid_mask): continue
+        
+        group_a = node_phases[valid_mask & (group_labels == 0)]
+        group_b = node_phases[valid_mask & (group_labels == 1)]
+        
+        if len(group_a) > 0 and len(group_b) > 0:
+            mean_a = circmean_hours(group_a, 24.0)
+            mean_b = circmean_hours(group_b, 24.0)
+            # Circular difference wrapped to [-12, 12]
+            diff = mean_b - mean_a
+            diff_map[i] = (diff + 12) % 24 - 12
+
+    return {
+        "node_f_values": real_f_map,
+        "node_p_values": real_p_map,
+        "cluster_p_values": np.array(cluster_p_values),
+        "significance_mask": final_sig_mask,
+        "difference_map": diff_map,
+        "real_cluster_masses": np.array(real_cluster_masses)
     }

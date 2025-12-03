@@ -9,6 +9,10 @@ from scipy.stats import circmean, linregress, sem
 from matplotlib.widgets import Slider, RadioButtons, Button, CheckButtons
 from matplotlib.patches import Polygon, Rectangle
 from matplotlib.path import Path
+from matplotlib.figure import Figure
+
+import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 
 import cosinor as csn
 from gui.analysis import compute_median_window_frames, preprocess_for_rhythmicity
@@ -1587,3 +1591,74 @@ class PhaseGradientViewer:
     def update_ylim(self, val):
         self.ax.set_ylim(-val, val)
         self.fig.canvas.draw_idle()
+        
+class GraphDifferenceViewer:
+    """
+    Visualizes the results of a Graph-Based Cluster Permutation Test.
+    
+    Uses a scatter plot for nodes and highlights significant clusters.
+    """
+    def __init__(self, fig: Figure, ax, scaffold, results: dict, group_labels: list = None):
+        self.fig = fig
+        self.ax = ax
+        self.scaffold = scaffold
+        self.results = results
+        self.group_labels = group_labels
+        self.draw()
+
+    def draw(self):
+        self.ax.clear()
+        
+        nodes = self.scaffold.nodes
+        diff_map = self.results['difference_map']
+        sig_mask = self.results['significance_mask']
+
+        # --- 1. Draw all nodes ---
+        # Non-significant nodes are small and gray
+        self.ax.scatter(
+            nodes[~sig_mask, 0], nodes[~sig_mask, 1],
+            s=20, c='lightgray', alpha=0.6, zorder=1
+        )
+        
+        # --- 2. Draw significant nodes, colored by phase difference ---
+        sc = self.ax.scatter(
+            nodes[sig_mask, 0], nodes[sig_mask, 1],
+            s=50,
+            c=diff_map[sig_mask],
+            cmap='coolwarm',
+            vmin=-6, vmax=6, # Symmetric range for phase difference in hours
+            edgecolor='black',
+            linewidth=1,
+            zorder=2
+        )
+        
+        # Add a colorbar
+        cbar = self.fig.colorbar(sc, ax=self.ax, orientation='vertical', pad=0.02)
+        cbar.set_label('Phase Difference (hours)', rotation=270, labelpad=15)
+
+        self.ax.set_aspect('equal', adjustable='box')
+        self.ax.invert_yaxis()
+        self.ax.set_title("Graph-Based CBPT Results (Significant Clusters)")
+        self.ax.set_xlabel("Warped X (pixels)")
+        self.ax.set_ylabel("Warped Y (pixels)")
+        
+        self.fig.tight_layout()
+        self.fig.canvas.draw_idle()
+
+    def get_export_data(self) -> (pd.DataFrame, str):
+        """Returns data for CSV export."""
+        if self.results is None:
+            return None, ""
+        
+        df = pd.DataFrame({
+            'Node_ID': np.arange(len(self.scaffold.nodes)),
+            'Node_X': self.scaffold.nodes[:, 0],
+            'Node_Y': self.scaffold.nodes[:, 1],
+            'Phase_Difference_Hours': self.results['difference_map'],
+            'F_Statistic': self.results['node_f_values'],
+            'Node_p_value': self.results['node_p_values'],
+            'Is_Significant_Cluster': self.results['significance_mask']
+        })
+        
+        filename = "graph_cbpt_results.csv"
+        return df, filename
