@@ -1,1664 +1,709 @@
+import os
+import json
 import numpy as np
 import pandas as pd
-import colorcet as cet
-from scipy.interpolate import RBFInterpolator
-from scipy.spatial import ConvexHull
-from numpy import pi, arctan2
-from scipy.stats import circmean, linregress, sem
-
-from matplotlib.widgets import Slider, RadioButtons, Button, CheckButtons
-from matplotlib.patches import Polygon, Rectangle
+from PyQt5 import QtWidgets, QtCore, QtGui
 from matplotlib.path import Path
+from matplotlib.patches import Polygon as MplPolygon
 from matplotlib.figure import Figure
-
-import matplotlib.pyplot as plt
-from matplotlib.collections import LineCollection
-
-import cosinor as csn
-from gui.analysis import compute_median_window_frames, preprocess_for_rhythmicity
-
-# ------------------------------------------------------------
-# Visualization Viewers
-# ------------------------------------------------------------
-
-class HeatmapViewer:
-    def __init__(self, fig, loaded_data, filtered_indices, phases, rhythm_scores, is_emphasized, rhythm_sort_desc, 
-                 period=None, minutes_per_frame=None, reference_phase=None, trend_window_hours=None):
-        self.fig = fig
-        self.loaded_data = loaded_data
-        self.traces_data = loaded_data["traces"]
-        self.roi_data = loaded_data["roi"]
-        self.filtered_indices = filtered_indices
-        self.is_emphasized = is_emphasized
-        self.rhythm_mask = None
-        self.emphasis_overlay = None
-        self.rhythm_sort_desc = rhythm_sort_desc
-        self.last_sort_indices = np.arange(len(self.roi_data))
-        
-        # Track the currently displayed trace so we can refresh it when params change
-        self.current_selected_index = None 
-        
-        # Analysis Parameters for On-Demand Visualization
-        self.period = period
-        self.minutes_per_frame = minutes_per_frame
-        self.reference_phase = reference_phase
-        self.trend_window_hours = trend_window_hours or 36.0
-
-        gs = self.fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.45) 
-        self.ax_heatmap = self.fig.add_subplot(gs[0])
-        self.ax_trace = self.fig.add_subplot(gs[1])
-        
-        self._prepare_normalized_data()
-        
-        self.image_artist = self.ax_heatmap.imshow(self.normalized_data.T, aspect="auto", cmap="viridis", interpolation="nearest")
-        self.ax_heatmap.set_title("Intensity Heatmap")
-        self.cbar = self.fig.colorbar(self.image_artist, ax=self.ax_heatmap, label="Normalized Intensity")
-
-        ax_radio = self.fig.add_axes([0.01, 0.7, 0.15, 0.15])
-        sort_options = ["Y-coordinate", "Phase", "Rhythmicity"]
-        if phases is None: sort_options.remove("Phase")
-        if rhythm_scores is None: sort_options.remove("Rhythmicity")
-        
-        self.radio_buttons = RadioButtons(ax_radio, sort_options)
-        self.radio_buttons.on_clicked(self.on_sort_change)
-        
-        self.ax_trace.set_xlabel("Time (frames)")
-        self.ax_trace.set_ylabel("Detrended Intensity")
-        self.ax_trace.set_title("Selected Cell Trace")
-        
-        self.trace_line = self.ax_trace.plot([], [], 'b-', alpha=0.6, label="Data")[0]
-        self.fit_line = self.ax_trace.plot([], [], 'r-', linewidth=2, label="Fit")[0]
-        self.ax_trace.legend(loc="upper right", fontsize="small")
-
-        if rhythm_scores is not None:
-            main_win = self.fig.canvas.parent().window()
-            try:
-                thr = float(main_win.phase_params["rhythm_threshold"][0].text())
-            except:
-                thr = 0.0
-            if self.rhythm_sort_desc: self.rhythm_mask = rhythm_scores >= thr
-            else: self.rhythm_mask = rhythm_scores <= thr
-        
-        self.update_phase_data(phases, rhythm_scores, self.rhythm_mask, self.rhythm_sort_desc, 
-                               period, minutes_per_frame, reference_phase, trend_window_hours)
-        
-        if sort_options: self.on_sort_change(sort_options[0])
-
-    def _prepare_normalized_data(self):
-        intensities = self.traces_data[:, 1:]
-        if intensities.size == 0: self.normalized_data = np.zeros((1, 1)); return
-        mins, maxs = intensities.min(axis=0), intensities.max(axis=0)
-        denom = maxs - mins; denom[denom == 0] = 1
-        self.normalized_data = (intensities - mins) / denom
-
-    def on_sort_change(self, label):
-        if self.normalized_data.size == 0: return
-        sort_values = self.sort_values.get(label)
-        if sort_values is None: return
-        is_descending = self.rhythm_sort_desc if label == "Rhythmicity" else False
-        if is_descending: sort_values = -sort_values
-        if self.is_emphasized and self.rhythm_mask is not None:
-            final_indices = np.lexsort((sort_values, ~self.rhythm_mask))
-        else:
-            final_indices = np.argsort(sort_values)
-        self.image_artist.set_data(self.normalized_data[:, final_indices].T)
-        self.ax_heatmap.set_ylabel(f"Cells (sorted by {label})")
-        if self.emphasis_overlay: self.emphasis_overlay.remove(); self.emphasis_overlay = None
-        if self.is_emphasized and self.rhythm_mask is not None:
-            num_rhythmic = np.sum(self.rhythm_mask)
-            total_cells = len(self.rhythm_mask)
-            if num_rhythmic < total_cells:
-                height = total_cells - num_rhythmic
-                y_start = num_rhythmic - 0.5 
-                self.emphasis_overlay = Rectangle(xy=(-0.5, y_start), width=self.normalized_data.shape[0], height=height, facecolor='black', alpha=0.6, edgecolor='none', zorder=10)
-                self.ax_heatmap.add_patch(self.emphasis_overlay)
-        self.last_sort_indices = final_indices
-        self.fig.canvas.draw_idle()
-
-    def update_phase_data(self, phases, rhythm_scores, rhythm_mask=None, sort_desc=True, 
-                          period=None, minutes_per_frame=None, reference_phase=None, trend_window_hours=None):
-        self.phases = phases
-        self.rhythm_scores = rhythm_scores
-        self.rhythm_mask = rhythm_mask
-        self.rhythm_sort_desc = sort_desc
-        
-        # Update analysis params if provided
-        if period is not None: self.period = period
-        if minutes_per_frame is not None: self.minutes_per_frame = minutes_per_frame
-        self.reference_phase = reference_phase 
-        if trend_window_hours is not None: self.trend_window_hours = trend_window_hours
-
-        self.sort_values = {"Y-coordinate": self.roi_data[:, 1]}
-        if self.phases is not None: self.sort_values["Phase"] = self.phases
-        if self.rhythm_scores is not None: self.sort_values["Rhythmicity"] = self.rhythm_scores
-        
-        current_sort = self.radio_buttons.value_selected
-        if current_sort in self.sort_values: self.on_sort_change(current_sort)
-
-        # Automatically refresh the selected trace with new params (e.g. new Ref Phase)
-        if self.current_selected_index is not None:
-            self.update_selected_trace(self.current_selected_index)
-
-    def update_rhythm_emphasis(self, rhythm_mask, is_emphasized):
-        self.is_emphasized, self.rhythm_mask = is_emphasized, rhythm_mask
-        self.on_sort_change(self.radio_buttons.value_selected)
-
-    def update_selected_trace(self, original_index):
-        # Store the current selection state
-        self.current_selected_index = original_index
-
-        # Clear previous vertical lines
-        while len(self.ax_trace.lines) > 2:
-            self.ax_trace.lines[-1].remove()
-            
-        if self.filtered_indices is not None:
-            try: current_index = np.where(self.filtered_indices == original_index)[0][0]
-            except IndexError:
-                self.trace_line.set_data([], [])
-                self.fit_line.set_data([], [])
-                self.ax_trace.set_title("Selected Cell Trace (Not in current filter)")
-                self.fig.canvas.draw_idle()
-                return
-        else: current_index = original_index
-
-        if 0 <= current_index < self.traces_data.shape[1] - 1:
-            # 1. Get Data
-            time_frames = self.traces_data[:, 0]
-            raw_intensity = self.traces_data[:, current_index + 1]
-            
-            # 2. Detrend 
-            mpf = self.minutes_per_frame or 15.0
-            trend_win = self.trend_window_hours or 36.0
-            win_frames = compute_median_window_frames(mpf, trend_win, len(raw_intensity))
-            detrended = preprocess_for_rhythmicity(raw_intensity, method="running_median", median_window_frames=win_frames)
-            
-            self.trace_line.set_data(time_frames, detrended)
-            
-            # 3. Calculate and Draw Fit
-            title_text = f"Trace for ROI {original_index + 1}"
-            
-            if self.period and self.minutes_per_frame:
-                time_hours = time_frames * (self.minutes_per_frame / 60.0)
-                res = csn.cosinor_analysis(detrended, time_hours, self.period)
-                
-                if not np.isnan(res['amplitude']):
-                    # Model: M + A * cos(w * (t - acrophase))
-                    w = 2 * np.pi / self.period
-                    model = res['mesor'] + res['amplitude'] * np.cos(w * (time_hours - res['acrophase']))
-                    self.fit_line.set_data(time_frames, model)
-                    
-                    # --- Nearest Neighbor Peak Plotting ---
-                    
-                    cell_phase_hours = res['acrophase']
-                    period_frames = self.period / (self.minutes_per_frame / 60.0)
-                    cell_peak_frame_base = (cell_phase_hours / (self.minutes_per_frame / 60.0))
-                    
-                    ref_text = ""
-                    final_peak_frame = cell_peak_frame_base
-                    
-                    if self.reference_phase is not None:
-                        # 1. Draw Reference Line (Black Dashed)
-                        ref_phase_frame = (self.reference_phase / (self.minutes_per_frame / 60.0))
-                        self.ax_trace.axvline(ref_phase_frame, color='k', linestyle='--', alpha=0.8, label='Ref Peak')
-                        
-                        # 2. Find the Cell Peak cycle closest to the Reference Line
-                        # Candidates: base, base+P, base-P, base+2P...
-                        
-                        # Calculate shift to bring cell peak closest to ref
-                        delta = ref_phase_frame - cell_peak_frame_base
-                        cycles_shift = round(delta / period_frames)
-                        
-                        candidate_frame = cell_peak_frame_base + (cycles_shift * period_frames)
-                        
-                        # 3. Safety Check: Is the candidate visible?
-                        max_frame = time_frames[-1]
-                        if 0 <= candidate_frame <= max_frame:
-                            final_peak_frame = candidate_frame
-                        else:
-                            # Fallback: if nearest is invisible, try to find ANY visible peak
-                            if 0 <= cell_peak_frame_base <= max_frame:
-                                final_peak_frame = cell_peak_frame_base
-                            else:
-                                # Try one forward shift if base is negative
-                                if cell_peak_frame_base < 0:
-                                    final_peak_frame = cell_peak_frame_base + period_frames
-                        
-                        # Calculate Delta for Text
-                        diff = (cell_phase_hours - self.reference_phase + self.period/2) % self.period - self.period/2
-                        sign = "+" if diff > 0 else ""
-                        ref_text = f" | Ref: {self.reference_phase:.1f}h | Δ: {sign}{diff:.1f}h"
-                    
-                    # Draw Cell Peak Line (Red Solid) at the calculated "Best" frame
-                    self.ax_trace.axvline(final_peak_frame, color='r', linestyle='-', alpha=0.8, label='Cell Peak')
-                    
-                    title_text += f" | Phase: {cell_phase_hours:.1f}h{ref_text}"
-                else:
-                     self.fit_line.set_data([], [])
-            else:
-                self.fit_line.set_data([], [])
-
-            self.ax_trace.set_title(title_text, fontsize=10)
-            self.ax_trace.relim()
-            self.ax_trace.autoscale_view()
-        else:
-            self.trace_line.set_data([], [])
-            self.fit_line.set_data([], [])
-            self.ax_trace.set_title("Selected Cell Trace")
-            
-        self.fig.canvas.draw_idle()
-
-    def get_export_data(self):
-        if self.normalized_data.size == 0: return None, ""
-        sorted_data = self.normalized_data[:, self.last_sort_indices].T
-        if self.filtered_indices is not None:
-            sorted_original_indices = self.filtered_indices[self.last_sort_indices]
-        else:
-            sorted_original_indices = self.last_sort_indices
-        df = pd.DataFrame(sorted_data)
-        df.columns = [f"Frame_{i}" for i in range(sorted_data.shape[1])]
-        df.insert(0, "Cell_ID", sorted_original_indices + 1)
-        return df, "heatmap_data.csv"
-
-class ContrastViewer:
-    def __init__(self, fig, ax, bg_image, com_points, on_change_callback, on_select_callback, filtered_indices=None, rois=None):
-        self.fig = fig
-        self.ax = ax
-        self.com_points = com_points
-        self.on_change_callback = on_change_callback
-        self.on_select_callback = on_select_callback
-        self.ax_heatmap = self.fig.add_subplot(gs[0])
-        self.ax_trace = self.fig.add_subplot(gs[1])
-        
-        self._prepare_normalized_data()
-        
-        self.image_artist = self.ax_heatmap.imshow(self.normalized_data.T, aspect="auto", cmap="viridis", interpolation="nearest")
-        self.ax_heatmap.set_title("Intensity Heatmap")
-        self.cbar = self.fig.colorbar(self.image_artist, ax=self.ax_heatmap, label="Normalized Intensity")
-
-        ax_radio = self.fig.add_axes([0.01, 0.7, 0.15, 0.15])
-        sort_options = ["Y-coordinate", "Phase", "Rhythmicity"]
-        if phases is None: sort_options.remove("Phase")
-        if rhythm_scores is None: sort_options.remove("Rhythmicity")
-        
-        self.radio_buttons = RadioButtons(ax_radio, sort_options)
-        self.radio_buttons.on_clicked(self.on_sort_change)
-        
-        self.ax_trace.set_xlabel("Time (frames)")
-        self.ax_trace.set_ylabel("Detrended Intensity")
-        self.ax_trace.set_title("Selected Cell Trace")
-        
-        self.trace_line = self.ax_trace.plot([], [], 'b-', alpha=0.6, label="Data")[0]
-        self.fit_line = self.ax_trace.plot([], [], 'r-', linewidth=2, label="Fit")[0]
-        self.ax_trace.legend(loc="upper right", fontsize="small")
-
-        if rhythm_scores is not None:
-            main_win = self.fig.canvas.parent().window()
-            try:
-                thr = float(main_win.phase_params["rhythm_threshold"][0].text())
-            except:
-                thr = 0.0
-            if self.rhythm_sort_desc: self.rhythm_mask = rhythm_scores >= thr
-            else: self.rhythm_mask = rhythm_scores <= thr
-        
-        self.update_phase_data(phases, rhythm_scores, self.rhythm_mask, self.rhythm_sort_desc, 
-                               period, minutes_per_frame, reference_phase, trend_window_hours)
-        
-        if sort_options: self.on_sort_change(sort_options[0])
-
-    def _prepare_normalized_data(self):
-        intensities = self.traces_data[:, 1:]
-        if intensities.size == 0: self.normalized_data = np.zeros((1, 1)); return
-        mins, maxs = intensities.min(axis=0), intensities.max(axis=0)
-        denom = maxs - mins; denom[denom == 0] = 1
-        self.normalized_data = (intensities - mins) / denom
-
-    def on_sort_change(self, label):
-        if self.normalized_data.size == 0: return
-        sort_values = self.sort_values.get(label)
-        if sort_values is None: return
-        is_descending = self.rhythm_sort_desc if label == "Rhythmicity" else False
-        if is_descending: sort_values = -sort_values
-        if self.is_emphasized and self.rhythm_mask is not None:
-            final_indices = np.lexsort((sort_values, ~self.rhythm_mask))
-        else:
-            final_indices = np.argsort(sort_values)
-        self.image_artist.set_data(self.normalized_data[:, final_indices].T)
-        self.ax_heatmap.set_ylabel(f"Cells (sorted by {label})")
-        if self.emphasis_overlay: self.emphasis_overlay.remove(); self.emphasis_overlay = None
-        if self.is_emphasized and self.rhythm_mask is not None:
-            num_rhythmic = np.sum(self.rhythm_mask)
-            total_cells = len(self.rhythm_mask)
-            if num_rhythmic < total_cells:
-                height = total_cells - num_rhythmic
-                y_start = num_rhythmic - 0.5 
-                self.emphasis_overlay = Rectangle(xy=(-0.5, y_start), width=self.normalized_data.shape[0], height=height, facecolor='black', alpha=0.6, edgecolor='none', zorder=10)
-                self.ax_heatmap.add_patch(self.emphasis_overlay)
-        self.last_sort_indices = final_indices
-        self.fig.canvas.draw_idle()
-
-    def update_phase_data(self, phases, rhythm_scores, rhythm_mask=None, sort_desc=True, 
-                          period=None, minutes_per_frame=None, reference_phase=None, trend_window_hours=None):
-        self.phases = phases
-        self.rhythm_scores = rhythm_scores
-        self.rhythm_mask = rhythm_mask
-        self.rhythm_sort_desc = sort_desc
-        
-        # Update analysis params if provided
-        if period is not None: self.period = period
-        if minutes_per_frame is not None: self.minutes_per_frame = minutes_per_frame
-        self.reference_phase = reference_phase 
-        if trend_window_hours is not None: self.trend_window_hours = trend_window_hours
-
-        self.sort_values = {"Y-coordinate": self.roi_data[:, 1]}
-        if self.phases is not None: self.sort_values["Phase"] = self.phases
-        if self.rhythm_scores is not None: self.sort_values["Rhythmicity"] = self.rhythm_scores
-        
-        current_sort = self.radio_buttons.value_selected
-        if current_sort in self.sort_values: self.on_sort_change(current_sort)
-
-        # Automatically refresh the selected trace with new params (e.g. new Ref Phase)
-        if self.current_selected_index is not None:
-            self.update_selected_trace(self.current_selected_index)
-
-    def update_rhythm_emphasis(self, rhythm_mask, is_emphasized):
-        self.is_emphasized, self.rhythm_mask = is_emphasized, rhythm_mask
-        self.on_sort_change(self.radio_buttons.value_selected)
-
-    def get_export_data(self):
-        if self.normalized_data.size == 0: return None, ""
-        sorted_data = self.normalized_data[:, self.last_sort_indices].T
-        if self.filtered_indices is not None:
-            sorted_original_indices = self.filtered_indices[self.last_sort_indices]
-        else:
-            sorted_original_indices = self.last_sort_indices
-        df = pd.DataFrame(sorted_data)
-        df.columns = [f"Frame_{i}" for i in range(sorted_data.shape[1])]
-        df.insert(0, "Cell_ID", sorted_original_indices + 1)
-        return df, "heatmap_data.csv"
-
-class ContrastViewer:
-    def __init__(self, fig, ax, bg_image, com_points, on_change_callback, on_select_callback, filtered_indices=None, rois=None):
-        self.fig = fig
-        self.ax = ax
-        self.com_points = com_points
-        self.on_change_callback = on_change_callback
-        self.on_select_callback = on_select_callback
-        self.filtered_indices = filtered_indices
-        self.rois = rois or [] # Store ROIs
-        self.highlight_artist = None
-        self.scatter_artists = []
-
-        # Reserve space at the bottom for sliders and right for colorbar (consistency)
-        self.fig.subplots_adjust(left=0.1, bottom=0.25, right=0.85, top=0.9)
-
-        self.image_artist = ax.imshow(bg_image, cmap="gray")
-        ax.set_title("Center of Mass (Click to Select Trajectory)")
-
-        # Position sliders in the reserved space
-        # Standardized positions: Slider at y=0.10, Secondary at y=0.05
-        ax_contrast = fig.add_axes([0.25, 0.10, 0.60, 0.03])
-        ax_brightness = fig.add_axes([0.25, 0.05, 0.60, 0.03])
-        
-        min_val, max_val = float(bg_image.min()), float(bg_image.max())
-        self.contrast_slider = Slider(ax=ax_contrast, label="Contrast", valmin=min_val, valmax=max_val, valinit=max_val)
-        self.brightness_slider = Slider(ax=ax_brightness, label="Brightness", valmin=min_val, valmax=max_val, valinit=min_val)
-        self.contrast_slider.on_changed(self.update)
-        self.brightness_slider.on_changed(self.update)
-        self.fig.canvas.mpl_connect('button_press_event', self.on_click)
-        self.update(None)
-        
-        self._draw_rois()    # Draw polygons
-        self._draw_scatter() # Initial drawing
-
-    def _draw_rois(self):
-        if not self.rois:
-            return
-
-        style_map = {
-            "Include": {"color": "lime", "linestyle": "-", "linewidth": 1.5},
-            "Exclude": {"color": "red", "linestyle": "-", "linewidth": 1.5},
-            "Phase Reference": {"color": "cyan", "linestyle": "--", "linewidth": 1.5},
-            "Phase Axis": {"color": "magenta", "linestyle": "-", "linewidth": 2.0}
-        }
-
-        for roi in self.rois:
-            mode = roi.get("mode", "Include")
-            verts = roi.get("path_vertices", [])
-            if not verts:
-                continue
-            
-            style = style_map.get(mode, style_map["Include"])
-            
-            # Draw Line instead of Polygon for Axis
-            if mode == "Phase Axis":
-                xs, ys = zip(*verts)
-                self.ax.plot(xs, ys, **style, label=mode)
-            else:
-                poly = Polygon(
-                    verts, 
-                    closed=True, 
-                    fill=False, 
-                    edgecolor=style["color"], 
-                    linestyle=style["linestyle"], 
-                    linewidth=style["linewidth"],
-                    label=mode
-                )
-                self.ax.add_patch(poly)
-        
-        # Optional: Add a simple legend if ROIs exist, handling duplicates
-        handles, labels = self.ax.get_legend_handles_labels()
-        if handles:
-            by_label = dict(zip(labels, handles))
-            self.ax.legend(by_label.values(), by_label.keys(), loc='upper right', fontsize='small', framealpha=0.5)
-
-    def _draw_scatter(self, rhythm_mask=None, is_emphasized=False):
-        for artist in self.scatter_artists:
-            artist.remove()
-        self.scatter_artists.clear()
-
-        if len(self.com_points) == 0:
-            self.fig.canvas.draw_idle()
-            return
-
-        if is_emphasized and rhythm_mask is not None:
-            rhythmic_pts = self.com_points[rhythm_mask]
-            non_rhythmic_pts = self.com_points[~rhythm_mask]
-            
-            if len(rhythmic_pts) > 0:
-                s1 = self.ax.plot(rhythmic_pts[:, 0], rhythmic_pts[:, 1], ".", color="red", markersize=5, alpha=0.8)[0]
-                self.scatter_artists.append(s1)
-            if len(non_rhythmic_pts) > 0:
-                s2 = self.ax.plot(non_rhythmic_pts[:, 0], non_rhythmic_pts[:, 1], ".", color="gray", markersize=3, alpha=0.4)[0]
-                self.scatter_artists.append(s2)
-        else:
-            s = self.ax.plot(self.com_points[:, 0], self.com_points[:, 1], ".", color="red", markersize=5, alpha=0.8)[0]
-            self.scatter_artists.append(s)
-        
-        self.fig.canvas.draw_idle()
-
-    def update_rhythm_emphasis(self, rhythm_mask, is_emphasized):
-        self._draw_scatter(rhythm_mask, is_emphasized)
-
-    def on_click(self, event):
-        if event.inaxes != self.ax or len(self.com_points) == 0:
-            return
-        distances = np.sqrt((self.com_points[:, 0] - event.xdata)**2 + (self.com_points[:, 1] - event.ydata)**2)
-        selected_index = np.argmin(distances) # This is the local/filtered index
-
-        if distances[selected_index] < 20:
-            # Highlight the point in this plot (uses the local index)
-            # Calculate the Original Index FIRST, then call highlight with it.
-            if self.filtered_indices is not None:
-                original_index = self.filtered_indices[selected_index]
-            else:
-                original_index = selected_index
-            
-            # This ensures the highlighting logic is consistent regardless of who called it
-            self.highlight_point(original_index)
-
-            if self.on_select_callback:
-                # Send the CORRECT, original index to the main window
-                self.on_select_callback(original_index)
-
-    def highlight_point(self, index):
-        """
-        Highlights a point. 
-        'index' is treated as the GLOBAL (Original) index.
-        We must convert it to the Local index to plot it on the filtered view.
-        """
-        if self.highlight_artist:
-            self.highlight_artist.remove()
-            self.highlight_artist = None
-        
-        local_index = None
-        if index is not None:
-            if self.filtered_indices is not None:
-                # Find where the global index exists in the filtered array
-                # This handles the case where the global index might have been filtered out
-                matches = np.where(self.filtered_indices == index)[0]
-                if len(matches) > 0:
-                    local_index = matches[0]
-                else:
-                    local_index = None
-            else:
-                # No filter active, 1:1 mapping
-                local_index = index
-
-        if local_index is not None and 0 <= local_index < len(self.com_points):
-            point = self.com_points[local_index]
-            self.highlight_artist = self.ax.plot(point[0], point[1], 'o', markersize=12, markerfacecolor='none', markeredgecolor='cyan', markeredgewidth=2)[0]
-        
-        self.fig.canvas.draw_idle()
-
-    def update(self, _):
-        vmin = self.brightness_slider.val
-        vmax = self.contrast_slider.val
-        if vmax <= vmin: vmax = vmin + 1e-6
-        self.image_artist.set_clim(vmin, vmax)
-        self.fig.canvas.draw_idle()
-        if self.on_change_callback:
-            self.on_change_callback(vmin, vmax)
-
-class GroupDifferenceViewer:
-    def __init__(self, fig, ax, diff_map, sig_mask, p_values, grid_def):
-        self.fig = fig
-        self.ax = ax
-        self.diff_map = diff_map
-        self.p_values = p_values
-        
-        # Masks
-        self.cluster_mask = sig_mask
-        self.uncorrected_mask = p_values < 0.05
-        self.current_mask = self.cluster_mask
-        self.is_uncorrected = False
-        self.show_all_mask = np.ones_like(sig_mask, dtype=bool)
-        self.is_masked = False 
-
-        # Unpack Grid Definition
-        # grid_def is (calc_x, calc_y, grid_x, grid_y, nx, ny)
-        calc_x, calc_y, _, _, _, _ = grid_def
-        
-        # Use Calculation Bins for Extent (Tight Data Limits)
-        # This matches the dimensions of diff_map (ny, nx)
-        extent = [calc_x[0], calc_x[-1], calc_y[0], calc_y[-1]]
-        
-        self.fig.subplots_adjust(left=0.1, bottom=0.25, right=0.85, top=0.9)
-        ax.set_title("Significant Phase Difference (Cluster-Corrected)")
-        
-        # 1. Layer 1: Ghost (Context)
-        self.im_ghost = ax.imshow(
-            diff_map, origin="lower", extent=extent,
-            cmap='coolwarm', alpha=0.15, vmin=-6, vmax=6
-        )
-        
-        # 2. Layer 2: Significant (Active Data)
-        masked_diff = self._apply_mask(diff_map, self.current_mask)
-        self.im_sig = ax.imshow(
-            masked_diff, origin="lower", extent=extent,
-            cmap='coolwarm', alpha=1.0, vmin=-6, vmax=6
-        )
-        
-        # 3. Contour
-        if np.any(self.cluster_mask):
-            self.contour = ax.contour(
-                self.cluster_mask, 
-                levels=[0.5], 
-                colors='black', 
-                linewidths=2,
-                origin='lower', 
-                extent=extent
-            )
-
-        # 4. Camera Zoom (Forceful Padding)
-        x_min, x_max, y_min, y_max = extent
-        width = x_max - x_min
-        height = y_max - y_min
-        
-        cx = (x_min + x_max) / 2
-        cy = (y_min + y_max) / 2
-        
-        # Force Square Viewport
-        max_range = max(width, height)
-        half_span = (max_range * 1.15) / 2 
-        
-        ax.set_xlim(cx - half_span, cx + half_span)
-        ax.set_ylim(cy - half_span, cy + half_span)
-        
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xticks([])
-        ax.set_yticks([])
-        
-        ax.invert_yaxis()
-        
-        # 5. Colorbar
-        cax = fig.add_axes([0.86, 0.25, 0.02, 0.6])
-        self.cbar = fig.colorbar(self.im_sig, cax=cax)
-        self.cbar.set_label("Phase Difference (Hours)")
-        
-        # 6. Controls
-        ax_slider = fig.add_axes([0.25, 0.10, 0.60, 0.03])
-        self.range_slider = Slider(ax=ax_slider, label="Diff Range (+/- h)", valmin=1.0, valmax=12.0, valinit=6.0)
-        self.range_slider.on_changed(self.update_clim)
-        
-        # Checkbox 1: Uncorrected
-        ax_check1 = fig.add_axes([0.05, 0.05, 0.25, 0.05], frame_on=False)
-        self.chk_uncorrected = CheckButtons(ax_check1, ["Show Uncorrected (p<0.05)"], [False])
-        self.chk_uncorrected.on_clicked(self.toggle_mode)
-        
-        # Checkbox 2: Mask
-        ax_check2 = fig.add_axes([0.30, 0.05, 0.20, 0.05], frame_on=False)
-        self.chk_mask = CheckButtons(ax_check2, ["Mask Non-Sig"], [False])
-        self.chk_mask.on_clicked(self.toggle_mask)
-        
-        # 7. Tooltip
-        self.annot = ax.annotate("", xy=(0,0), xytext=(20,20), textcoords="offset points",
-                                 bbox=dict(boxstyle="round", fc="w", alpha=0.9),
-                                 arrowprops=dict(arrowstyle="->"))
-        self.annot.set_visible(False)
-        self.fig.canvas.mpl_connect("motion_notify_event", self.hover)
-
-    def _apply_mask(self, data, mask):
-        masked = data.copy()
-        if self.is_masked:
-             masked[~mask] = np.nan
-        return masked
-
-    def toggle_mode(self, label):
-        self.is_uncorrected = not self.is_uncorrected
-        self.current_mask = self.uncorrected_mask if self.is_uncorrected else self.cluster_mask
-        self._refresh_plot()
-
-    def toggle_mask(self, label):
-        self.is_masked = not self.is_masked
-        self._refresh_plot()
-        
-    def _refresh_plot(self):
-        # Update Title
-        base_title = "Phase Difference"
-        if self.is_uncorrected: base_title += " (Uncorrected p<0.05)"
-        else: base_title += " (Cluster-Corrected)"
-        self.ax.set_title(base_title)
-
-        # Update Data
-        new_data = self._apply_mask(self.diff_map, self.current_mask)
-        self.im_sig.set_data(new_data)
-        
-        # Update Contours
-        if hasattr(self, 'contour'):
-            for c in self.contour.collections:
-                c.remove()
-                
-        if np.any(self.current_mask):
-            self.contour = self.ax.contour(
-                self.current_mask, 
-                levels=[0.5], 
-                colors='black', 
-                linewidths=1.5,
-                origin='lower', 
-                extent=self.im_sig.get_extent()
-            )
-        self.fig.canvas.draw_idle()
-
-    def update_clim(self, val):
-        self.im_ghost.set_clim(-val, val)
-        self.im_sig.set_clim(-val, val)
-        self.fig.canvas.draw_idle()
-        
-    def hover(self, event):
-        if event.inaxes != self.ax:
-            if self.annot.get_visible():
-                self.annot.set_visible(False)
-                self.fig.canvas.draw_idle()
-            return
-
-        extent = self.im_sig.get_extent()
-        arr = self.diff_map
-        ny, nx = arr.shape
-        xmin, xmax, ymin, ymax = extent
-        dx = (xmax - xmin) / nx
-        dy = (ymax - ymin) / ny
-        
-        c = int((event.xdata - xmin) / dx)
-        r = int((event.ydata - ymin) / dy)
-        
-        if 0 <= r < ny and 0 <= c < nx:
-            val = arr[r, c]
-            is_sig = self.current_mask[r, c]
-            p_val = self.p_values[r, c]
-            
-            if np.isnan(val):
-                self.annot.set_visible(False)
-                self.fig.canvas.draw_idle()
-                return
-            
-            sig_str = "**SIGNIFICANT**" if is_sig else "(Not Significant)"
-            text = f"Diff: {val:+.2f} h\np={p_val:.4f}\n{sig_str}"
-            
-            self.annot.xy = (event.xdata, event.ydata)
-            self.annot.set_text(text)
-            self.annot.set_visible(True)
-            self.fig.canvas.draw_idle()
-        else:
-            if self.annot.get_visible():
-                self.annot.set_visible(False)
-                self.fig.canvas.draw_idle()
-
-class TrajectoryInspector:
-    def __init__(self, fig, ax, trajectories, movie_stack):
-        self.fig = fig
-        self.ax = ax
-        self.trajectories = trajectories
-        self.movie_stack = movie_stack
-        self.num_frames = len(movie_stack)
-        self.num_trajectories = len(trajectories)
-        self.index = 0
-        self.vmin = None
-        self.vmax = None
-        self.bg_artist = None
-
-        # Reserve space at the bottom for controls and right for consistency
-        self.fig.subplots_adjust(left=0.1, bottom=0.25, right=0.85, top=0.9)
-
-        # --- Create Widgets ---
-        # Previous/Next buttons for trajectory index
-        # Positioned at y=0.05 to align with secondary controls
-        ax_prev = fig.add_axes([0.65, 0.05, 0.1, 0.04])
-        ax_next = fig.add_axes([0.76, 0.05, 0.1, 0.04])
-        from matplotlib.widgets import Button
-        self.btn_prev = Button(ax_prev, "Previous")
-        self.btn_next = Button(ax_next, "Next")
-        self.btn_prev.on_clicked(self.prev_trajectory)
-        self.btn_next.on_clicked(self.next_trajectory)
-
-        # Slider for frame navigation
-        # Positioned at y=0.10 to align with primary sliders
-        ax_slider = fig.add_axes([0.15, 0.10, 0.45, 0.03])
-        self.frame_slider = Slider(
-            ax=ax_slider,
-            label='Frame',
-            valmin=0,
-            valmax=self.num_frames - 1,
-            valinit=0,
-            valstep=1
-        )
-        self.frame_slider.on_changed(self.on_frame_change)
-        
-        self.update()
-
-    def on_frame_change(self, frame_index):
-        """Callback for when the frame slider is moved."""
-        self.update()
-
-    def set_trajectory(self, index):
-        """Public method to set the currently displayed trajectory by its index."""
-        if 0 <= index < self.num_trajectories:
-            self.index = index
-            self.update()
-
-    def update_contrast(self, vmin, vmax):
-        self.vmin = vmin
-        self.vmax = vmax
-        if self.bg_artist:
-            self.bg_artist.set_clim(vmin, vmax)
-            self.fig.canvas.draw_idle()
-
-    def next_trajectory(self, _):
-        if self.num_trajectories > 0:
-            self.index = (self.index + 1) % self.num_trajectories
-            self.update()
-
-    def prev_trajectory(self, _):
-        if self.num_trajectories > 0:
-            self.index = (self.index - 1 + self.num_trajectories) % self.num_trajectories
-            self.update()
-
-    def update(self):
-        self.ax.clear()
-        current_frame = int(self.frame_slider.val)
-
-        self.bg_artist = self.ax.imshow(
-            self.movie_stack[current_frame],
-            cmap="gray",
-            vmin=self.vmin,
-            vmax=self.vmax,
-        )
-        
-        if self.num_trajectories > 0:
-            traj = self.trajectories[self.index]
-            
-            # Plot the full trajectory path as a faint line
-            self.ax.plot(
-                traj[:, 1], traj[:, 0], '-', color='cyan', linewidth=1, alpha=0.7
-            )
-            
-            # Plot a prominent but non-obscuring marker at the current frame's position
-            current_pos = traj[current_frame]
-            self.ax.plot(
-                current_pos[1], current_pos[0], 'o', 
-                markersize=10, 
-                markerfacecolor=(1, 1, 0, 0.5), # Yellow with 50% transparency
-                markeredgecolor='yellow',
-                markeredgewidth=1.5
-            )
-            
-            self.ax.set_title(
-                f"Trajectory {self.index + 1} / {self.num_trajectories} (Frame {current_frame + 1}/{self.num_frames})"
-            )
-        else:
-            self.ax.set_title("No Trajectories to Display")
-
-        self.ax.set_xlim(0, self.movie_stack[0].shape[1])
-        self.ax.set_ylim(self.movie_stack[0].shape[0], 0)
-        self.fig.canvas.draw_idle()
-
-
-class PhaseMapViewer:
-    def __init__(self, fig, ax, bg_image, rhythmic_df, on_select_callback, vmin=None, vmax=None):
-        self.fig = fig
-        self.ax = ax
-        self.rhythmic_df = rhythmic_df
-        self.roi_data = self.rhythmic_df[['X_Position', 'Y_Position']].values if not self.rhythmic_df.empty else np.array([])
-        self.period_hours = self.rhythmic_df['Period_Hours'].iloc[0] if not self.rhythmic_df.empty else 24
-        self.on_select_callback = on_select_callback
-        self.highlight_artist = None
-        
-        # State for colormap
-        self.is_cyclic = True 
-        self.cmap_cyclic = cet.cm.cyclic_mygbm_30_95_c78
-        self.cmap_diverging = 'coolwarm'
-
-        # Reserve space for controls and right for colorbar
-        self.fig.subplots_adjust(left=0.1, bottom=0.25, right=0.85, top=0.9)
-
-        self.bg_artist = ax.imshow(bg_image, cmap="gray", vmin=vmin, vmax=vmax)
-        
-        if not self.rhythmic_df.empty:
-            self.scatter = ax.scatter(
-                self.rhythmic_df['X_Position'], self.rhythmic_df['Y_Position'],
-                c=self.rhythmic_df['Relative_Phase_Hours'],
-                cmap=self.cmap_cyclic, s=25, edgecolor="black", linewidth=0.5,
-            )
-            # Manual colorbar placement to prevent resizing the main plot
-            cax = fig.add_axes([0.86, 0.25, 0.02, 0.6])
-            self.cbar = fig.colorbar(self.scatter, cax=cax)
-            self.cbar.set_label("Relative Peak Time (hours)", fontsize=10)
-            
-            # Position controls in reserved space
-            # Slider at y=0.10
-            ax_slider = fig.add_axes([0.25, 0.10, 0.60, 0.03])
-            max_range = self.period_hours / 2.0
-            self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- hrs)", valmin=1.0, valmax=max_range, valinit=max_range)
-            self.range_slider.on_changed(self.update_clim)
-            
-            # Colormap Toggle Button - Positioned below slider at y=0.05
-            ax_button = fig.add_axes([0.25, 0.05, 0.15, 0.04])
-            self.cmap_btn = Button(ax_button, "Mode: Cyclic")
-            self.cmap_btn.on_clicked(self.toggle_cmap)
-            
-            self.update_clim(max_range)
-
-        ax.set_title("Spatiotemporal Phase Map (Click to Select Trajectory)")
-        ax.set_xticks([]); ax.set_yticks([])
-        self.fig.canvas.mpl_connect('button_press_event', self.on_click)
-
-    def toggle_cmap(self, event):
-        self.is_cyclic = not self.is_cyclic
-        new_cmap = self.cmap_cyclic if self.is_cyclic else self.cmap_diverging
-        label = "Mode: Cyclic" if self.is_cyclic else "Mode: Diverging"
-        self.scatter.set_cmap(new_cmap)
-        self.cmap_btn.label.set_text(label)
-        self.fig.canvas.draw_idle()
-
-    def on_click(self, event):
-        if event.inaxes != self.ax or self.rhythmic_df.empty: return
-        distances = np.sqrt((self.roi_data[:, 0] - event.xdata)**2 + (self.roi_data[:, 1] - event.ydata)**2)
-        selected_index = np.argmin(distances) # This is the ROW index of the dataframe
-        
-        if distances[selected_index] < 20:
-            # Convert Row Index -> Global Index for consistency
-            # Original_ROI_Index is 1-based, convert to 0-based Global Index
-            global_index = int(self.rhythmic_df.iloc[selected_index]['Original_ROI_Index'] - 1)
-            
-            # Highlight using the Global Index (which internal logic converts back to Row Index)
-            self.highlight_point(global_index)
-            
-            # Pass the ROW index to the callback (as expected by the current wrapper in Main)
-            if self.on_select_callback: self.on_select_callback(selected_index)
-
-    def highlight_point(self, original_index):
-        """
-        Highlights a point based on the Global Original Index.
-        Scans the dataframe to find the matching row.
-        """
-        if self.highlight_artist: self.highlight_artist.remove(); self.highlight_artist = None
-        
-        if original_index is not None and not self.rhythmic_df.empty:
-            # Find the row corresponding to this global index
-            # 'Original_ROI_Index' is 1-based in the DF, so we add 1 to the 0-based input
-            matches = self.rhythmic_df.index[self.rhythmic_df['Original_ROI_Index'] == (original_index + 1)].tolist()
-            
-            if matches:
-                row_idx = matches[0]
-                point = self.roi_data[row_idx]
-                self.highlight_artist = self.ax.plot(point[0], point[1], 'o', markersize=15, markerfacecolor='none', markeredgecolor='white', markeredgewidth=2)[0]
-                
-        self.fig.canvas.draw_idle()
-
-    def update_contrast(self, vmin, vmax):
-        if self.bg_artist is not None: self.bg_artist.set_clim(vmin, vmax); self.fig.canvas.draw_idle()
-
-    def update_clim(self, val):
-        if hasattr(self, "scatter"): self.scatter.set_clim(-val, val); self.fig.canvas.draw_idle()
-
-    def get_export_data(self):
-        return self.rhythmic_df, "phase_map_data.csv"
-        
-class GroupScatterViewer:
-    def __init__(self, fig, ax, group_df, grid_bins=None):
-        self.fig = fig
-        self.ax = ax
-        self.group_df = group_df
-        self.period_hours = self.group_df['Period_Hours'].iloc[0] if not self.group_df.empty else 24
-        
-        # State
-        self.is_cyclic = True 
-        self.cmap_cyclic = cet.cm.cyclic_mygbm_30_95_c78
-        self.cmap_diverging = 'coolwarm'
-
-        # Reserve space
-        self.fig.subplots_adjust(left=0.1, bottom=0.25, right=0.85, top=0.9)
-
-        ax.set_title("Group Phase Distribution")
-        if not self.group_df.empty:
-            # 1. Draw Grid Lines (Behind the scatter)
-            if grid_bins is not None:
-                xbins, ybins = grid_bins
-                # Use a very light style: faint gray, dotted, thin
-                grid_style = {'color': '#999999', 'linestyle': ':', 'linewidth': 0.5, 'alpha': 0.4, 'zorder': 0}
-                
-                for x in xbins:
-                    ax.axvline(x, **grid_style)
-                for y in ybins:
-                    ax.axhline(y, **grid_style)
-
-            # 2. Draw Scatter
-            self.scatter = ax.scatter(
-                self.group_df['Warped_X'], self.group_df['Warped_Y'],
-                c=self.group_df['Relative_Phase_Hours'], 
-                cmap=self.cmap_cyclic, 
-                s=25, edgecolor="black", linewidth=0.5, alpha=1.0,
-                zorder=10 # Ensure dots are on top of grid
-            )
-            # Manual colorbar placement
-            cax = fig.add_axes([0.86, 0.25, 0.02, 0.6])
-            self.cbar = fig.colorbar(self.scatter, cax=cax)
-            self.cbar.set_label("Relative Peak Time (Circadian Hours, CT)")
-            
-            # Position controls
-            ax_slider = fig.add_axes([0.25, 0.10, 0.60, 0.03])
-            max_range = self.period_hours / 2.0
-            self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- CT hrs)", valmin=1.0, valmax=max_range, valinit=max_range)
-            self.range_slider.on_changed(self.update_clim)
-            
-            # Colormap Toggle Button
-            ax_button = fig.add_axes([0.25, 0.05, 0.15, 0.04])
-            self.cmap_btn = Button(ax_button, "Mode: Cyclic")
-            self.cmap_btn.on_clicked(self.toggle_cmap)
-
-            self.update_clim(max_range)
-
-            # --- Force Square Field of View ---
-            xs = self.group_df['Warped_X']
-            ys = self.group_df['Warped_Y']
-            
-            cx = (xs.min() + xs.max()) / 2
-            cy = (ys.min() + ys.max()) / 2
-            
-            range_x = xs.max() - xs.min()
-            range_y = ys.max() - ys.min()
-            max_range = max(range_x, range_y)
-            
-            # Apply Padding and Set Limits (Match InterpMapViewer/AvgMap padding)
-            half_span = (max_range * 1.15) / 2 
-            ax.set_xlim(cx - half_span, cx + half_span)
-            ax.set_ylim(cy - half_span, cy + half_span)
-            
-        ax.set_aspect("equal", adjustable="box")
-        ax.invert_yaxis()
-        ax.set_xticks([]); ax.set_yticks([])
-
-        # Tooltip setup
-        self.annot = ax.annotate("", xy=(0,0), xytext=(20,20),textcoords="offset points",
-                                 bbox=dict(boxstyle="round", fc="w", alpha=0.9),
-                                 arrowprops=dict(arrowstyle="->"))
-        self.annot.set_visible(False)
-        self.annot.set_zorder(100) # Ensure it's on top
-        
-        self.fig.canvas.mpl_connect("motion_notify_event", self.hover)
-
-    def toggle_cmap(self, event):
-        self.is_cyclic = not self.is_cyclic
-        new_cmap = self.cmap_cyclic if self.is_cyclic else self.cmap_diverging
-        label = "Mode: Cyclic" if self.is_cyclic else "Mode: Diverging"
-        self.scatter.set_cmap(new_cmap)
-        self.cmap_btn.label.set_text(label)
-        self.fig.canvas.draw_idle()
-
-    def update_clim(self, val):
-        if hasattr(self, "scatter"): self.scatter.set_clim(-val, val); self.fig.canvas.draw_idle()
-
-    def update_annot(self, ind):
-        if len(ind["ind"]) == 0: return
-        
-        # Get data for the first point in the cluster
-        idx = ind["ind"][0]
-        pos = self.scatter.get_offsets()[idx]
-        self.annot.xy = pos
-        
-        row = self.group_df.iloc[idx]
-        
-        text = f"Animal: {row['Source_Animal']}\nPhase: {row['Relative_Phase_Hours']:.2f} h\nX: {row['Warped_X']:.1f}, Y: {row['Warped_Y']:.1f}"
-        self.annot.set_text(text)
-
-    def hover(self, event):
-        vis = self.annot.get_visible()
-        if event.inaxes == self.ax:
-            cont, ind = self.scatter.contains(event)
-            if cont:
-                self.update_annot(ind)
-                self.annot.set_visible(True)
-                self.fig.canvas.draw_idle()
-            else:
-                if vis:
-                    self.annot.set_visible(False)
-                    self.fig.canvas.draw_idle()
-
-    def get_export_data(self):
-        return self.group_df, "group_scatter_data.csv"
-
-class GroupAverageMapViewer:
-    def __init__(self, fig, ax, group_binned_df, group_scatter_df, grid_dims, do_smooth):
-        self.fig = fig
-        self.ax = ax
-        self.group_binned_df = group_binned_df
-        self.group_scatter_df = group_scatter_df
-        self.period_hours = self.group_scatter_df['Period_Hours'].iloc[0] if not self.group_scatter_df.empty else 24
-        
-        # State
-        self.is_cyclic = True 
-        self.cmap_cyclic = cet.cm.cyclic_mygbm_30_95_c78
-        self.cmap_diverging = 'coolwarm'
-
-        # Match the margins of GroupScatterViewer
-        self.fig.subplots_adjust(left=0.1, bottom=0.25, right=0.85, top=0.9)
-
-        ax.set_title("Group Average Phase Map")
-        
-        if self.group_binned_df.empty:
-            ax.text(0.5, 0.5, "No data to display.", ha='center', va='center')
-            self.fig.canvas.draw_idle()
-            return
-
-        # Handle independent X/Y dimensions (Square Pixels)
-        nx, ny = grid_dims
-        
-        # Main Phase Grid: shape is (rows, cols) -> (ny, nx)
-        binned_grid = np.full((ny, nx), np.nan)
-        
-        # Metadata Grids for Tooltip
-        self.count_grid = np.zeros((ny, nx), dtype=int)
-        self.animal_grid = {} # Key: (row, col), Value: set of animal names
-
-        # 1. Populate Grids from Data
-        # We iterate group_scatter_df to get counts and animals, 
-        # and group_binned_df to get the pre-calculated means.
-        
-        # Fill Phase Mean
-        for _, row in self.group_binned_df.iterrows():
-            ix = int(row['Grid_X_Index'])
-            iy = int(row['Grid_Y_Index'])
-            if 0 <= iy < ny and 0 <= ix < nx:
-                binned_grid[iy, ix] = row['Relative_Phase_Hours']
-
-        # Fill Metadata (Counts and Sources)
-        for _, row in self.group_scatter_df.iterrows():
-            ix = int(row['Grid_X_Index'])
-            iy = int(row['Grid_Y_Index'])
-            if 0 <= iy < ny and 0 <= ix < nx:
-                self.count_grid[iy, ix] += 1
-                if (iy, ix) not in self.animal_grid:
-                    self.animal_grid[(iy, ix)] = set()
-                self.animal_grid[(iy, ix)].add(str(row['Source_Animal']))
-
-        # 2. Apply Smoothing (if requested)
-        if do_smooth:
-            from scipy.stats import circmean
-            
-            # Create a copy to avoid "daisy-chaining" (only fill based on original data)
-            original_grid = binned_grid.copy()
-            rows, cols = original_grid.shape
-            
-            for r in range(rows):
-                for c in range(cols):
-                    # Only fill empty bins
-                    if np.isnan(original_grid[r, c]):
-                        # Check 3x3 neighborhood
-                        r_min, r_max = max(0, r-1), min(rows, r+2)
-                        c_min, c_max = max(0, c-1), min(cols, c+2)
-                        
-                        window = original_grid[r_min:r_max, c_min:c_max]
-                        valid_neighbors = window[~np.isnan(window)]
-                        
-                        if valid_neighbors.size > 0:
-                            # Convert hours to radians [-pi, pi]
-                            rads = (valid_neighbors / (self.period_hours / 2.0)) * np.pi
-                            
-                            # Circular mean centered at 0 (prevents Blue->Red wrapping error)
-                            mean_rad = circmean(rads, low=-np.pi, high=np.pi)
-                            
-                            # Convert back to hours
-                            mean_h = (mean_rad / np.pi) * (self.period_hours / 2.0)
-                            binned_grid[r, c] = mean_h
-
-        # 3. Get Data Limits (Tight) for Image Extent
-        xs = self.group_scatter_df['Warped_X']
-        ys = self.group_scatter_df['Warped_Y']
-        data_x_min, data_x_max = xs.min(), xs.max()
-        data_y_min, data_y_max = ys.min(), ys.max()
-
-        # 4. Calculate View Limits (Padded Square) for Camera Zoom
-        cx = (data_x_min + data_x_max) / 2
-        cy = (data_y_min + data_y_max) / 2
-        
-        range_x = data_x_max - data_x_min
-        range_y = data_y_max - data_y_min
-        max_range = max(range_x, range_y)
-        
-        half_span = (max_range * 1.15) / 2  # 15% padding matches other plots
-
-        # 5. Draw Image
-        self.im = ax.imshow(binned_grid, origin="lower", 
-                            extent=[data_x_min, data_x_max, data_y_min, data_y_max], 
-                            cmap=self.cmap_cyclic)
-
-        # 6. Set View limits
-        ax.set_xlim(cx - half_span, cx + half_span)
-        ax.set_ylim(cy - half_span, cy + half_span)
-        
-        ax.set_aspect("equal", adjustable="box")
-        ax.invert_yaxis()
-        ax.set_xticks([]); ax.set_yticks([])
-        
-        # 7. Tooltip Setup
-        self.annot = ax.annotate("", xy=(0,0), xytext=(20,20), textcoords="offset points",
-                                 bbox=dict(boxstyle="round", fc="w", alpha=0.9),
-                                 arrowprops=dict(arrowstyle="->"))
-        self.annot.set_visible(False)
-        self.fig.canvas.mpl_connect("motion_notify_event", self.hover)
-        
-        # Controls (Colorbar, Sliders)
-        cax = fig.add_axes([0.86, 0.25, 0.02, 0.6])
-        self.cbar = fig.colorbar(self.im, cax=cax)
-        self.cbar.set_label("Relative Peak Time (Circadian Hours, CT)")
-        
-        ax_slider = fig.add_axes([0.25, 0.10, 0.60, 0.03])
-        max_range = self.period_hours / 2.0
-        self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- CT hrs)", valmin=1.0, valmax=max_range, valinit=max_range)
-        self.range_slider.on_changed(self.update_clim)
-
-        ax_button = fig.add_axes([0.25, 0.05, 0.15, 0.04])
-        self.cmap_btn = Button(ax_button, "Mode: Cyclic")
-        self.cmap_btn.on_clicked(self.toggle_cmap)
-
-        self.update_clim(max_range)
-        self.fig.canvas.draw_idle()
-
-    def toggle_cmap(self, event):
-        self.is_cyclic = not self.is_cyclic
-        new_cmap = self.cmap_cyclic if self.is_cyclic else self.cmap_diverging
-        label = "Mode: Cyclic" if self.is_cyclic else "Mode: Diverging"
-        self.im.set_cmap(new_cmap)
-        self.cmap_btn.label.set_text(label)
-        self.fig.canvas.draw_idle()
-
-    def update_clim(self, val):
-        if hasattr(self, "im"): self.im.set_clim(-val, val); self.fig.canvas.draw_idle()
-        
-    def hover(self, event):
-        if event.inaxes != self.ax:
-            if self.annot.get_visible():
-                self.annot.set_visible(False)
-                self.fig.canvas.draw_idle()
-            return
-
-        # Get extent and shape to map mouse position to array index
-        extent = self.im.get_extent() # [xmin, xmax, ymin, ymax]
-        arr = self.im.get_array()
-        ny, nx = arr.shape
-        
-        xmin, xmax, ymin, ymax = extent
-        
-        # Calculate pixel size
-        dx = (xmax - xmin) / nx
-        dy = (ymax - ymin) / ny
-        
-        # Map mouse to index (origin='lower')
-        c = int((event.xdata - xmin) / dx)
-        r = int((event.ydata - ymin) / dy)
-        
-        if 0 <= r < ny and 0 <= c < nx:
-            val = arr[r, c]
-            
-            # 1. Check if the value is a MaskedConstant (common in mpl images)
-            if np.ma.is_masked(val):
-                self.annot.set_visible(False)
-                self.fig.canvas.draw_idle()
-                return
-            
-            # 2. Check if the value is explicitly NaN
-            if np.isnan(val):
-                self.annot.set_visible(False)
-                self.fig.canvas.draw_idle()
-                return
-            # -------------------------------------------------
-            
-            # It has a valid float value (Real or Smoothed)
-            count = self.count_grid[r, c]
-            text = f"Phase: {val:.2f} h"
-            
-            if count > 0:
-                # Real Data
-                animals = self.animal_grid.get((r, c), set())
-                # Truncate list if long
-                animal_list = sorted(list(animals))
-                if len(animal_list) > 3:
-                    source_str = f"{', '.join(animal_list[:3])}, +{len(animal_list)-3} more"
-                else:
-                    source_str = ", ".join(animal_list)
-                
-                text += f"\nN = {count} cells"
-                text += f"\nSources: {source_str}"
-            else:
-                # Smoothed Data
-                text += "\n(Interpolated)"
-                
-            self.annot.xy = (event.xdata, event.ydata)
-            self.annot.set_text(text)
-            self.annot.set_visible(True)
-            self.fig.canvas.draw_idle()
-        else:
-            if self.annot.get_visible():
-                self.annot.set_visible(False)
-                self.fig.canvas.draw_idle()
-                
-    def get_export_data(self):
-        return self.group_scatter_df, "group_binned_details_data.csv"
-
-
-class InterpolatedMapViewer:
-    def __init__(self, fig, ax, roi_data, relative_phases,
-                 period_hours, grid_resolution, rois=None):
-        self.fig = fig
-        self.ax = ax
-        self.period_hours = period_hours
-        
-        # State
-        self.is_cyclic = True 
-        self.cmap_cyclic = cet.cm.cyclic_mygbm_30_95_c78
-        self.cmap_diverging = 'coolwarm'
-
-        # Reserve space
-        self.fig.subplots_adjust(left=0.1, bottom=0.25, right=0.85, top=0.9)
-
-        ax.set_title("Interpolated Spatiotemporal Phase Map")
-
-        if len(roi_data) < 4:
-            ax.text(0.5, 0.5, "Not enough data points (<4) for interpolation.", ha="center", va="center")
-            return
-
-        phase_angles_rad = (relative_phases / (period_hours / 2.0)) * pi
-        x_comp = np.cos(phase_angles_rad)
-        y_comp = np.sin(phase_angles_rad)
-
-        # 1. Determine Geometry Bounds
-        # Start with data bounds
-        xs = roi_data[:, 0]
-        ys = roi_data[:, 1]
-        bounds_x_min, bounds_x_max = xs.min(), xs.max()
-        bounds_y_min, bounds_y_max = ys.min(), ys.max()
-        
-        # If "Include" ROIs exist, use their extent instead of just the points.
-        # This prevents clipping the anatomical border and matches the CoM view scale better.
-        if rois:
-            include_verts = []
-            for r in rois:
-                if r.get("mode") == "Include" and "path_vertices" in r:
-                    include_verts.append(np.array(r["path_vertices"]))
-            
-            if include_verts:
-                all_verts = np.vstack(include_verts)
-                roi_x_min, roi_x_max = all_verts[:, 0].min(), all_verts[:, 0].max()
-                roi_y_min, roi_y_max = all_verts[:, 1].min(), all_verts[:, 1].max()
-                
-                # Expand bounds to encompass the full ROI
-                bounds_x_min = min(bounds_x_min, roi_x_min)
-                bounds_x_max = max(bounds_x_max, roi_x_max)
-                bounds_y_min = min(bounds_y_min, roi_y_min)
-                bounds_y_max = max(bounds_y_max, roi_y_max)
-
-        # 2. Grid Generation (Buffer based on full bounds)
-        x_buf = (bounds_x_max - bounds_x_min) * 0.05
-        y_buf = (bounds_y_max - bounds_y_min) * 0.05
-        
-        grid_x_min, grid_x_max = bounds_x_min - x_buf, bounds_x_max + x_buf
-        grid_y_min, grid_y_max = bounds_y_min - y_buf, bounds_y_max + y_buf
-
-        grid_x, grid_y = np.mgrid[
-            grid_x_min:grid_x_max:complex(grid_resolution),
-            grid_y_min:grid_y_max:complex(grid_resolution),
-        ]
-        grid_points = np.vstack([grid_x.ravel(), grid_y.ravel()]).T
-
-        rbf_x = RBFInterpolator(roi_data, x_comp, kernel="linear", smoothing=1.0)
-        rbf_y = RBFInterpolator(roi_data, y_comp, kernel="linear", smoothing=1.0)
-        
-        gx = rbf_x(grid_points)
-        gy = rbf_y(grid_points)
-        
-        angles = arctan2(gy, gx)
-        
-        grid_z = (angles / pi) * (period_hours / 2.0)
-        grid_z = grid_z.reshape(grid_x.shape)
-
-        # Mask outside ROIs/hull
-        if rois:
-            final_mask = np.zeros(grid_x.shape, dtype=bool)
-            include_paths = [r["path"] for r in rois if r["mode"] == "Include"]
-            if include_paths:
-                for path in include_paths:
-                    final_mask |= path.contains_points(grid_points).reshape(grid_x.shape)
-            else:
-                if len(roi_data) > 2:
-                    hull = ConvexHull(roi_data)
-                    hpath = Path(roi_data[hull.vertices])
-                    final_mask = hpath.contains_points(grid_points).reshape(grid_x.shape)
-            for roi in rois:
-                if roi["mode"] == "Exclude":
-                    final_mask &= ~roi["path"].contains_points(grid_points).reshape(grid_x.shape)
-            grid_z[~final_mask] = np.nan
-        elif len(roi_data) > 2:
-            hull = ConvexHull(roi_data)
-            hpath = Path(roi_data[hull.vertices])
-            mask = hpath.contains_points(grid_points).reshape(grid_x.shape)
-            grid_z[~mask] = np.nan
-
-        # 3. Draw Image (Corrected Orientation)
-        self.im = ax.imshow(
-            grid_z.T,
-            origin="upper",
-            extent=[grid_x_min, grid_x_max, grid_y_max, grid_y_min], # y_max to y_min for correct orientation
-            cmap=self.cmap_cyclic,
-            interpolation="bilinear",
-        )
-
-        # 4. Camera View (Centered on Bounds + 15% padding)
-        cx = (bounds_x_min + bounds_x_max) / 2
-        cy = (bounds_y_min + bounds_y_max) / 2
-        
-        range_x = bounds_x_max - bounds_x_min
-        range_y = bounds_y_max - bounds_y_min
-        max_range = max(range_x, range_y)
-        
-        half_span = (max_range * 1.15) / 2 
-        
-        ax.set_xlim(cx - half_span, cx + half_span)
-        ax.set_ylim(cy + half_span, cy - half_span) 
-
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xticks([])
-        ax.set_yticks([])
-
-        # Manual colorbar placement
-        cax = fig.add_axes([0.86, 0.25, 0.02, 0.6])
-        self.cbar = fig.colorbar(self.im, cax=cax)
-        self.cbar.set_label("Relative Peak Time (hours)", fontsize=10)
-
-        # Position controls
-        ax_slider = fig.add_axes([0.25, 0.10, 0.60, 0.03])
-        max_range = self.period_hours / 2.0
-        self.range_slider = Slider(
-            ax=ax_slider,
-            label='Phase Range (+/- hrs)',
-            valmin=1.0,
-            valmax=max_range,
-            valinit=max_range,
-        )
-        self.range_slider.on_changed(self.update_clim)
-        
-        # Colormap Toggle Button
-        ax_button = fig.add_axes([0.25, 0.05, 0.15, 0.04])
-        self.cmap_btn = Button(ax_button, "Mode: Cyclic")
-        self.cmap_btn.on_clicked(self.toggle_cmap)
-        
-        self.update_clim(max_range)
-
-    def toggle_cmap(self, event):
-        self.is_cyclic = not self.is_cyclic
-        new_cmap = self.cmap_cyclic if self.is_cyclic else self.cmap_diverging
-        label = "Mode: Cyclic" if self.is_cyclic else "Mode: Diverging"
-        self.im.set_cmap(new_cmap)
-        self.cmap_btn.label.set_text(label)
-        self.fig.canvas.draw_idle()
-
-    def update_clim(self, val):
-        # assumes image exists
-        for im in self.ax.images:
-            im.set_clim(-val, val)
-        self.fig.canvas.draw_idle()
-
-class PhaseGradientViewer:
-    def __init__(self, fig, ax, gradient_data):
-        """
-        Visualizes Phase vs Anatomical Position (s) and calculates shape metrics.
-        """
-        self.fig = fig
-        self.ax = ax
-        self.gradient_data = gradient_data
-        
-        # Reserve space for slider
-        self.fig.subplots_adjust(left=0.15, bottom=0.20, right=0.95, top=0.9)
-        ax.set_title("Dorsoventral Phase Gradient")
-        ax.set_xlabel("Anatomical Position (s)\n(0.0 = Dorsal/Start, 1.0 = Ventral/End)")
-        ax.set_ylabel("Relative Phase (CT Hours)")
-        ax.grid(True, linestyle=':', alpha=0.6)
-        
-        if not gradient_data:
-            ax.text(0.5, 0.5, "No gradient data available.", ha='center')
-            self.fig.canvas.draw_idle()
-            return
-
-        # 1. Plot Individual Animals & Collect Metrics
-        all_phases_matrix = [] 
-        
-        # Metrics storage
-        animal_slopes = []
-        animal_vars = [] # Gradient Variance (The Shape Metric)
-        
-        # We assume the bin centers 's' are consistent across animals 
-        # (since they are generated by linspace(0,1,11) in group_view)
-        # But we must handle gaps.
-        
-        for entry in gradient_data:
-            s = entry['s']
-            p = entry['phases']
-            
-            # Plot trace
-            ax.plot(s, p, color='gray', alpha=0.3, linewidth=1)
-            ax.scatter(s, p, color='gray', alpha=0.3, s=10)
-            all_phases_matrix.append(p)
-            
-            # --- Per-Animal Metrics ---
-            # Filter NaNs
-            mask = ~np.isnan(p)
-            s_clean = s[mask]
-            p_clean = p[mask]
-            
-            if len(s_clean) > 2:
-                # A. Global Slope
-                slope, _, _, _, _ = linregress(s_clean, p_clean)
-                animal_slopes.append(slope)
-                
-                # B. Gradient Variance (Local Slope Variance)
-                # Calculate derivatives: dy/dx
-                dy = np.diff(p_clean)
-                dx = np.diff(s_clean)
-                
-                # Avoid division by zero (shouldn't happen with unique s bins)
-                valid_dx = dx > 0
-                if np.any(valid_dx):
-                    local_slopes = dy[valid_dx] / dx[valid_dx]
-                    # Calculate variance of these slopes
-                    grad_var = np.var(local_slopes)
-                    animal_vars.append(grad_var)
-        
-        # 2. Calculate Group Mean Profile (For Visualization Only)
-        all_phases_matrix = np.array(all_phases_matrix)
-        group_mean_profile = []
-        
-        # Use first entry's s-axis for plotting the mean
-        valid_s = gradient_data[0]['s']
-        
-        for col in range(all_phases_matrix.shape[1]):
-            col_data = all_phases_matrix[:, col]
-            valid_data = col_data[~np.isnan(col_data)]
-            
-            if len(valid_data) > 0:
-                rads = (valid_data / 24.0) * 2 * np.pi
-                m_rad = circmean(rads, low=-np.pi, high=np.pi)
-                m_h = (m_rad / (2 * np.pi)) * 24.0
-                group_mean_profile.append(m_h)
-            else:
-                group_mean_profile.append(np.nan)
-        
-        group_mean_profile = np.array(group_mean_profile)
-        
-        # 3. Plot Group Mean
-        ax.plot(valid_s, group_mean_profile, color='blue', linewidth=3, label='Group Mean')
-        ax.scatter(valid_s, group_mean_profile, color='blue', s=50, zorder=5)
-        
-        # 4. Display Statistics (Mean of Per-Animal Metrics)
-        stats_text = "Group Metrics (Mean ± SEM):\n"
-        
-        if len(animal_slopes) > 0:
-            mean_slope = np.mean(animal_slopes)
-            sem_slope = sem(animal_slopes)
-            stats_text += f"Slope: {mean_slope:.2f} ± {sem_slope:.2f}\n"
-            
-        if len(animal_vars) > 0:
-            mean_var = np.mean(animal_vars)
-            sem_var = sem(animal_vars)
-            stats_text += f"Grad Var: {mean_var:.1f} ± {sem_var:.1f}"
-            
-        # Add Step Amplitude for context (Calculated on Group Mean for robustness against noise)
-        mask = ~np.isnan(group_mean_profile)
-        s_clean = valid_s[mask]
-        p_clean = group_mean_profile[mask]
-        if len(s_clean) > 0:
-             dorsal_mask = s_clean <= 0.5
-             ventral_mask = s_clean > 0.5
-             if np.sum(dorsal_mask) > 0 and np.sum(ventral_mask) > 0:
-                d_mean = np.mean(p_clean[dorsal_mask])
-                v_mean = np.mean(p_clean[ventral_mask])
-                step_amp = v_mean - d_mean
-                stats_text += f"\nStep Amp: {step_amp:.2f} h"
-
-        ax.legend(loc='upper left')
-        
-        props = dict(boxstyle='round', facecolor='white', alpha=0.8)
-        ax.text(0.95, 0.05, stats_text, transform=ax.transAxes, fontsize=10,
-                verticalalignment='bottom', horizontalalignment='right', bbox=props)
-        
-        # 5. Range Slider
-        ax_slider = fig.add_axes([0.25, 0.05, 0.50, 0.03])
-        self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- h)", valmin=1.0, valmax=12.0, valinit=8.0)
-        self.range_slider.on_changed(self.update_ylim)
-        
-        self.update_ylim(8.0) 
-
-    def get_export_data(self):
-        """
-        Export the gradient data to a DataFrame.
-        """
-        rows = []
-        for entry in self.gradient_data:
-            animal = entry['animal']
-            s_vals = entry['s']
-            p_vals = entry['phases']
-            
-            for i in range(len(s_vals)):
-                # Include NaNs so gaps are explicit in the CSV
-                val = p_vals[i]
-                rows.append({
-                    'Animal_ID': animal,
-                    'Anatomical_Pos_s': s_vals[i],
-                    'Relative_Phase_CT': val,
-                    'Bin_Index': i
-                })
-        
-        df = pd.DataFrame(rows)
-        return df, "phase_gradient_data.csv"
-
-    def update_ylim(self, val):
-        self.ax.set_ylim(-val, val)
-        self.fig.canvas.draw_idle()
-        
-class GraphDifferenceViewer:
+from matplotlib.backends.backend_qt5agg import (
+    FigureCanvasQTAgg as FigureCanvas,
+    NavigationToolbar2QT as NavigationToolbar,
+)
+from scipy.stats import circmean, f as f_dist
+from skimage.draw import polygon as draw_polygon
+
+from gui.utils import Tooltip, add_mpl_to_tab, clear_layout, project_points_to_polyline
+from gui.viewers import GroupScatterViewer, GroupAverageMapViewer, PhaseGradientViewer
+from gui.statistics import watson_williams_f
+from gui.dialogs.roi_drawer import ROIDrawerDialog
+from gui.theme import get_icon
+
+# -----------------------------------------------------------------------------
+# Visualization Classes
+# -----------------------------------------------------------------------------
+
+class RegionResultViewer(QtWidgets.QWidget):
     """
-    Visualizes the results of a Graph-Based Cluster Permutation Test.
+    Visualizes the results of the Region-Based Analysis.
+    Tab 1: Atlas Map colored by Phase Difference.
+    Tab 2: Statistical Table.
+    """
+    def __init__(self, zone_stats, atlas_polys_by_zone, parent=None):
+        super().__init__(parent)
+        self.zone_stats = zone_stats
+        self.atlas_polys = atlas_polys_by_zone
+        
+        layout = QtWidgets.QVBoxLayout(self)
+        
+        self.tabs = QtWidgets.QTabWidget()
+        layout.addWidget(self.tabs)
+        
+        # 1. Map Tab
+        self.map_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.map_tab, "Region Map")
+        map_layout = QtWidgets.QVBoxLayout(self.map_tab)
+        
+        self.fig = Figure(figsize=(8, 6))
+        self.canvas = FigureCanvas(self.fig)
+        self.toolbar = NavigationToolbar(self.canvas, self.map_tab)
+        map_layout.addWidget(self.toolbar)
+        map_layout.addWidget(self.canvas)
+        
+        # 2. Table Tab
+        self.table_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.table_tab, "Stats Table")
+        table_layout = QtWidgets.QVBoxLayout(self.table_tab)
+        self.stats_table = QtWidgets.QTableWidget()
+        table_layout.addWidget(self.stats_table)
+        
+        self._draw_map()
+        self._populate_table()
+
+    def _draw_map(self):
+        ax = self.fig.add_subplot(111)
+        ax.set_title("Region Phase Differences (Exp - Ctrl)\n* = Significant (p < 0.05)")
+        ax.set_aspect('equal')
+        
+        # Colormap setup: Blue (Early) -> White -> Red (Late)
+        import matplotlib.cm as cm
+        import matplotlib.colors as mcolors
+        norm = mcolors.Normalize(vmin=-4, vmax=4)
+        mapper = cm.ScalarMappable(norm=norm, cmap='coolwarm')
+        
+        all_x, all_y = [], []
+
+        for stat in self.zone_stats:
+            zid = stat['id']
+            diff = stat.get('diff_mean', 0)
+            is_sig = stat.get('p_value', 1.0) < 0.05
+            
+            color = mapper.to_rgba(diff)
+            
+            polys = self.atlas_polys.get(zid, [])
+            for poly_path in polys:
+                verts = poly_path.vertices # Path object vertices
+                all_x.extend(verts[:, 0])
+                all_y.extend(verts[:, 1])
+                
+                poly = MplPolygon(verts, closed=True, facecolor=color, edgecolor='black', linewidth=1, alpha=0.8)
+                ax.add_patch(poly)
+                
+                # Significance Marker
+                cx, cy = np.mean(verts[:, 0]), np.mean(verts[:, 1])
+                if is_sig:
+                    ax.text(cx, cy, "*", fontsize=24, ha='center', va='center', color='black', weight='bold')
+                
+                # Label
+                ax.text(cx, cy, f"\n{diff:+.1f}h", fontsize=9, ha='center', va='top', color='black', weight='bold')
+
+        if all_x:
+            pad = 50
+            ax.set_xlim(min(all_x)-pad, max(all_x)+pad)
+            ax.set_ylim(max(all_y)+pad, min(all_y)-pad) # Invert Y for imaging convention
+        
+        # Colorbar
+        cbar = self.fig.colorbar(mapper, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
+        cbar.set_label("Phase Difference (Hours)")
+        cbar.set_ticks([-4, 0, 4])
+        cbar.set_ticklabels(["-4h (Earlier)", "0h", "+4h (Later)"])
+        
+        self.canvas.draw()
+
+    def _populate_table(self):
+        cols = ["Zone ID", "Name", "N(Ctrl)", "N(Exp)", "Mean(Ctrl)", "Mean(Exp)", "Diff", "p-value"]
+        self.stats_table.setColumnCount(len(cols))
+        self.stats_table.setHorizontalHeaderLabels(cols)
+        self.stats_table.setRowCount(len(self.zone_stats))
+        
+        for r, stat in enumerate(self.zone_stats):
+            self.stats_table.setItem(r, 0, QtWidgets.QTableWidgetItem(str(stat['id'])))
+            self.stats_table.setItem(r, 1, QtWidgets.QTableWidgetItem(str(stat['name'])))
+            self.stats_table.setItem(r, 2, QtWidgets.QTableWidgetItem(str(stat.get('n_ctrl', 0))))
+            self.stats_table.setItem(r, 3, QtWidgets.QTableWidgetItem(str(stat.get('n_exp', 0))))
+            self.stats_table.setItem(r, 4, QtWidgets.QTableWidgetItem(f"{stat.get('mean_ctrl', np.nan):.2f}"))
+            self.stats_table.setItem(r, 5, QtWidgets.QTableWidgetItem(f"{stat.get('mean_exp', np.nan):.2f}"))
+            
+            diff_item = QtWidgets.QTableWidgetItem(f"{stat.get('diff_mean', np.nan):+.2f}")
+            if stat.get('diff_mean', 0) > 0: diff_item.setForeground(QtGui.QColor('red'))
+            else: diff_item.setForeground(QtGui.QColor('blue'))
+            self.stats_table.setItem(r, 6, diff_item)
+            
+            p = stat.get('p_value', np.nan)
+            p_str = "< 0.001" if p < 0.001 else f"{p:.4f}"
+            p_item = QtWidgets.QTableWidgetItem(p_str)
+            if p < 0.05:
+                p_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Bold))
+                p_item.setBackground(QtGui.QColor("#d4edda")) # Light green
+            self.stats_table.setItem(r, 7, p_item)
+            
+        self.stats_table.resizeColumnsToContents()
+
+    def get_export_data(self):
+        # Flatten stats to DF
+        data = []
+        for s in self.zone_stats:
+            row = s.copy()
+            if 'data' in row: del row['data'] 
+            data.append(row)
+        return pd.DataFrame(data), "region_stats.csv"
+
+# -----------------------------------------------------------------------------
+# Main Panel
+# -----------------------------------------------------------------------------
+
+class GroupViewPanel(QtWidgets.QWidget):
+    def __init__(self, main_window):
+        super().__init__(main_window)
+        self.mw = main_window
+        self.state = main_window.state
+        self.zones_polygons_map = {} 
+        self.init_ui()
+        self.connect_signals()
+
+    def init_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        box = QtWidgets.QGroupBox("Group Data Setup")
+        b = QtWidgets.QVBoxLayout(box)
+        
+        # File List
+        self.group_list = QtWidgets.QTreeWidget()
+        self.group_list.setHeaderLabels(["File Path", "Group"])
+        self.group_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        b.addWidget(self.group_list)
+        
+        # Add/Remove Buttons
+        row = QtWidgets.QHBoxLayout()
+        self.btn_add_group = QtWidgets.QPushButton(get_icon('fa5s.plus'), "Add Warped ROI File(s)...")
+        self.btn_remove_group = QtWidgets.QPushButton(get_icon('fa5s.minus'), "Remove Selected")
+        row.addWidget(self.btn_add_group)
+        row.addWidget(self.btn_remove_group)
+        b.addLayout(row)
+        
+        # Group Assignment Buttons
+        assign_row = QtWidgets.QHBoxLayout()
+        self.btn_assign_control = QtWidgets.QPushButton("Set Selected as Control")
+        self.btn_assign_exp = QtWidgets.QPushButton("Set Selected as Experiment")
+        assign_row.addWidget(self.btn_assign_control)
+        assign_row.addWidget(self.btn_assign_exp)
+        b.addLayout(assign_row)
+        
+        # Continuous Map Parameters
+        param_box = QtWidgets.QGroupBox("Continuous Map Parameters")
+        param_layout = QtWidgets.QFormLayout(param_box)
+        self.group_grid_res_edit = QtWidgets.QLineEdit("50")
+        self.group_smooth_check = QtWidgets.QCheckBox("Smooth to fill empty bins")
+        param_layout.addRow("Grid Resolution:", self.group_grid_res_edit)
+        param_layout.addRow(self.group_smooth_check)
+        b.addWidget(param_box)        
+        
+        # Regional Analysis Setup
+        region_box = QtWidgets.QGroupBox("Regional Analysis Setup")
+        region_layout = QtWidgets.QFormLayout(region_box)
+        
+        # Atlas Template Loader
+        atlas_box = QtWidgets.QWidget()
+        atlas_layout = QtWidgets.QHBoxLayout(atlas_box)
+        atlas_layout.setContentsMargins(0, 0, 0, 0)
+        self.btn_load_atlas = QtWidgets.QPushButton(get_icon('fa5s.map'), "Load Atlas Template...")
+        self.atlas_path_label = QtWidgets.QLineEdit()
+        self.atlas_path_label.setPlaceholderText("No Atlas Loaded")
+        self.atlas_path_label.setReadOnly(True)
+        atlas_layout.addWidget(self.btn_load_atlas)
+        atlas_layout.addWidget(self.atlas_path_label)
+        region_layout.addRow("Atlas Template:", atlas_box)
+        
+        # Define Regions Button
+        self.btn_define_regions = QtWidgets.QPushButton(get_icon('fa5s.draw-polygon'), "Define Analysis Regions...")
+        self.region_status_label = QtWidgets.QLabel("No regions defined")
+        self.region_status_label.setStyleSheet("color: gray; font-style: italic;")
+        region_layout.addRow(self.btn_define_regions, self.region_status_label)
+
+        # Stats Parameters
+        self.min_region_cells_spin = QtWidgets.QSpinBox()
+        self.min_region_cells_spin.setRange(1, 100)
+        self.min_region_cells_spin.setValue(10)
+        region_layout.addRow("Min Cells / Region / Animal:", self.min_region_cells_spin)
+
+        self.min_animals_spin = QtWidgets.QSpinBox()
+        self.min_animals_spin.setRange(2, 50)
+        self.min_animals_spin.setValue(3)
+        region_layout.addRow("Min Animals / Group (Stats):", self.min_animals_spin)
+
+        b.addWidget(region_box)
+        
+        # Generate Button
+        self.btn_view_group = QtWidgets.QPushButton(get_icon('fa5s.chart-pie'), "Generate Group Visualizations")
+        Tooltip.install(self.btn_view_group, "Runs Continuous Grid analysis, Gradient analysis (if axes present), and Regional Statistical analysis.")
+        self.btn_view_group.setEnabled(False)
+        b.addWidget(self.btn_view_group)
+        
+        layout.addWidget(box)
+        layout.addStretch(1)
+
+    def connect_signals(self):
+        self.btn_add_group.clicked.connect(self.add_group_files)
+        self.btn_remove_group.clicked.connect(self.remove_group_file)
+        self.btn_view_group.clicked.connect(self.generate_group_visualizations)
+        self.btn_load_atlas.clicked.connect(self.load_atlas_template)
+        self.btn_assign_control.clicked.connect(lambda: self.assign_group("Control"))
+        self.btn_assign_exp.clicked.connect(lambda: self.assign_group("Experiment"))
+        self.btn_define_regions.clicked.connect(self.define_regions)
+        self.mw.btn_export_data.clicked.connect(self.export_current_data)
     
-    Uses a scatter plot for nodes and highlights significant clusters.
-    """
-    def __init__(self, fig: Figure, ax, scaffold, results: dict, group_labels: list = None):
-        self.fig = fig
-        self.ax = ax
-        self.scaffold = scaffold
-        self.results = results
-        self.group_labels = group_labels
-        self.draw()
+    def assign_group(self, group_name: str):
+        selected_items = self.group_list.selectedItems()
+        if not selected_items:
+            QtWidgets.QMessageBox.information(self, "No Selection", "Please select one or more files to assign.")
+            return
+        for item in selected_items:
+            item.setText(1, group_name)
+            item.setForeground(1, QtGui.QColor('blue') if group_name == "Control" else QtGui.QColor('red'))
+    
+    def define_regions(self):
+        """Draw/Edit regions using the ROI Drawer on top of the Atlas."""
+        atlas_path = self.state.atlas_roi_path
+        if not atlas_path or not os.path.exists(atlas_path):
+            QtWidgets.QMessageBox.warning(self, "No Atlas", "Please load an Atlas Template first.")
+            return
 
-    def draw(self):
-        self.ax.clear()
-        
-        nodes = self.scaffold.nodes
-        diff_map = self.results['difference_map']
-        sig_mask = self.results['significance_mask']
+        try:
+            with open(atlas_path, 'r') as f:
+                atlas_rois = json.load(f)
+            
+            all_verts = []
+            for r in atlas_rois:
+                if 'path_vertices' in r: all_verts.extend(r['path_vertices'])
+            
+            if not all_verts: return
+            all_verts = np.array(all_verts)
+            max_x, max_y = np.max(all_verts[:, 0]), np.max(all_verts[:, 1])
+            bg_image = np.zeros((int(max_y) + 50, int(max_x) + 50), dtype=float)
+            
+            # Draw atlas Include polygons in Gray
+            for r in atlas_rois:
+                if r.get('mode') == 'Include':
+                    poly = np.array(r['path_vertices'])
+                    rr, cc = draw_polygon(poly[:, 1], poly[:, 0], shape=bg_image.shape)
+                    bg_image[rr, cc] = 0.3 
+            
+            region_file = atlas_path.replace('_anatomical_roi.json', '_anatomical_regions.json')
+            existing_regions = []
+            if os.path.exists(region_file):
+                with open(region_file, 'r') as f: existing_regions = json.load(f)
 
-        # --- 1. Draw all nodes ---
-        # Non-significant nodes are small and gray
-        self.ax.scatter(
-            nodes[~sig_mask, 0], nodes[~sig_mask, 1],
-            s=20, c='lightgray', alpha=0.6, zorder=1
+            def save_callback(indices, rois_list, refs_list):
+                final_list = (rois_list or []) + (refs_list or [])
+                if not final_list: return
+                serializable = []
+                for r in final_list:
+                    verts = r["path_vertices"]
+                    if hasattr(verts, 'tolist'): verts = verts.tolist()
+                    elif isinstance(verts, np.ndarray): verts = verts.tolist()
+                    item = {"path_vertices": verts, "mode": r["mode"]}
+                    for k in ["zone_id", "lobe", "name"]:
+                        if k in r: item[k] = r[k]
+                    serializable.append(item)
+                with open(region_file, 'w') as f: json.dump(serializable, f, indent=4)
+                self.mw.log_message(f"Saved {len(serializable)} regions.")
+                self.region_status_label.setText(f"{len(serializable)} regions loaded.")
+                self.region_status_label.setStyleSheet("color: green; font-weight: bold;")
+
+            dlg = ROIDrawerDialog(self.mw, bg_image, None, None, save_callback, vmin=0, vmax=1, is_region_mode=True)
+            if existing_regions:
+                dlg.rois = existing_regions
+                dlg.redraw_finished_rois()
+            dlg.exec_()
+
+        except Exception as e:
+            self.mw.log_message(f"Error launching region definition: {e}")
+
+    def load_atlas_template(self):
+        start_dir = self.mw._get_last_dir()
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select Master Atlas ROI", start_dir, "JSON files (*.json)"
         )
+        if not path: return
+        self.mw._set_last_dir(path)
+        self.state.atlas_roi_path = path
+        self.atlas_path_label.setText(os.path.basename(path))
         
-        # --- 2. Draw significant nodes, colored by phase difference ---
-        sc = self.ax.scatter(
-            nodes[sig_mask, 0], nodes[sig_mask, 1],
-            s=50,
-            c=diff_map[sig_mask],
-            cmap='coolwarm',
-            vmin=-6, vmax=6, # Symmetric range for phase difference in hours
-            edgecolor='black',
-            linewidth=1,
-            zorder=2
+        # Check for existing regions file
+        region_file = path.replace('_anatomical_roi.json', '_anatomical_regions.json')
+        if os.path.exists(region_file):
+            with open(region_file, 'r') as f: regions = json.load(f)
+            self.region_status_label.setText(f"{len(regions)} regions found.")
+            self.region_status_label.setStyleSheet("color: green;")
+
+    def add_group_files(self):
+        start_dir = self.mw._get_last_dir()
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Select Warped ROI Files", start_dir, "Warped ROI files (*_roi_warped.csv)"
         )
-        
-        # Add a colorbar
-        cbar = self.fig.colorbar(sc, ax=self.ax, orientation='vertical', pad=0.02)
-        cbar.set_label('Phase Difference (hours)', rotation=270, labelpad=15)
+        if not files: return
+        self.mw._set_last_dir(files[0])
+        for f in files:
+            if f not in self.state.group_data_paths:
+                self.state.group_data_paths.append(f)
+                item = QtWidgets.QTreeWidgetItem(self.group_list)
+                item.setText(0, f)
+                item.setText(1, "Unassigned")
+        self._update_group_view_button()
 
-        self.ax.set_aspect('equal', adjustable='box')
-        self.ax.invert_yaxis()
-        self.ax.set_title("Graph-Based CBPT Results (Significant Clusters)")
-        self.ax.set_xlabel("Warped X (pixels)")
-        self.ax.set_ylabel("Warped Y (pixels)")
-        
-        self.fig.tight_layout()
-        self.fig.canvas.draw_idle()
+    def remove_group_file(self):
+        selected_items = self.group_list.selectedItems()
+        for item in selected_items:
+            path = item.text(0)
+            if path in self.state.group_data_paths:
+                self.state.group_data_paths.remove(path)
+            (item.parent() or self.group_list.invisibleRootItem()).removeChild(item)
+        self._update_group_view_button()
 
-    def get_export_data(self) -> (pd.DataFrame, str):
-        """Returns data for CSV export."""
-        if self.results is None:
-            return None, ""
+    def _update_group_view_button(self):
+        self.btn_view_group.setEnabled(len(self.state.group_data_paths) > 0)
+
+    # -------------------------------------------------------------------------
+    # Analysis Logic
+    # -------------------------------------------------------------------------
+
+    def generate_group_visualizations(self):
+        self.mw.log_message("--- Starting Group Analysis ---")
         
-        df = pd.DataFrame({
-            'Node_ID': np.arange(len(self.scaffold.nodes)),
-            'Node_X': self.scaffold.nodes[:, 0],
-            'Node_Y': self.scaffold.nodes[:, 1],
-            'Phase_Difference_Hours': self.results['difference_map'],
-            'F_Statistic': self.results['node_f_values'],
-            'Node_p_value': self.results['node_p_values'],
-            'Is_Significant_Cluster': self.results['significance_mask']
-        })
+        # 1. Validation
+        if not self.state.group_data_paths: return
+        atlas_path = self.state.atlas_roi_path
+        if not atlas_path:
+            self.mw.log_message("Error: No Atlas Template loaded.")
+            return
+
+        # 2. Load Regions
+        region_file = atlas_path.replace('_anatomical_roi.json', '_anatomical_regions.json')
+        if not os.path.exists(region_file):
+            self.mw.log_message(f"Error: Regions file not found. Please Define Regions first.")
+            return
+
+        try:
+            with open(region_file, 'r') as f: raw_regions = json.load(f)
+            self.zones = {} 
+            self.zones_polygons_map = {} 
+            
+            for r in raw_regions:
+                if 'zone_id' not in r: continue
+                zid = r['zone_id']
+                if zid not in self.zones:
+                    self.zones[zid] = {'name': r.get('name', f"Zone {zid}"), 'polygons': []}
+                    self.zones_polygons_map[zid] = []
+                
+                path_obj = Path(np.array(r['path_vertices']))
+                self.zones[zid]['polygons'].append(path_obj)
+                self.zones_polygons_map[zid].append(path_obj)
+            
+            self.mw.log_message(f"Loaded {len(self.zones)} anatomical zones.")
+        except Exception as e:
+            self.mw.log_message(f"Error parsing regions: {e}")
+            return
+
+        # 3. Load Animal Data
+        all_dfs = []
+        try:
+            group_map = {}
+            root = self.group_list.invisibleRootItem()
+            for i in range(root.childCount()):
+                item = root.child(i)
+                group_map[item.text(0)] = item.text(1)
+
+            for roi_path in self.state.group_data_paths:
+                base = os.path.basename(roi_path).replace('_roi_warped.csv', '')
+                group = group_map.get(roi_path, "Unassigned")
+                if group not in ["Control", "Experiment"]: continue
+                
+                rhythm_path = roi_path.replace("_roi_warped.csv", "_rhythm_results.csv")
+                if not os.path.exists(rhythm_path): 
+                     self.mw.log_message(f"Skipping {base}: No rhythm results.")
+                     continue
+                
+                coords = np.loadtxt(roi_path, delimiter=",")
+                rhythm_df = pd.read_csv(rhythm_path)
+                
+                # Check consistency
+                if len(coords) != len(rhythm_df):
+                    self.mw.log_message(f"Warning: Length mismatch in {base}. Skipping.")
+                    continue
+                    
+                mask = rhythm_df['Is_Rhythmic'].astype(bool).values
+                if not np.any(mask): continue
+
+                # Standardize to CT
+                phases = rhythm_df['Phase_Hours'][mask].values
+                periods = rhythm_df['Period_Hours'][mask].values
+                phases_ct = (phases / periods) * 24.0
+                
+                df = pd.DataFrame({
+                    'Animal': base, 'Group': group,
+                    'X': coords[mask, 0], 'Y': coords[mask, 1],
+                    'Phase_CT': phases_ct
+                })
+                all_dfs.append(df)
+
+            if not all_dfs:
+                self.mw.log_message("No valid animal data found.")
+                return
+            master_df = pd.concat(all_dfs, ignore_index=True)
+
+            # 4. Global Normalization
+            ctrl_phases = master_df[master_df['Group'] == 'Control']['Phase_CT'].values
+            if len(ctrl_phases) == 0:
+                self.mw.log_message("Error: No control cells found for normalization.")
+                return
+            
+            # Grand Control Mean
+            rads = (ctrl_phases / 24.0) * (2 * np.pi)
+            ref_rad = circmean(rads)
+            ref_phase = (ref_rad / (2 * np.pi)) * 24.0
+            
+            master_df['Rel_Phase'] = (master_df['Phase_CT'] - ref_phase + 12.0) % 24.0 - 12.0
+            self.mw.log_message(f"Normalized to Control Mean Phase: {ref_phase:.2f}h")
+
+            # --- PART A: CONTINUOUS GRID MAPS ---
+            self._generate_continuous_maps(master_df)
+
+            # --- PART B: GRADIENT ANALYSIS (Legacy) ---
+            self._generate_gradient_analysis(master_df)
+
+            # --- PART C: REGIONAL STATS ---
+            self._generate_regional_stats(master_df)
+
+        except Exception as e:
+            self.mw.log_message(f"Analysis Error: {e}")
+            import traceback
+            self.mw.log_message(traceback.format_exc())
+
+    def _generate_continuous_maps(self, df):
+        # Create tabs
+        single_animal_tabs = [self.mw.heatmap_tab, self.mw.com_tab, self.mw.traj_tab, self.mw.phase_tab, self.mw.interp_tab]
+        for tab in single_animal_tabs: self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(tab), False)
         
-        filename = "graph_cbpt_results.csv"
-        return df, filename
+        try:
+            grid_res = int(self.group_grid_res_edit.text())
+            do_smooth = self.group_smooth_check.isChecked()
+            
+            x_min, x_max = df['X'].min(), df['X'].max()
+            y_min, y_max = df['Y'].min(), df['Y'].max()
+            width, height = x_max - x_min, y_max - y_min
+            
+            if width >= height:
+                n_bins_x = grid_res
+                bin_size = width / n_bins_x
+                n_bins_y = max(1, int(round(height / bin_size)))
+            else:
+                n_bins_y = grid_res
+                bin_size = height / n_bins_y
+                n_bins_x = max(1, int(round(width / bin_size)))
+
+            start_x = x_min - bin_size; end_x = x_max + bin_size
+            start_y = y_min - bin_size; end_y = y_max + bin_size
+            
+            grid_x_bins = np.arange(start_x, end_x, bin_size)
+            grid_y_bins = np.arange(start_y, end_y, bin_size)
+            calc_x_bins = np.linspace(x_min, x_max, n_bins_x + 1)
+            calc_y_bins = np.linspace(y_min, y_max, n_bins_y + 1)
+            
+            # Scatter Plot
+            scatter_df = df.rename(columns={'Animal': 'Source_Animal', 'X': 'Warped_X', 'Y': 'Warped_Y', 'Rel_Phase': 'Relative_Phase_Hours'})
+            fig_s, _ = add_mpl_to_tab(self.mw.group_scatter_tab)
+            viewer_s = GroupScatterViewer(fig_s, fig_s.add_subplot(111), scatter_df, grid_bins=(grid_x_bins, grid_y_bins))
+            self.mw.visualization_widgets[self.mw.group_scatter_tab] = viewer_s
+            
+            # Average Map
+            scatter_df['Grid_X_Index'] = pd.cut(scatter_df['Warped_X'], bins=calc_x_bins, labels=False, include_lowest=True)
+            scatter_df['Grid_Y_Index'] = pd.cut(scatter_df['Warped_Y'], bins=calc_y_bins, labels=False, include_lowest=True)
+            
+            def circmean_phase(series):
+                rad = (series / 12.0) * np.pi 
+                mean_rad = circmean(rad, low=-np.pi, high=np.pi)
+                return (mean_rad / np.pi) * 12.0
+            
+            group_binned = scatter_df.groupby(['Grid_X_Index', 'Grid_Y_Index'])['Relative_Phase_Hours'].apply(circmean_phase).reset_index()
+            
+            fig_g, _ = add_mpl_to_tab(self.mw.group_avg_tab)
+            viewer_g = GroupAverageMapViewer(fig_g, fig_g.add_subplot(111), group_binned, scatter_df, (n_bins_x, n_bins_y), do_smooth)
+            self.mw.visualization_widgets[self.mw.group_avg_tab] = viewer_g
+            
+            self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.group_scatter_tab), True)
+            self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.group_avg_tab), True)
+            
+        except Exception as e:
+            self.mw.log_message(f"Grid Visualization Error: {e}")
+
+    def _generate_regional_stats(self, df):
+        self.final_zone_stats = []
+        min_cells = self.min_region_cells_spin.value()
+        min_animals = self.min_animals_spin.value()
+        unique_animals = df['Animal'].unique()
+        
+        self.mw.log_message("Calculating per-zone statistics...")
+
+        for zid, z_info in self.zones.items():
+            polys = z_info['polygons']
+            zone_record = {'id': zid, 'name': z_info['name'], 'data': []}
+            
+            # 1. Aggregate per Animal
+            for animal in unique_animals:
+                subset = df[df['Animal'] == animal]
+                if subset.empty: continue
+                
+                points = subset[['X', 'Y']].values
+                mask_in_zone = np.zeros(len(points), dtype=bool)
+                for poly in polys:
+                    mask_in_zone |= poly.contains_points(points)
+                
+                valid_phases = subset.loc[mask_in_zone, 'Rel_Phase'].values
+                
+                if len(valid_phases) >= min_cells:
+                    rads = (valid_phases / 24.0) * (2 * np.pi)
+                    m_rad = circmean(rads, low=-np.pi, high=np.pi)
+                    m_val = (m_rad / (2 * np.pi)) * 24.0
+                    
+                    zone_record['data'].append({
+                        'animal': animal,
+                        'group': subset['Group'].iloc[0],
+                        'mean': m_val
+                    })
+
+            # 2. Run Statistics (Watson-Williams)
+            ctrl_means = [d['mean'] for d in zone_record['data'] if d['group'] == 'Control']
+            exp_means = [d['mean'] for d in zone_record['data'] if d['group'] == 'Experiment']
+            
+            zone_record['n_ctrl'] = len(ctrl_means)
+            zone_record['n_exp'] = len(exp_means)
+            
+            if len(ctrl_means) >= min_animals and len(exp_means) >= min_animals:
+                # Use Circmean for group summary too
+                def group_circ(vals):
+                    r = (np.array(vals) / 24.0) * (2*np.pi)
+                    return (circmean(r) / (2*np.pi)) * 24.0
+
+                zone_record['mean_ctrl'] = group_circ(ctrl_means)
+                zone_record['mean_exp'] = group_circ(exp_means)
+                
+                # Watson-Williams
+                f_val = watson_williams_f(ctrl_means, exp_means)
+                df2 = len(ctrl_means) + len(exp_means) - 2
+                p_val = 1.0 - f_dist.cdf(f_val, 1, df2)
+                
+                zone_record['p_value'] = p_val
+                
+                # Circular Diff (Exp - Ctrl)
+                c_mean = zone_record['mean_ctrl']
+                e_mean = zone_record['mean_exp']
+                diff = (e_mean - c_mean + 12.0) % 24.0 - 12.0
+                zone_record['diff_mean'] = diff
+            else:
+                zone_record['p_value'] = 1.0
+                zone_record['diff_mean'] = 0.0
+
+            self.final_zone_stats.append(zone_record)
+
+        # 3. Create Viewer
+        if not hasattr(self.mw, 'region_tab'):
+            self.mw.region_tab = QtWidgets.QWidget()
+            self.mw.vis_tabs.addTab(self.mw.region_tab, "Region Stats")
+        
+        if self.mw.region_tab.layout(): clear_layout(self.mw.region_tab.layout())
+        
+        viewer = RegionResultViewer(self.final_zone_stats, self.zones_polygons_map)
+        self.mw.visualization_widgets[self.mw.region_tab] = viewer
+        
+        layout = QtWidgets.QVBoxLayout(self.mw.region_tab)
+        layout.addWidget(viewer)
+        
+        self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.region_tab), True)
+        self.mw.vis_tabs.setCurrentWidget(self.mw.region_tab)
+        self.mw.log_message("Region Analysis Complete.")
+
+    def _generate_gradient_analysis(self, df):
+        """Calculates phase gradients if 'Phase Axis' exists in Atlas."""
+        atlas_path = self.state.atlas_roi_path
+        if not atlas_path: return
+        try:
+            with open(atlas_path, 'r') as f: atlas_data = json.load(f)
+            axis_rois = [r for r in atlas_data if r.get('mode') == 'Phase Axis']
+            if not axis_rois: return
+            
+            self.mw.log_message(f"Running Gradient Analysis ({len(axis_rois)} Axes)...")
+            
+            # Simple Single-Axis Logic for Robustness
+            axis_poly = np.array(axis_rois[0]['path_vertices'])
+            
+            gradient_data = []
+            animals = df['Animal'].unique()
+            
+            for animal in animals:
+                subset = df[df['Animal'] == animal]
+                points = subset[['X', 'Y']].values
+                phases = subset['Rel_Phase'].values
+                
+                s_vals = project_points_to_polyline(points, axis_poly)
+                
+                # Binning
+                bins = np.linspace(0, 1, 11)
+                bin_centers = (bins[:-1] + bins[1:]) / 2
+                binned_phases = []
+                
+                for k in range(len(bins)-1):
+                    mask = (s_vals >= bins[k]) & (s_vals < bins[k+1])
+                    if np.sum(mask) > 0:
+                        p_bin = phases[mask]
+                        rads = (p_bin / 24.0) * 2 * np.pi
+                        m_rad = circmean(rads, low=-np.pi, high=np.pi)
+                        m_h = (m_rad / (2 * np.pi)) * 24.0
+                        binned_phases.append(m_h)
+                    else:
+                        binned_phases.append(np.nan)
+                
+                gradient_data.append({
+                    'animal': animal,
+                    's': bin_centers,
+                    'phases': np.array(binned_phases)
+                })
+                
+            if not hasattr(self.mw, 'grad_tab'):
+                self.mw.grad_tab = QtWidgets.QWidget()
+                self.mw.vis_tabs.addTab(self.mw.grad_tab, "Gradient")
+            
+            if self.mw.grad_tab.layout(): clear_layout(self.mw.grad_tab.layout())
+            
+            fig, _ = add_mpl_to_tab(self.mw.grad_tab)
+            viewer_g = PhaseGradientViewer(fig, fig.add_subplot(111), gradient_data)
+            self.mw.visualization_widgets[self.mw.grad_tab] = viewer_g
+            
+            layout = QtWidgets.QVBoxLayout(self.mw.grad_tab)
+            layout.addWidget(viewer_g)
+            
+            self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.grad_tab), True)
+
+        except Exception as e:
+            self.mw.log_message(f"Gradient Analysis Warning: {e}")
+
+    def export_current_data(self):
+        current_tab = self.mw.vis_tabs.currentWidget()
+        
+        # Region Viewer Nested Case
+        if current_tab == getattr(self.mw, 'region_tab', None):
+             viewer = current_tab.findChild(RegionResultViewer)
+             if viewer:
+                 df, fname = viewer.get_export_data()
+                 path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export", fname, "CSV (*.csv)")
+                 if path:
+                     df.to_csv(path, index=False)
+                     self.mw.log_message(f"Saved to {path}")
+                 return
+
+        # Standard Case
+        viewer = self.mw.visualization_widgets.get(current_tab)
+        if viewer and hasattr(viewer, 'get_export_data'):
+             df, fname = viewer.get_export_data()
+             path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export", fname, "CSV (*.csv)")
+             if path:
+                 df.to_csv(path, index=False)
+                 self.mw.log_message(f"Saved to {path}")
