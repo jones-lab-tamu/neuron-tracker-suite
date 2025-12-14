@@ -1,4 +1,3 @@
-# gui/panels/group_view.py
 import os
 import json
 import numpy as np
@@ -28,13 +27,11 @@ class GroupViewPanel(QtWidgets.QWidget):
         box = QtWidgets.QGroupBox("Group Data Setup")
         b = QtWidgets.QVBoxLayout(box)
         
-        # File List
         self.group_list = QtWidgets.QTreeWidget()
         self.group_list.setHeaderLabels(["File Path", "Group"])
         self.group_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         b.addWidget(self.group_list)
         
-        # Add/Remove Buttons
         row = QtWidgets.QHBoxLayout()
         self.btn_add_group = QtWidgets.QPushButton(get_icon('fa5s.plus'), "Add Warped ROI File(s)...")
         self.btn_remove_group = QtWidgets.QPushButton(get_icon('fa5s.minus'), "Remove Selected")
@@ -42,7 +39,6 @@ class GroupViewPanel(QtWidgets.QWidget):
         row.addWidget(self.btn_remove_group)
         b.addLayout(row)
         
-        # Group Assignment Buttons
         assign_row = QtWidgets.QHBoxLayout()
         self.btn_assign_control = QtWidgets.QPushButton("Set Selected as Control")
         self.btn_assign_exp = QtWidgets.QPushButton("Set Selected as Experiment")
@@ -50,7 +46,6 @@ class GroupViewPanel(QtWidgets.QWidget):
         assign_row.addWidget(self.btn_assign_exp)
         b.addLayout(assign_row)
         
-        # Continuous Map Parameters
         param_box = QtWidgets.QGroupBox("Continuous Map Parameters")
         param_layout = QtWidgets.QFormLayout(param_box)
         self.group_grid_res_edit = QtWidgets.QLineEdit("50")
@@ -59,11 +54,9 @@ class GroupViewPanel(QtWidgets.QWidget):
         param_layout.addRow(self.group_smooth_check)
         b.addWidget(param_box)        
         
-        # Regional Analysis Setup
         region_box = QtWidgets.QGroupBox("Regional Analysis Setup")
         region_layout = QtWidgets.QFormLayout(region_box)
         
-        # Atlas Template Loader
         atlas_box = QtWidgets.QWidget()
         atlas_layout = QtWidgets.QHBoxLayout(atlas_box)
         atlas_layout.setContentsMargins(0, 0, 0, 0)
@@ -75,13 +68,11 @@ class GroupViewPanel(QtWidgets.QWidget):
         atlas_layout.addWidget(self.atlas_path_label)
         region_layout.addRow("Atlas Template:", atlas_box)
         
-        # Define Regions Button
         self.btn_define_regions = QtWidgets.QPushButton(get_icon('fa5s.draw-polygon'), "Define Analysis Regions...")
         self.region_status_label = QtWidgets.QLabel("No regions defined")
         self.region_status_label.setStyleSheet("color: gray; font-style: italic;")
         region_layout.addRow(self.btn_define_regions, self.region_status_label)
 
-        # Stats Parameters
         self.min_region_cells_spin = QtWidgets.QSpinBox()
         self.min_region_cells_spin.setRange(1, 100)
         self.min_region_cells_spin.setValue(10)
@@ -94,7 +85,6 @@ class GroupViewPanel(QtWidgets.QWidget):
 
         b.addWidget(region_box)
         
-        # Generate Button
         self.btn_view_group = QtWidgets.QPushButton(get_icon('fa5s.chart-pie'), "Generate Group Visualizations")
         Tooltip.install(self.btn_view_group, "Runs Continuous Grid analysis, Gradient analysis (if axes present), and Regional Statistical analysis.")
         self.btn_view_group.setEnabled(False)
@@ -291,7 +281,8 @@ class GroupViewPanel(QtWidgets.QWidget):
                 df = pd.DataFrame({
                     'Animal': base, 'Group': group,
                     'X': coords[mask, 0], 'Y': coords[mask, 1],
-                    'Phase_CT': phases_ct
+                    'Phase_CT': phases_ct,
+                    'Period_Hours': 24.0
                 })
                 all_dfs.append(df)
 
@@ -406,7 +397,9 @@ class GroupViewPanel(QtWidgets.QWidget):
                     zone_record['data'].append({
                         'animal': animal,
                         'group': subset['Group'].iloc[0],
-                        'mean': m_val
+                        'mean': m_val,
+                        'n_cells': len(valid_phases),
+                        'raw_phases': valid_phases.tolist()
                     })
 
             ctrl_means = [d['mean'] for d in zone_record['data'] if d['group'] == 'Control']
@@ -443,12 +436,16 @@ class GroupViewPanel(QtWidgets.QWidget):
             self.mw.region_tab = QtWidgets.QWidget()
             self.mw.vis_tabs.addTab(self.mw.region_tab, "Region Stats")
         
-        if self.mw.region_tab.layout(): clear_layout(self.mw.region_tab.layout())
+        # Handle layout safely to prevent console warnings
+        layout = self.mw.region_tab.layout()
+        if layout is None:
+            layout = QtWidgets.QVBoxLayout(self.mw.region_tab)
+        else:
+            clear_layout(layout)
         
         viewer = RegionResultViewer(self.final_zone_stats, self.zones_polygons_map)
         self.mw.visualization_widgets[self.mw.region_tab] = viewer
         
-        layout = QtWidgets.QVBoxLayout(self.mw.region_tab)
         layout.addWidget(viewer)
         
         self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.region_tab), True)
@@ -473,6 +470,8 @@ class GroupViewPanel(QtWidgets.QWidget):
                 subset = df[df['Animal'] == animal]
                 points = subset[['X', 'Y']].values
                 phases = subset['Rel_Phase'].values
+                group_name = subset['Group'].iloc[0]  # <--- Capture Group Name
+                
                 s_vals = project_points_to_polyline(points, axis_poly)
                 bins = np.linspace(0, 1, 11)
                 bin_centers = (bins[:-1] + bins[1:]) / 2
@@ -491,6 +490,7 @@ class GroupViewPanel(QtWidgets.QWidget):
                 
                 gradient_data.append({
                     'animal': animal,
+                    'group': group_name, # <--- Pass Group Name
                     's': bin_centers,
                     'phases': np.array(binned_phases)
                 })
@@ -499,14 +499,10 @@ class GroupViewPanel(QtWidgets.QWidget):
                 self.mw.grad_tab = QtWidgets.QWidget()
                 self.mw.vis_tabs.addTab(self.mw.grad_tab, "Gradient")
             
-            if self.mw.grad_tab.layout(): clear_layout(self.mw.grad_tab.layout())
-            
+            # Use add_mpl_to_tab which manages the layout internally
             fig, _ = add_mpl_to_tab(self.mw.grad_tab)
             viewer_g = PhaseGradientViewer(fig, fig.add_subplot(111), gradient_data)
             self.mw.visualization_widgets[self.mw.grad_tab] = viewer_g
-            
-            layout = QtWidgets.QVBoxLayout(self.mw.grad_tab)
-            layout.addWidget(viewer_g)
             
             self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.grad_tab), True)
 
