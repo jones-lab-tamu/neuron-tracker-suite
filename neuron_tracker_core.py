@@ -3,24 +3,95 @@
 Neuron Tracker Core Logic Library
 
 This file contains all the core functions for the neuron tracking and data
-extraction pipeline. It is designed to be a self-contained library, completely
-decoupled from any user interface. This separation of logic allows it to be
-imported and used by various front-ends, such as a command-line script (CLI)
-or a graphical user interface (GUI).
-
-The main workflow is orchestrated by calling these functions in sequence.
+extraction pipeline. It is designed to be a self-contained library.
 """
 
+import os
+import atexit
 import numpy
 import scipy.ndimage
 import scipy.spatial
 import networkx
+from multiprocessing import Pool, shared_memory
 
+# --- Worker Global State (initialized per process) ---
+_shm_handle = None
+_shm_arr = None
+
+def _cleanup_worker():
+    """Closes the shared memory handle on worker exit."""
+    global _shm_handle
+    if _shm_handle is not None:
+        try:
+            _shm_handle.close()
+        except:
+            pass
+        _shm_handle = None
+
+def _init_worker(shm_name, shape, dtype):
+    """
+    Initializes the worker process by attaching to the existing SharedMemory block.
+    """
+    global _shm_handle, _shm_arr
+    try:
+        _shm_handle = shared_memory.SharedMemory(name=shm_name)
+        # Create a numpy view into the shared memory
+        _shm_arr = numpy.ndarray(shape, dtype=dtype, buffer=_shm_handle.buf)
+        # Register cleanup to run when this worker process eventually exits
+        atexit.register(_cleanup_worker)
+    except Exception as e:
+        # On Windows, this print might get lost, but it's better than silent failure
+        print(f"Worker initialization failed: {e}")
+        raise
+
+# --- Core Detection Logic (Factored out to ensure Serial/Parallel equivalence) ---
+def _detect_features_in_image(im, sigma1, sigma2, blur_sigma, max_features):
+    """
+    Pure function to detect features in a single image array.
+    """
+    # Difference of Gaussians on the negative image
+    # Note: We negate 'im' inside the call to match original logic
+    fltrd = (
+        scipy.ndimage.gaussian_filter(-im, sigma1)
+        - scipy.ndimage.gaussian_filter(-im, sigma2)
+    )
+    fltrd = rescale(fltrd, 0.0, 1.0)
+
+    # Local minima in the filtered image
+    locations = list(zip(*detect_local_minima(fltrd)))
+
+    if not locations:
+        return []
+
+    # Rank by intensity on a blurred version of the original image
+    blurred_im = scipy.ndimage.gaussian_filter(im, blur_sigma)
+    mags = [blurred_im[i, j] for i, j in locations]
+
+    indices = numpy.argsort(mags)
+    # Take the top N, but maintain the sort order (lowest to highest magnitude)
+    indices = indices[-max_features:]
+    
+    xys = [locations[i] for i in indices]
+    return xys
+
+def _process_frame_task_shared(t, sigma1, sigma2, blur_sigma, max_features):
+    """
+    Worker task: reads from shared memory, calculates features.
+    """
+    # Read frame t from the shared array (zero-copy view)
+    im = _shm_arr[t]
+    xys = _detect_features_in_image(im, sigma1, sigma2, blur_sigma, max_features)
+    return t, xys
+
+def _process_frame_star(args):
+    """Shim to unpack arguments for starmap/imap."""
+    return _process_frame_task_shared(*args)
+
+
+# --- Public API ---
 
 def detect_local_minima(arr):
-    """
-    Takes a 2D array and detects local minima (troughs).
-    """
+    """Takes a 2D array and detects local minima (troughs)."""
     neighborhood = scipy.ndimage.generate_binary_structure(len(arr.shape), 3)
     local_min = (scipy.ndimage.minimum_filter(arr, footprint=neighborhood) == arr)
     background = (arr == 0)
@@ -32,9 +103,7 @@ def detect_local_minima(arr):
 
 
 def rescale(signal, minimum, maximum):
-    """
-    Rescales a numpy array to a new specified minimum and maximum range.
-    """
+    """Rescales a numpy array to a new specified minimum and maximum range."""
     mins = numpy.min(signal)
     maxs = numpy.max(signal)
     if maxs == mins:
@@ -46,91 +115,101 @@ def rescale(signal, minimum, maximum):
     return output
 
 
-def process_frames(data, sigma1, sigma2, blur_sigma, max_features, progress_callback=None):
+def process_frames(data, sigma1, sigma2, blur_sigma, max_features, progress_callback=None, n_processes=None):
     """
-    Detects features (neurons) in each frame of the image sequence.
+    Detects features (neurons) in each frame.
+    
+    Args:
+        data: 3D numpy array (T, Y, X).
+        n_processes: Number of worker processes. 
+                     If None, defaults to min(cpu_count, 8).
+                     If 1, runs serially in main process (no shared memory).
     """
     if progress_callback is None:
         progress_callback = lambda msg: None
 
-    blob_lists, trees, ims, ids = [], [], [], {}
     T = data.shape[0]
+    
+    # Determine Process Count
+    if n_processes is None:
+        # Cap at 8 to prevent UI starvation/memory contention
+        n_processes = min(os.cpu_count() or 1, 8)
 
-    progress_callback("Stage 1/4: Detecting features in each frame...")
+    results = []
     step = max(1, T // 20)
 
-    for t in range(T):
-        im = data[t]
-        ims.append(im)
-
-        # Difference of Gaussians on the negative image (to pick up bright blobs)
-        fltrd = (
-            scipy.ndimage.gaussian_filter(-im, sigma1)
-            - scipy.ndimage.gaussian_filter(-im, sigma2)
-        )
-        fltrd = rescale(fltrd, 0.0, 1.0)
-
-        # Local minima in the filtered image
-        locations = list(zip(*detect_local_minima(fltrd)))
-
-        # If no detections in this frame, record an empty frame and skip KDTree
-        if not locations:
-            blob_lists.append([])
-            trees.append(None)
-
+    # --- SERIAL PATHWAY (n=1) ---
+    if n_processes < 2:
+        progress_callback("Stage 1/4: Detecting features (Serial)...")
+        for t in range(T):
+            xys = _detect_features_in_image(data[t], sigma1, sigma2, blur_sigma, max_features)
+            results.append((t, xys))
+            
             if (t + 1) % step == 0 or t == T - 1:
-                progress_callback(
-                    f"  Processed frame {t+1}/{T} ({100.0 * (t+1) / float(T):.1f}%)"
-                )
-            continue
+                progress_callback(f"  Processed frame {t+1}/{T} ({100.0 * (t+1) / float(T):.1f}%)")
 
-        # Rank by intensity on a blurred version of the original image
-        blurred_im = scipy.ndimage.gaussian_filter(im, blur_sigma)
-        mags = [blurred_im[i, j] for i, j in locations]
+    # --- PARALLEL PATHWAY (n > 1) ---
+    else:
+        # Allocate shared memory
+        shm = shared_memory.SharedMemory(create=True, size=data.nbytes)
+        
+        try:
+            # Copy data to shared memory
+            shm_arr = numpy.ndarray(data.shape, dtype=data.dtype, buffer=shm.buf)
+            shm_arr[:] = data[:] 
+            
+            progress_callback(f"Stage 1/4: Detecting features (Parallel on {n_processes} cores)...")
+            
+            # Generator expression for O(1) memory overhead during task creation
+            tasks = (
+                (t, sigma1, sigma2, blur_sigma, max_features) 
+                for t in range(T)
+            )
 
-        indices = numpy.argsort(mags)
-        indices = indices[-max_features:]  # safe even if len < max_features
-        xys = [locations[i] for i in indices]
+            init_args = (shm.name, data.shape, data.dtype)
 
-        # Guard against the degenerate case where xys somehow ends up empty
+            with Pool(processes=n_processes, initializer=_init_worker, initargs=init_args) as pool:
+                # imap_unordered for better throughput
+                for i, res in enumerate(pool.imap_unordered(_process_frame_star, tasks)):
+                    results.append(res)
+                    if (i + 1) % step == 0 or i == T - 1:
+                        progress_callback(
+                            f"  Processed frame {i+1}/{T} ({100.0 * (i+1) / float(T):.1f}%)"
+                        )
+        
+        finally:
+            shm.close()
+            shm.unlink()
+
+    # --- Deterministic Assembly ---
+    # Sort by frame index t to ensure strict ordering before ID assignment
+    results.sort(key=lambda x: x[0])
+    
+    blob_lists, trees, ims, ids = [], [], [], {}
+    
+    for t, xys in results:
+        # Store reference to original data
+        ims.append(data[t]) 
+        
         if not xys:
             blob_lists.append([])
             trees.append(None)
-
-            if (t + 1) % step == 0 or t == T - 1:
-                progress_callback(
-                    f"  Processed frame {t+1}/{T} ({100.0 * (t+1) / float(T):.1f}%)"
-                )
             continue
-
-        # Assign unique IDs to each detected blob
+            
+        # Serial ID assignment ensures identical IDs across runs
         for x, y in xys:
             ids[(t, (x, y))] = len(ids)
-
-        # Store KDTree and blob list for this frame
+            
         trees.append(scipy.spatial.KDTree(xys))
         blob_lists.append(xys)
-
-        if (t + 1) % step == 0 or t == T - 1:
-            progress_callback(
-                f"  Processed frame {t+1}/{T} ({100.0 * (t+1) / float(T):.1f}%)"
-            )
 
     return ims, ids, trees, blob_lists
 
 
 def build_trajectories(
-    blob_lists,
-    trees,
-    ids,
-    search_range,
-    cone_radius_base,
-    cone_radius_multiplier,
-    progress_callback=None,
+    blob_lists, trees, ids, search_range, cone_radius_base, cone_radius_multiplier, progress_callback=None,
 ):
-    """
-    Connects features across frames to build trajectories.
-    """
+    """Connects features across frames to build trajectories."""
     if progress_callback is None:
         progress_callback = lambda msg: None
 
@@ -142,21 +221,14 @@ def build_trajectories(
 
     for t in range(1, T):
         if (t + 1) % step == 0 or t == T - 1:
-            progress_callback(
-                f"  Connecting features up to frame {t+1}/{T} "
-                f"({100.0 * (t+1) / float(T):.1f}%)"
-            )
+            progress_callback(f"  Connecting features up to frame {t+1}/{T} ({100.0 * (t+1) / float(T):.1f}%)")
 
-        # Skip frames with no detections in the current timepoint
         if not blob_lists[t]:
             continue
 
         for blob in blob_lists[t]:
             start = max(0, t - search_range)
-
-            # Walk backward through previous frames within search_range
             for bt in range(t - 1, start - 1, -1):
-                # Skip frames with no detections or no KDTree
                 if trees[bt] is None or not blob_lists[bt]:
                     continue
 
@@ -173,9 +245,7 @@ def build_trajectories(
 
 
 def prune_trajectories(graph, subgraphs, ids, progress_callback=None):
-    """
-    Prunes branched trajectories to ensure a single path.
-    """
+    """Prunes branched trajectories to ensure a single path."""
     if progress_callback is None:
         progress_callback = lambda msg: None
 
@@ -211,34 +281,20 @@ def prune_trajectories(graph, subgraphs, ids, progress_callback=None):
 
 
 def extract_and_interpolate_data(
-    ims,
-    pruned_subgraphs,
-    reverse_ids,
-    min_trajectory_length,
-    sampling_box_size,
-    sampling_sigma,
-    max_interpolation_distance,
-    progress_callback=None,
+    ims, pruned_subgraphs, reverse_ids, min_trajectory_length, sampling_box_size, sampling_sigma, max_interpolation_distance, progress_callback=None,
 ):
-    """
-    Filters, interpolates, and samples data from the final, pruned trajectories.
-    (Parameter names align with GUI/CLI.)
-    """
+    """Filters, interpolates, and samples data from the final, pruned trajectories."""
     if progress_callback is None:
         progress_callback = lambda msg: None
 
-    progress_callback(
-        "Stage 4/4: Filtering, interpolating, and sampling final trajectories..."
-    )
+    progress_callback("Stage 4/4: Filtering, interpolating, and sampling final trajectories...")
 
     T = len(ims)
     lines, coms, trajectories = [], [], []
 
-    # Ensure odd box size
     if sampling_box_size % 2 == 0:
         sampling_box_size += 1
 
-    # Gaussian-like sampling kernel
     blur = numpy.zeros((sampling_box_size, sampling_box_size))
     center = sampling_box_size // 2
     blur[center, center] = 1.0
@@ -246,23 +302,15 @@ def extract_and_interpolate_data(
     blur /= numpy.sum(blur)
 
     for i, path in enumerate(pruned_subgraphs):
-        if (
-            i > 0
-            and len(pruned_subgraphs) > 10
-            and i % (len(pruned_subgraphs) // 10) == 0
-        ):
-            progress_callback(
-                f"  Sampling trajectory {i+1}/{len(pruned_subgraphs)}"
-            )
+        if i > 0 and len(pruned_subgraphs) > 10 and i % (len(pruned_subgraphs) // 10) == 0:
+            progress_callback(f"  Sampling trajectory {i+1}/{len(pruned_subgraphs)}")
 
-        # Enforce minimum trajectory length as fraction of total frames
         if len(path) < min_trajectory_length * T:
             continue
 
         interpolated_pos = {}
         interpolated_val = {}
 
-        # Known positions
         for node in path:
             t, c = reverse_ids[node]
             interpolated_pos[t] = c
@@ -271,17 +319,14 @@ def extract_and_interpolate_data(
         if not detected_times:
             continue
 
-        # Extend to start
         start_pos = interpolated_pos[detected_times[0]]
         for t in range(0, detected_times[0]):
             interpolated_pos[t] = start_pos
 
-        # Extend to end
         end_pos = interpolated_pos[detected_times[-1]]
         for t in range(detected_times[-1] + 1, T):
             interpolated_pos[t] = end_pos
 
-        # Linear interpolation between detections
         for j in range(len(detected_times) - 1):
             lt, rt = detected_times[j], detected_times[j + 1]
             if rt == lt + 1:
@@ -292,7 +337,6 @@ def extract_and_interpolate_data(
                 alpha = float(t - lt) / (rt - lt)
                 interpolated_pos[t] = tuple(lc * (1.0 - alpha) + rc * alpha)
 
-        # Sample along full trajectory
         full_trajectory = []
         cancel = False
         b_half = sampling_box_size // 2
@@ -319,17 +363,12 @@ def extract_and_interpolate_data(
 
         full_trajectory = numpy.array(full_trajectory)
 
-        # Reject trajectories with implausible jumps
-        distances = numpy.sqrt(
-            numpy.sum(numpy.diff(full_trajectory, axis=0) ** 2, axis=1)
-        )
+        distances = numpy.sqrt(numpy.sum(numpy.diff(full_trajectory, axis=0) ** 2, axis=1))
         if numpy.any(distances > max_interpolation_distance):
             continue
 
         coms.append(numpy.mean(full_trajectory, axis=0))
         trajectories.append(full_trajectory)
-
-        # Convert dict {t: val} to sorted array [[t, val], ...]
         lines.append(numpy.array(sorted(interpolated_val.items())))
 
     return (
