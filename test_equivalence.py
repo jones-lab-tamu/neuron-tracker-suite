@@ -84,24 +84,31 @@ def legacy_reference_process_frames(data, sigma1, sigma2, blur_sigma, max_featur
 
 class TestNeuronTrackerEquivalence(unittest.TestCase):
     def setUp(self):
-        # Create a synthetic "movie"
-        # 10 frames, 64x64 pixels
-        np.random.seed(12345) 
-        self.frames = np.random.rand(10, 64, 64).astype(np.float32)
+        # --- OPTION 1: REAL DATA ---
+        import skimage.io
+        print("Loading real movie...")
+        # Load the full TIFF
+        full_movie = skimage.io.imread("D:/SCN_GCaMP/Mus/120525-121025_Mus-Rhabdomys_series4.tif")
         
-        # Add moving "cells" to ensure we actually detect things
-        for t in range(10):
-            y, x = 20 + t, 20 + t
-            self.frames[t, y-2:y+3, x-2:x+3] += 5.0 
-            
-        for t in range(10):
-            self.frames[t, 40:45, 40:45] += 5.0
+        # OPTIONAL: Slice it for speed (e.g., first 200 frames). 
+        # Comparison on the full movie might take a long time.
+        self.frames = full_movie[:200] 
+        
+        # --- OPTION 2: SYNTHETIC DATA (Commented Out) ---
+        # np.random.seed(12345) 
+        # self.frames = np.random.rand(10, 64, 64).astype(np.float32)
+        # for t in range(10):
+        #     y, x = 20 + t, 20 + t
+        #     self.frames[t, y-2:y+3, x-2:x+3] += 5.0 
+        # for t in range(10):
+        #     self.frames[t, 40:45, 40:45] += 5.0
 
         self.params = {
             'sigma1': 1.0,
             'sigma2': 5.0,
             'blur_sigma': 1.0,
-            'max_features': 10
+            # 'max_features': 10 # For artificial data
+            'max_features': 200 # Increased for real data
         }
 
     def canonicalize_edges(self, graph):

@@ -304,11 +304,19 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         self._analysis_thread.started.connect(self._analysis_worker.run)
         self._analysis_worker.message.connect(self.mw.log_message)
         self._analysis_worker.progress.connect(lambda v: self.mw.progress_bar.setValue(int(v * 100)))
+        
         def done(success, msg):
             self._analysis_thread.quit()
             self._analysis_thread.wait()
+
+            # Explicitly delete the worker to free the reference to the movie data
             self._analysis_worker = None
             self._analysis_thread = None
+            
+            # Force Garbage Collection immediately
+            import gc
+            gc.collect()
+            
             if success:
                 self.mw.log_message("Analysis finished. Loading results...")
                 self.load_results()
