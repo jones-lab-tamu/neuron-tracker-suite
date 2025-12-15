@@ -122,7 +122,7 @@ def process_frames(data, sigma1, sigma2, blur_sigma, max_features, progress_call
     Args:
         data: 3D numpy array (T, Y, X).
         n_processes: Number of worker processes. 
-                     If None, defaults to min(cpu_count, 8).
+                     If None, uses a Safe Clamp heuristic: min(max(1, cpu - 2), 16).
                      If 1, runs serially in main process (no shared memory).
     """
     if progress_callback is None:
@@ -130,10 +130,12 @@ def process_frames(data, sigma1, sigma2, blur_sigma, max_features, progress_call
 
     T = data.shape[0]
     
-    # Determine Process Count
+    # Determine Process Count (The "Safe Clamp" Logic)
     if n_processes is None:
-        # Cap at 8 to prevent UI starvation/memory contention
-        n_processes = min(os.cpu_count() or 1, 8)
+        cpu = os.cpu_count() or 1
+        # 1. Leave headroom for OS/GUI (cpu - 2)
+        # 2. Clamp to 16 to prevent memory bandwidth saturation/thrashing
+        n_processes = min(max(1, cpu - 2), 16)
 
     results = []
     step = max(1, T // 20)
@@ -177,6 +179,8 @@ def process_frames(data, sigma1, sigma2, blur_sigma, max_features, progress_call
                             f"  Processed frame {i+1}/{T} ({100.0 * (i+1) / float(T):.1f}%)"
                         )
         
+        except Exception as e:
+            raise e
         finally:
             shm.close()
             shm.unlink()
