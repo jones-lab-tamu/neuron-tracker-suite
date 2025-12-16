@@ -95,6 +95,13 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         self.status_gate_label = self.lbl_status_gate
         self.status_roi_label = self.lbl_status_roi
                 
+        # Some older MainWindow code also expects these:
+        # We do not have separate strip slots for each file type in the rewrite,
+        # so map them to "Results"
+        self.status_traj_label = self.lbl_status_results
+        self.status_metrics_label = self.lbl_status_mode  # metrics implies scored/strict mode
+        self.status_roi_file_label = self.lbl_status_roi  # ROI file presence, treated as ROI status
+          
         self.connect_signals()
         
         # Initial State
