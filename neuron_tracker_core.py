@@ -13,8 +13,62 @@ import scipy.ndimage
 import scipy.spatial
 import networkx
 from multiprocessing import Pool, shared_memory
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict, Optional, Union
 
-# --- Worker Global State (initialized per process) ---
+# =============================================================================
+# DATA STRUCTURES
+# =============================================================================
+
+@dataclass
+class TrajectoryMetrics:
+    """Quality metrics for a single trajectory candidate."""
+    # Spatial Counts
+    n_detected: int = 0
+    
+    # Coverage Metrics
+    path_node_fraction: float = 0.0  # Legacy metric (len(path) / T)
+    detected_fraction: float = 0.0   # Scientific metric (n_detected / T)
+    
+    # Spatial Quality
+    max_gap: int = 0
+    max_step: float = 0.0
+    boundary_fail: bool = False
+    
+    # Jitter (Stability)
+    spatial_jitter_raw: float = 0.0      
+    spatial_jitter_detrended: float = 0.0 
+    
+    # Trace Metrics (Only computed if trace extracted)
+    trace_snr_proxy: float = 0.0         # Median / MAD
+
+@dataclass
+class TrajectoryCandidate:
+    """A single cell trajectory candidate with its metadata and data."""
+    id: int
+    pruned_path_nodes: list
+    
+    # Spatial Data
+    positions: numpy.ndarray             # Shape (T, 2) [y, x]
+    detected_mask: numpy.ndarray         # Shape (T,) boolean
+    
+    # Intensity Data (Optional, populated in Pass 2)
+    trace: Optional[numpy.ndarray] = None # Shape (T,)
+    
+    # Metrics
+    metrics: TrajectoryMetrics = field(default_factory=TrajectoryMetrics)
+    
+    # Pipeline State
+    is_valid_spatial: bool = False  # Passed loose spatial gate?
+    trace_extracted: bool = False   # Trace successfully sampled?
+    accepted: bool = False          # Passed final policy?
+    
+    reject_reason: str = ""
+
+# =============================================================================
+# PARALLEL WORKER STATE & INIT
+# =============================================================================
+
 _shm_handle = None
 _shm_arr = None
 
@@ -35,60 +89,51 @@ def _init_worker(shm_name, shape, dtype):
     global _shm_handle, _shm_arr
     try:
         _shm_handle = shared_memory.SharedMemory(name=shm_name)
-        # Create a numpy view into the shared memory
         _shm_arr = numpy.ndarray(shape, dtype=dtype, buffer=_shm_handle.buf)
-        # Register cleanup to run when this worker process eventually exits
         atexit.register(_cleanup_worker)
     except Exception as e:
-        # On Windows, this print might get lost, but it's better than silent failure
         print(f"Worker initialization failed: {e}")
         raise
 
-# --- Core Detection Logic (Factored out to ensure Serial/Parallel equivalence) ---
+# =============================================================================
+# CORE DETECTION LOGIC
+# =============================================================================
+
 def _detect_features_in_image(im, sigma1, sigma2, blur_sigma, max_features):
-    """
-    Pure function to detect features in a single image array.
-    """
-    # Difference of Gaussians on the negative image
-    # Note: We negate 'im' inside the call to match original logic
+    """Pure function to detect features in a single image array."""
     fltrd = (
         scipy.ndimage.gaussian_filter(-im, sigma1)
         - scipy.ndimage.gaussian_filter(-im, sigma2)
     )
     fltrd = rescale(fltrd, 0.0, 1.0)
 
-    # Local minima in the filtered image
     locations = list(zip(*detect_local_minima(fltrd)))
 
     if not locations:
         return []
 
-    # Rank by intensity on a blurred version of the original image
     blurred_im = scipy.ndimage.gaussian_filter(im, blur_sigma)
     mags = [blurred_im[i, j] for i, j in locations]
 
     indices = numpy.argsort(mags)
-    # Take the top N, but maintain the sort order (lowest to highest magnitude)
     indices = indices[-max_features:]
     
     xys = [locations[i] for i in indices]
     return xys
 
 def _process_frame_task_shared(t, sigma1, sigma2, blur_sigma, max_features):
-    """
-    Worker task: reads from shared memory, calculates features.
-    """
-    # Read frame t from the shared array (zero-copy view)
+    """Worker task: reads from shared memory, calculates features."""
     im = _shm_arr[t]
     xys = _detect_features_in_image(im, sigma1, sigma2, blur_sigma, max_features)
     return t, xys
 
 def _process_frame_star(args):
-    """Shim to unpack arguments for starmap/imap."""
     return _process_frame_task_shared(*args)
 
 
-# --- Public API ---
+# =============================================================================
+# PUBLIC API: HELPERS
+# =============================================================================
 
 def detect_local_minima(arr):
     """Takes a 2D array and detects local minima (troughs)."""
@@ -114,96 +159,66 @@ def rescale(signal, minimum, maximum):
     output += minimum
     return output
 
+# =============================================================================
+# PUBLIC API: PIPELINE STEPS
+# =============================================================================
 
 def process_frames(data, sigma1, sigma2, blur_sigma, max_features, progress_callback=None, n_processes=None):
-    """
-    Detects features (neurons) in each frame.
-    
-    Args:
-        data: 3D numpy array (T, Y, X).
-        n_processes: Number of worker processes. 
-                     If None, uses a Safe Clamp heuristic: min(max(1, cpu - 2), 16).
-                     If 1, runs serially in main process (no shared memory).
-    """
+    """Step 1: Detect features in each frame."""
     if progress_callback is None:
         progress_callback = lambda msg: None
 
     T = data.shape[0]
-    
-    # Determine Process Count (The "Safe Clamp" Logic)
     if n_processes is None:
         cpu = os.cpu_count() or 1
-        # 1. Leave headroom for OS/GUI (cpu - 2)
-        # 2. Clamp to 16 to prevent memory bandwidth saturation/thrashing
         n_processes = min(max(1, cpu - 2), 16)
 
     results = []
     step = max(1, T // 20)
 
-    # --- SERIAL PATHWAY (n=1) ---
+    # --- SERIAL PATHWAY ---
     if n_processes < 2:
         progress_callback("Stage 1/4: Detecting features (Serial)...")
         for t in range(T):
             xys = _detect_features_in_image(data[t], sigma1, sigma2, blur_sigma, max_features)
             results.append((t, xys))
-            
             if (t + 1) % step == 0 or t == T - 1:
                 progress_callback(f"  Processed frame {t+1}/{T} ({100.0 * (t+1) / float(T):.1f}%)")
 
-    # --- PARALLEL PATHWAY (n > 1) ---
+    # --- PARALLEL PATHWAY ---
     else:
-        # Allocate shared memory
         shm = shared_memory.SharedMemory(create=True, size=data.nbytes)
-        
         try:
-            # Copy data to shared memory
             shm_arr = numpy.ndarray(data.shape, dtype=data.dtype, buffer=shm.buf)
             shm_arr[:] = data[:] 
             
             progress_callback(f"Stage 1/4: Detecting features (Parallel on {n_processes} cores)...")
             
-            # Generator expression for O(1) memory overhead during task creation
-            tasks = (
-                (t, sigma1, sigma2, blur_sigma, max_features) 
-                for t in range(T)
-            )
-
+            tasks = ((t, sigma1, sigma2, blur_sigma, max_features) for t in range(T))
             init_args = (shm.name, data.shape, data.dtype)
 
             with Pool(processes=n_processes, initializer=_init_worker, initargs=init_args) as pool:
-                # imap_unordered for better throughput
                 for i, res in enumerate(pool.imap_unordered(_process_frame_star, tasks)):
                     results.append(res)
                     if (i + 1) % step == 0 or i == T - 1:
-                        progress_callback(
-                            f"  Processed frame {i+1}/{T} ({100.0 * (i+1) / float(T):.1f}%)"
-                        )
-        
-        except Exception as e:
-            raise e
+                        progress_callback(f"  Processed frame {i+1}/{T} ({100.0 * (i+1) / float(T):.1f}%)")
         finally:
             shm.close()
             shm.unlink()
 
-    # --- Deterministic Assembly ---
-    # Sort by frame index t to ensure strict ordering before ID assignment
+    # Deterministic Assembly
     results.sort(key=lambda x: x[0])
     
     blob_lists, trees, ims, ids = [], [], [], {}
     
     for t, xys in results:
-        # Store reference to original data
         ims.append(data[t]) 
-        
         if not xys:
             blob_lists.append([])
             trees.append(None)
             continue
-            
-        # Serial ID assignment ensures identical IDs across runs
         for x, y in xys:
             ids[(t, (x, y))] = len(ids)
-            
         trees.append(scipy.spatial.KDTree(xys))
         blob_lists.append(xys)
 
@@ -213,7 +228,7 @@ def process_frames(data, sigma1, sigma2, blur_sigma, max_features, progress_call
 def build_trajectories(
     blob_lists, trees, ids, search_range, cone_radius_base, cone_radius_multiplier, progress_callback=None,
 ):
-    """Connects features across frames to build trajectories."""
+    """Step 2: Connect features across frames."""
     if progress_callback is None:
         progress_callback = lambda msg: None
 
@@ -235,10 +250,8 @@ def build_trajectories(
             for bt in range(t - 1, start - 1, -1):
                 if trees[bt] is None or not blob_lists[bt]:
                     continue
-
                 distance, neighbor_idx = trees[bt].query(blob, 1)
                 cone_radius = cone_radius_base + cone_radius_multiplier * (t - bt)
-
                 if distance < cone_radius:
                     neighbor_coords = tuple(trees[bt].data[neighbor_idx])
                     graph.add_edge(ids[(bt, neighbor_coords)], ids[(t, blob)])
@@ -249,7 +262,7 @@ def build_trajectories(
 
 
 def prune_trajectories(graph, subgraphs, ids, progress_callback=None):
-    """Prunes branched trajectories to ensure a single path."""
+    """Step 3: Prune branched trajectories."""
     if progress_callback is None:
         progress_callback = lambda msg: None
 
@@ -257,12 +270,25 @@ def prune_trajectories(graph, subgraphs, ids, progress_callback=None):
 
     reverse_ids = {v: k for k, v in ids.items()}
     pruned_subgraphs = []
+    
+    # Ensure deterministic processing order for subgraphs
+    sorted_subgraphs = sorted(subgraphs, key=lambda nodes: min(nodes))
 
-    for nodes in subgraphs:
-        subgraph = graph.subgraph(nodes)
+    for nodes in sorted_subgraphs:
+        # Create a FRESH graph component and populate it in sorted order.
+        # This guarantees that networkx's internal adjacency dicts have a fixed insertion order,
+        # ensuring that BFS (shortest_path) tie-breaking is deterministic.
+        sorted_nodes = sorted(list(nodes))
+        subgraph_view = graph.subgraph(nodes)
+        
+        det_subgraph = networkx.Graph()
+        det_subgraph.add_nodes_from(sorted_nodes)
+        # Sort edges to ensure deterministic edge insertion order
+        sorted_edges = sorted([tuple(sorted(e)) for e in subgraph_view.edges()])
+        det_subgraph.add_edges_from(sorted_edges)
+
         nodes_by_time = {}
-
-        for node in nodes:
+        for node in sorted_nodes:
             t, _ = reverse_ids[node]
             nodes_by_time.setdefault(t, []).append(node)
 
@@ -270,11 +296,15 @@ def prune_trajectories(graph, subgraphs, ids, progress_callback=None):
         if len(times) < 2:
             continue
 
+        # Deterministic start/end
+        nodes_by_time[times[0]].sort()
+        nodes_by_time[times[-1]].sort()
+        
         start_node = nodes_by_time[times[0]][0]
         end_node = nodes_by_time[times[-1]][0]
 
         try:
-            path = networkx.shortest_path(subgraph, start_node, end_node)
+            path = networkx.shortest_path(det_subgraph, start_node, end_node)
             if path:
                 pruned_subgraphs.append(path)
         except networkx.NetworkXNoPath:
@@ -285,98 +315,207 @@ def prune_trajectories(graph, subgraphs, ids, progress_callback=None):
 
 
 def extract_and_interpolate_data(
-    ims, pruned_subgraphs, reverse_ids, min_trajectory_length, sampling_box_size, sampling_sigma, max_interpolation_distance, progress_callback=None,
+    ims, 
+    pruned_subgraphs, 
+    reverse_ids, 
+    min_trajectory_length, 
+    sampling_box_size, 
+    sampling_sigma, 
+    max_interpolation_distance, 
+    progress_callback=None,
+    mode='strict', # 'strict' or 'scored'
+    return_candidates=False
 ):
-    """Filters, interpolates, and samples data from the final, pruned trajectories."""
+    """Step 4: Two-Pass Pipeline (Spatial -> Trace)."""
     if progress_callback is None:
         progress_callback = lambda msg: None
 
-    progress_callback("Stage 4/4: Filtering, interpolating, and sampling final trajectories...")
+    progress_callback("Stage 4/4: Filtering and sampling (Two-Pass Pipeline)...")
 
     T = len(ims)
-    lines, coms, trajectories = [], [], []
-
+    
     if sampling_box_size % 2 == 0:
         sampling_box_size += 1
-
-    blur = numpy.zeros((sampling_box_size, sampling_box_size))
+    
+    blur_kernel = numpy.zeros((sampling_box_size, sampling_box_size))
     center = sampling_box_size // 2
-    blur[center, center] = 1.0
-    blur = scipy.ndimage.gaussian_filter(blur, sampling_sigma)
-    blur /= numpy.sum(blur)
+    blur_kernel[center, center] = 1.0
+    blur_kernel = scipy.ndimage.gaussian_filter(blur_kernel, sampling_sigma)
+    blur_kernel /= numpy.sum(blur_kernel)
+    b_half = sampling_box_size // 2
+    
+    # Enforce shape invariant
+    if T > 0:
+        h0, w0 = ims[0].shape
+        for t in range(1, T):
+            if ims[t].shape != (h0, w0):
+                raise ValueError(f"Frame dimensions mismatch at index {t}: expected {(h0, w0)}, got {ims[t].shape}")
+        h, w = h0, w0
+    else:
+        h, w = 0, 0 # Fallback for empty (though T=0 is unlikely here)
 
+    candidates: List[TrajectoryCandidate] = []
+
+    # --- PASS 1: SPATIAL ANALYSIS & GATING ---
     for i, path in enumerate(pruned_subgraphs):
         if i > 0 and len(pruned_subgraphs) > 10 and i % (len(pruned_subgraphs) // 10) == 0:
-            progress_callback(f"  Sampling trajectory {i+1}/{len(pruned_subgraphs)}")
+            progress_callback(f"  Processing trajectory {i+1}/{len(pruned_subgraphs)}")
 
-        if len(path) < min_trajectory_length * T:
-            continue
-
-        interpolated_pos = {}
-        interpolated_val = {}
-
+        # 1.1: Basic Interpolation
+        known_pos = {}
         for node in path:
             t, c = reverse_ids[node]
-            interpolated_pos[t] = c
-
-        detected_times = sorted(interpolated_pos.keys())
-        if not detected_times:
-            continue
-
-        start_pos = interpolated_pos[detected_times[0]]
-        for t in range(0, detected_times[0]):
-            interpolated_pos[t] = start_pos
-
-        end_pos = interpolated_pos[detected_times[-1]]
-        for t in range(detected_times[-1] + 1, T):
-            interpolated_pos[t] = end_pos
-
+            known_pos[t] = c
+            
+        detected_times = sorted(known_pos.keys())
+        if not detected_times: continue
+        
+        # 1.2: Metrics Prep
+        n_detected = len(detected_times)
+        detected_mask = numpy.zeros(T, dtype=bool)
+        detected_mask[detected_times] = True
+        
+        interpolated_pos = numpy.zeros((T, 2))
+        for t in detected_times: interpolated_pos[t] = known_pos[t]
+        interpolated_pos[:detected_times[0]] = known_pos[detected_times[0]]
+        interpolated_pos[detected_times[-1] + 1:] = known_pos[detected_times[-1]]
+        
+        max_gap = 0
         for j in range(len(detected_times) - 1):
-            lt, rt = detected_times[j], detected_times[j + 1]
-            if rt == lt + 1:
-                continue
-            lc = numpy.array(interpolated_pos[lt])
-            rc = numpy.array(interpolated_pos[rt])
-            for t in range(lt + 1, rt):
-                alpha = float(t - lt) / (rt - lt)
-                interpolated_pos[t] = tuple(lc * (1.0 - alpha) + rc * alpha)
+            t1, t2 = detected_times[j], detected_times[j+1]
+            gap = t2 - t1 - 1
+            if gap > max_gap: max_gap = gap
+            if gap > 0:
+                p1 = numpy.array(known_pos[t1])
+                p2 = numpy.array(known_pos[t2])
+                for t in range(t1 + 1, t2):
+                    alpha = (t - t1) / (t2 - t1)
+                    interpolated_pos[t] = p1 * (1.0 - alpha) + p2 * alpha
 
-        full_trajectory = []
-        cancel = False
-        b_half = sampling_box_size // 2
+        # 1.3: Compute Spatial Metrics
+        int_pos = numpy.round(interpolated_pos).astype(int)
+        jumps = numpy.sqrt(numpy.sum(numpy.diff(int_pos, axis=0) ** 2, axis=1))
+        max_step = numpy.max(jumps) if len(jumps) > 0 else 0.0
 
+        y_coords = int_pos[:, 0]
+        x_coords = int_pos[:, 1]
+        in_bounds_y = (y_coords >= b_half) & (y_coords < h - b_half)
+        in_bounds_x = (x_coords >= b_half) & (x_coords < w - b_half)
+        boundary_fail = not numpy.all(in_bounds_y & in_bounds_x)
+
+        if n_detected > 1:
+            det_points = numpy.array([known_pos[t] for t in detected_times])
+            std_devs = numpy.std(det_points, axis=0)
+            spatial_jitter_raw = numpy.sqrt(numpy.sum(std_devs**2))
+            
+            smooth_path = scipy.ndimage.uniform_filter1d(det_points, size=5, axis=0, mode='nearest')
+            residuals = det_points - smooth_path
+            res_std = numpy.std(residuals, axis=0)
+            spatial_jitter_detrended = numpy.sqrt(numpy.sum(res_std**2))
+        else:
+            spatial_jitter_raw = 0.0
+            spatial_jitter_detrended = 0.0
+
+        cand = TrajectoryCandidate(
+            id=i,
+            pruned_path_nodes=path,
+            positions=int_pos,
+            detected_mask=detected_mask,
+        )
+        cand.metrics.n_detected = n_detected
+        cand.metrics.path_node_fraction = len(path) / T # Legacy metric
+        cand.metrics.detected_fraction = n_detected / T # Scientific metric
+        cand.metrics.max_gap = max_gap
+        cand.metrics.max_step = max_step
+        cand.metrics.boundary_fail = boundary_fail
+        cand.metrics.spatial_jitter_raw = spatial_jitter_raw
+        cand.metrics.spatial_jitter_detrended = spatial_jitter_detrended
+        
+        # 1.4: GATE LOGIC
+        
+        is_valid = False
+
+        if mode == 'strict':
+            # Strict Policy: Mimic legacy checks
+            if cand.metrics.path_node_fraction < min_trajectory_length:
+                cand.reject_reason = "min_length_strict"
+                is_valid = False
+            elif cand.metrics.boundary_fail:
+                cand.reject_reason = "boundary_strict"
+                is_valid = False
+            elif cand.metrics.max_step > max_interpolation_distance:
+                cand.reject_reason = "max_step_strict"
+                is_valid = False
+            else:
+                is_valid = True
+        else:
+            # Scored Policy: Loose Gate
+            if boundary_fail:
+                cand.reject_reason = "boundary_physical"
+                is_valid = False
+            elif n_detected < 3:
+                cand.reject_reason = "insufficient_points"
+                is_valid = False
+            elif cand.metrics.path_node_fraction < 0.01:
+                 cand.reject_reason = "too_short_loose"
+                 is_valid = False
+            else:
+                 is_valid = True
+
+        cand.is_valid_spatial = is_valid
+        candidates.append(cand)
+
+    # --- PASS 2: TRACE EXTRACTION ---
+    for cand in candidates:
+        if not cand.is_valid_spatial:
+            continue
+            
+        trace = numpy.zeros(T)
         for t in range(T):
-            c = numpy.round(numpy.array(interpolated_pos[t])).astype(int)
-            full_trajectory.append(c)
-
-            h, w = ims[t].shape
-            y, x = c
-
-            if not (b_half <= y < h - b_half and b_half <= x < w - b_half):
-                cancel = True
-                break
-
+            y, x = cand.positions[t]
             patch = ims[t][
                 y - b_half : y + b_half + 1,
                 x - b_half : x + b_half + 1,
             ]
-            interpolated_val[t] = numpy.sum(patch * blur)
+            trace[t] = numpy.sum(patch * blur_kernel)
+            
+        cand.trace = trace
+        cand.trace_extracted = True
+        
+        med = numpy.median(trace)
+        mad = numpy.median(numpy.abs(trace - med))
+        if mad > 0:
+            cand.metrics.trace_snr_proxy = med / mad
+        else:
+            cand.metrics.trace_snr_proxy = 0.0
 
-        if cancel:
-            continue
+    # --- PASS 3: FINAL ACCEPTANCE ---
+    for cand in candidates:
+        # In strict mode, acceptance was already decided by the gate.
+        # In scored mode, we accept everything that survived extraction (for now).
+        if cand.trace_extracted:
+            cand.accepted = True
+        else:
+            cand.accepted = False
+            
+    # --- OUTPUT GENERATION ---
+    if return_candidates:
+        return candidates
 
-        full_trajectory = numpy.array(full_trajectory)
-
-        distances = numpy.sqrt(numpy.sum(numpy.diff(full_trajectory, axis=0) ** 2, axis=1))
-        if numpy.any(distances > max_interpolation_distance):
-            continue
-
-        coms.append(numpy.mean(full_trajectory, axis=0))
-        trajectories.append(full_trajectory)
-        lines.append(numpy.array(sorted(interpolated_val.items())))
-
+    final_coms = []
+    final_trajectories = []
+    final_lines = []
+    
+    for cand in candidates:
+        # Safety: trace must be present to write output
+        if cand.accepted and cand.trace is not None:
+            line_data = numpy.column_stack((numpy.arange(T), cand.trace))
+            final_coms.append(numpy.mean(cand.positions, axis=0))
+            final_trajectories.append(cand.positions)
+            final_lines.append(line_data)
+            
     return (
-        numpy.array(coms),
-        numpy.array(trajectories),
-        numpy.array(lines),
+        numpy.array(final_coms),
+        numpy.array(final_trajectories),
+        numpy.array(final_lines),
     )
