@@ -2,7 +2,7 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from PyQt5 import QtWidgets, QtCore
+from PyQt5 import QtWidgets, QtCore, QtGui
 from matplotlib.path import Path
 from scipy.stats import circmean
 
@@ -26,13 +26,39 @@ from gui.analysis import (
 )
 import cosinor as csn
 
+"""
+SingleAnimalPanel invariants (do not change without intent and verification):
+
+INDEXING / SELECTION
+- "original_index" means the global candidate index in unfiltered space (0-based).
+- "filtered_indices" maps local indices (in loaded_data) back to original_index.
+- Viewers that display spatial points may show filtered data, but selection callbacks must
+  ultimately resolve to original_index, then map to local_index via filtered_indices.
+
+FILTER INTERSECTION
+- The definitive filter is the intersection:
+    final_mask = roi_mask & metric_mask
+- roi_mask and metric_mask are always length == num_total_candidates (unfiltered space).
+- The order of applying ROI vs Quality Gate must not change results, only the final intersection matters.
+
+ROI SCHEMA
+- ROI dictionaries may contain:
+    {"mode": "Include"/"Exclude", "path_vertices": [...], optional "path": matplotlib.path.Path}
+- Viewers must not assume "path" exists. Prefer path_vertices, build Path if needed.
+
+PHASE REFERENCE
+- phase_reference_rois are in the same coordinate space as state.unfiltered_data["roi"].
+- Reference masking uses coordinates from loaded_data (post ROI/gate intersection), so any
+  future coordinate transform must be applied consistently to both.
+"""
+
 class SingleAnimalPanel(QtWidgets.QWidget):
     def __init__(self, main_window):
         super().__init__(main_window)
         self.mw = main_window
         self.state = main_window.state
         
-        # Local state for this panel
+        # Local state
         self.params = {}
         self.phase_params = {}
         self.filtered_indices = None
@@ -40,12 +66,14 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         self.phase_reference_rois = None
         self.vmin = None
         self.vmax = None
-        self.metrics_df = None 
+        self.metrics_df = None
+        self.latest_rhythm_df = None
         
         # Filtering State
         self.roi_mask = None
         self.metric_mask = None
         self.num_total_candidates = 0
+        self.quality_presets = {}  # Computed on load
         
         # Thread handles
         self._analysis_worker = None
@@ -53,100 +81,130 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         self._movie_loader_worker = None
         self._movie_loader_thread = None
 
+        # Visibility Tracking
+        self.advanced_widgets = [] # List of widgets to hide/show
+
         self.init_ui()
         self.connect_signals()
+        
+        # Initial State
+        self._set_ui_mode(False) # Default to Basic
+        self._update_workflow_status()
 
     def init_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
         
-        # File I/O
-        io_box = QtWidgets.QGroupBox("File I/O")
-        io_layout = QtWidgets.QGridLayout(io_box)
+        # --- Top Control Bar ---
+        top_row = QtWidgets.QHBoxLayout()
+        self.chk_advanced_mode = QtWidgets.QCheckBox("Show Advanced Controls")
+        top_row.addWidget(self.chk_advanced_mode)
+        top_row.addStretch(1)
+        layout.addLayout(top_row)
+
+        # --- 1. File I/O Box ---
+        self.io_box = QtWidgets.QGroupBox("File I/O")
+        io_layout = QtWidgets.QGridLayout(self.io_box)
+        
         self.btn_load_movie = QtWidgets.QPushButton(get_icon('fa5s.file-video'), "Load Movie...")
         io_layout.addWidget(self.btn_load_movie, 0, 0, 1, 2)
+        
         io_layout.addWidget(QtWidgets.QLabel("Input File:"), 1, 0)
         self.input_file_edit = QtWidgets.QLineEdit()
         self.input_file_edit.setReadOnly(True)
         io_layout.addWidget(self.input_file_edit, 1, 1)
+        
         io_layout.addWidget(QtWidgets.QLabel("Output Basename:"), 2, 0)
         self.output_base_edit = QtWidgets.QLineEdit()
         io_layout.addWidget(self.output_base_edit, 2, 1)
         
-        self.status_traces_label = QtWidgets.QLabel("Traces: —")
-        self.status_roi_label = QtWidgets.QLabel("ROI: —")
-        self.status_traj_label = QtWidgets.QLabel("Trajectories: —")
-        s_layout = QtWidgets.QHBoxLayout()
-        s_layout.addWidget(self.status_traces_label)
-        s_layout.addWidget(self.status_roi_label)
-        s_layout.addWidget(self.status_traj_label)
-        io_layout.addLayout(s_layout, 3, 0, 1, 2)
-        layout.addWidget(io_box)
+        layout.addWidget(self.io_box)
 
-        # ROI
-        roi_box = QtWidgets.QGroupBox("Region of Interest (ROI)")
-        roi_layout = QtWidgets.QHBoxLayout(roi_box)
+        # --- 2. Workflow Status Strip ---
+        self.workflow_box = QtWidgets.QGroupBox("Workflow Status")
+        wf_layout = QtWidgets.QHBoxLayout(self.workflow_box)
+        
+        self.lbl_status_input = QtWidgets.QLabel("Input: none")
+        self.lbl_status_results = QtWidgets.QLabel("Results: none")
+        self.lbl_status_mode = QtWidgets.QLabel("Mode: unknown")
+        self.lbl_status_gate = QtWidgets.QLabel("Gate: off")
+        self.lbl_status_roi = QtWidgets.QLabel("ROI: off")
+        
+        for lbl in [self.lbl_status_input, self.lbl_status_results, self.lbl_status_mode, self.lbl_status_gate, self.lbl_status_roi]:
+            lbl.setStyleSheet("font-size: 11px; color: #333; padding: 2px; border: 1px solid #ccc; border-radius: 3px; background: #f9f9f9;")
+            wf_layout.addWidget(lbl)
+            
+        layout.addWidget(self.workflow_box)
+
+        # --- 3. ROI Box ---
+        self.roi_box = QtWidgets.QGroupBox("Region of Interest (ROI)")
+        roi_layout = QtWidgets.QHBoxLayout(self.roi_box)
         self.btn_define_roi = QtWidgets.QPushButton(get_icon('fa5s.pen'), "Define Anatomical ROI...")
         self.btn_define_roi.setEnabled(False)
-        Tooltip.install(self.btn_define_roi, "Launches the ROI drawing tool. This is required to create the `_anatomical_roi.json` file, which is a prerequisite for the Atlas Registration workflow.")
+        Tooltip.install(self.btn_define_roi, "Draw include/exclude polygons to filter cells spatially.")
+        
         self.btn_clear_roi = QtWidgets.QPushButton(get_icon('fa5s.times'), "Clear ROI Filter")
         self.btn_clear_roi.setEnabled(False)
+        
         roi_layout.addWidget(self.btn_define_roi)
         roi_layout.addWidget(self.btn_clear_roi)
-        layout.addWidget(roi_box)
+        layout.addWidget(self.roi_box)
         
-        # Post-Hoc Data Filtering
-        filter_box = QtWidgets.QGroupBox("Post-Hoc Data Filtering")
-        filter_layout = QtWidgets.QGridLayout(filter_box)
+        # --- 4. Quality Gate Box (Replaces Post-Hoc Filtering) ---
+        self.quality_gate_box = QtWidgets.QGroupBox("Quality Gate")
+        gate_layout = QtWidgets.QGridLayout(self.quality_gate_box)
+        
+        # Row 0: Presets & Override
+        gate_layout.addWidget(QtWidgets.QLabel("Preset:"), 0, 0)
+        self.quality_preset_combo = QtWidgets.QComboBox()
+        self.quality_preset_combo.addItems(["Recommended", "Lenient", "Strict", "Manual"])
+        gate_layout.addWidget(self.quality_preset_combo, 0, 1)
+        
+        self.chk_quality_manual_override = QtWidgets.QCheckBox("Manual Override")
+        gate_layout.addWidget(self.chk_quality_manual_override, 0, 2)
+        
+        # Row 1: Manual Controls (Hidden by default unless override)
+        self.manual_gate_widget = QtWidgets.QWidget()
+        manual_layout = QtWidgets.QHBoxLayout(self.manual_gate_widget)
+        manual_layout.setContentsMargins(0, 0, 0, 0)
         
         self.spin_coverage = QtWidgets.QDoubleSpinBox()
-        self.spin_coverage.setRange(0.0, 1.0); self.spin_coverage.setSingleStep(0.05); self.spin_coverage.setValue(0.0)
-        filter_layout.addWidget(QtWidgets.QLabel("Min Coverage (detected/T):"), 0, 0); filter_layout.addWidget(self.spin_coverage, 0, 1)
+        self.spin_coverage.setRange(0.0, 1.0); self.spin_coverage.setSingleStep(0.05)
+        self.spin_coverage.setPrefix("Cov >= ")
+        manual_layout.addWidget(self.spin_coverage)
         
         self.spin_jitter = QtWidgets.QDoubleSpinBox()
-        self.spin_jitter.setRange(0.0, 50.0); self.spin_jitter.setSingleStep(0.5); self.spin_jitter.setValue(10.0)
-        filter_layout.addWidget(QtWidgets.QLabel("Max Jitter (detrended px):"), 1, 0); filter_layout.addWidget(self.spin_jitter, 1, 1)
+        self.spin_jitter.setRange(0.0, 50.0); self.spin_jitter.setSingleStep(0.5)
+        self.spin_jitter.setPrefix("Jit <= ")
+        manual_layout.addWidget(self.spin_jitter)
         
         self.spin_snr = QtWidgets.QDoubleSpinBox()
-        self.spin_snr.setRange(0.0, 50.0); self.spin_snr.setSingleStep(0.5); self.spin_snr.setValue(0.0)
-        filter_layout.addWidget(QtWidgets.QLabel("Min Trace SNR Proxy:"), 2, 0); filter_layout.addWidget(self.spin_snr, 2, 1)
+        self.spin_snr.setRange(0.0, 50.0); self.spin_snr.setSingleStep(0.5)
+        self.spin_snr.setPrefix("SNR >= ")
+        manual_layout.addWidget(self.spin_snr)
         
-        self.btn_apply_filters = QtWidgets.QPushButton(get_icon('fa5s.filter'), "Apply Filters")
-        self.btn_apply_filters.setEnabled(False)
-        filter_layout.addWidget(self.btn_apply_filters, 3, 0, 1, 2)
+        gate_layout.addWidget(self.manual_gate_widget, 1, 0, 1, 3)
+        self.manual_gate_widget.setVisible(False) # Initial state
         
-        self.lbl_filter_status = QtWidgets.QLabel("Metrics not loaded.")
-        self.lbl_filter_status.setStyleSheet("color: gray; font-style: italic;")
-        filter_layout.addWidget(self.lbl_filter_status, 4, 0, 1, 2)
+        # Row 2: Apply & Status
+        self.btn_apply_quality_gate = QtWidgets.QPushButton(get_icon('fa5s.filter'), "Apply Quality Gate")
+        gate_layout.addWidget(self.btn_apply_quality_gate, 2, 0, 1, 1)
         
-        self.lbl_counts_status = QtWidgets.QLabel("Candidates: —")
-        self.lbl_counts_status.setStyleSheet("color: gray; font-style: italic;")
-        filter_layout.addWidget(self.lbl_counts_status, 5, 0, 1, 2)
+        self.lbl_quality_counts = QtWidgets.QLabel("Passing: - / -")
+        self.lbl_quality_counts.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_quality_counts.setStyleSheet("font-weight: bold;")
+        gate_layout.addWidget(self.lbl_quality_counts, 2, 1, 1, 2)
         
-        layout.addWidget(filter_box)
+        self.lbl_quality_breakdown = QtWidgets.QLabel("")
+        self.lbl_quality_breakdown.setStyleSheet("color: gray; font-size: 10px;")
+        gate_layout.addWidget(self.lbl_quality_breakdown, 3, 0, 1, 3)
+        
+        layout.addWidget(self.quality_gate_box)
 
-        # Parameters
-        param_tooltips = {
-            "sigma1": "<b>What it is:</b> The size (pixels) of the smaller Gaussian blur, roughly the radius of your cells.<br><b>How to tune it:</b> Decrease for smaller cells, increase for larger cells.<br><b>Trade-off:</b> Too small detects noise; too large merges cells.",
-            "sigma2": "<b>What it is:</b> The size (pixels) of the larger Gaussian blur for background subtraction.<br><b>How to tune it:</b> Increase for large, uneven background brightness.<br><b>Trade-off:</b> Too small subtracts cells; too large is ineffective.",
-            "blur_sigma": "<b>What it is:</b> A small blur applied before ranking features by brightness.<br><b>How to tune it:</b> A small value (1-2 pixels) makes brightness measurement more stable.<br><b>Trade-off:</b> 0 is fine, but slight blurring is often more robust.",
-            "max_features": "<b>What it is:</b> The max number of brightest features to consider in any single frame.<br><b>How to tune it:</b> Set higher than the max number of cells you expect to see.<br><b>Trade-off:</b> Too low misses cells; too high includes noise and slows analysis.",
-            "search_range": "<b>What it is:</b> Max number of frames to look backward in time to link a track.<br><b>How to tune it:</b> Increase if cells can disappear for long periods.<br><b>Trade-off:</b> Too high increases incorrect matches and slows tracking.",
-            "cone_radius_base": "<b>What it is:</b> The initial search radius (pixels) for linking a cell to the very next frame.<br><b>How to tune it:</b> Increase if cells move rapidly between frames.<br><b>Trade-off:</b> Too small fails to track fast cells; too large risks mismatches with neighbors.",
-            "cone_radius_multiplier": "<b>What it is:</b> A factor allowing the search radius to grow for linking across larger time gaps.<br><b>How to tune it:</b> Advanced. Leave at default unless movement is very erratic.<br><b>Trade-off:</b> Helps track fast cells over gaps, but increases mismatch risk.",
-            "min_trajectory_length": "<b>What it is:</b> The minimum track length as a fraction of total movie length (e.g., 0.08 = 8%).<br><b>How to tune it:</b> Increase to be stricter; decrease to include transient cells.<br><b>Trade-off:</b> Too high discards valid cells; too low includes noisy false-positives.",
-            "sampling_box_size": "<b>What it is:</b> Side length (pixels) of the square box used to measure cell brightness.<br><b>How to tune it:</b> Should be large enough to encompass the entire cell (e.g., 2-3x cell diameter).<br><b>Trade-off:</b> Too small misses signal; too large includes background noise.",
-            "sampling_sigma": "<b>What it is:</b> Blur applied within the sampling box for a weighted measurement.<br><b>How to tune it:</b> Should be close to the cell's radius. A value of 0 is a simple average.<br><b>Trade-off:</b> A good value (e.g., 2.0) makes the measurement robust to tracking jitter.",
-            "max_interpolation_distance": "<b>What it is:</b> A safety check. Tracks with a frame-to-frame jump larger than this (in pixels) are discarded.<br><b>How to tune it:</b> Set slightly larger than the max plausible distance a cell could move in one frame.<br><b>Trade-off:</b> Too low discards valid fast cells; too high fails to catch errors.",
-            "minutes_per_frame": "<b>REQUIRED:</b> The sampling interval of your recording in minutes.",
-            "period_min": "<b>Optional:</b> Constrains the rhythm search to periods LONGER than this value (in hours).",
-            "period_max": "<b>Optional:</b> Constrains the rhythm search to periods SHORTER than this value (in hours).",
-            "grid_resolution": "<b>What it is:</b> The resolution of the grid used for interpolated and group average maps.<br><b>How to tune it:</b> Higher values produce a smoother, higher-resolution image but can take longer to compute.",
-            "rhythm_threshold": "<b>What it is:</b> The cutoff for considering a cell 'rhythmic'. Its meaning depends on the selected Analysis Method.<br><b>FFT (SNR):</b> A signal-to-noise ratio. A value >= 2.0 is a good start.<br><b>Cosinor (p-value):</b> The statistical significance. A value less than or equal to 0.05 is standard.",
-            "r_squared_threshold": "<b>What it is:</b> (Cosinor only) The 'goodness-of-fit'. Filters for cells where the cosine model explains at least this much of the data's variance.<br><b>How to tune it:</b> A value >= 0.3 is a reasonable starting point for finding well-fit rhythms."
-        }
+        # --- 5. Analysis Parameters (Advanced Only) ---
+        self.param_box = QtWidgets.QGroupBox("Analysis Parameters")
+        param_layout = QtWidgets.QVBoxLayout(self.param_box)
         
-        param_box = QtWidgets.QGroupBox("Analysis Parameters")
-        param_layout = QtWidgets.QVBoxLayout(param_box)
+        # Save/Load
         btn_row = QtWidgets.QHBoxLayout()
         self.btn_save_params = QtWidgets.QPushButton(get_icon('fa5s.download'), "Save Params...")
         self.btn_load_params = QtWidgets.QPushButton(get_icon('fa5s.upload'), "Load Params...")
@@ -154,23 +212,40 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         btn_row.addWidget(self.btn_load_params)
         param_layout.addLayout(btn_row)
         
-        tabs = QtWidgets.QTabWidget()
-        param_layout.addWidget(tabs)
+        # Tabs
+        self.param_tabs = QtWidgets.QTabWidget()
+        param_layout.addWidget(self.param_tabs)
         
+        # Define Tooltips
+        param_tooltips = {
+            "sigma1": "Smaller Gaussian blur radius (pixels).",
+            "sigma2": "Larger Gaussian blur radius (pixels) for background subtraction.",
+            "blur_sigma": "Blur applied before ranking features.",
+            "max_features": "Max brightest features per frame.",
+            "search_range": "Max frames to look backward for linking.",
+            "cone_radius_base": "Initial search radius (pixels).",
+            "cone_radius_multiplier": "Radius growth factor per frame gap.",
+            "min_trajectory_length": "Min track length (fraction of movie).",
+            "sampling_box_size": "Intensity sampling box size (pixels).",
+            "sampling_sigma": "Gaussian weights sigma for sampling.",
+            "max_interpolation_distance": "Max allowed jump (pixels) between frames."
+        }
+
+        # Populate Tabs
         det_tab = QtWidgets.QWidget()
         det_layout = QtWidgets.QFormLayout(det_tab)
         self._add_param_field(det_layout, "sigma1", 3.0, param_tooltips)
         self._add_param_field(det_layout, "sigma2", 20.0, param_tooltips)
         self._add_param_field(det_layout, "blur_sigma", 2.0, param_tooltips)
         self._add_param_field(det_layout, "max_features", 200, param_tooltips)
-        tabs.addTab(det_tab, "Detection")
+        self.param_tabs.addTab(det_tab, "Detection")
         
         tr_tab = QtWidgets.QWidget()
         tr_layout = QtWidgets.QFormLayout(tr_tab)
         self._add_param_field(tr_layout, "search_range", 50, param_tooltips)
         self._add_param_field(tr_layout, "cone_radius_base", 1.5, param_tooltips)
         self._add_param_field(tr_layout, "cone_radius_multiplier", 0.125, param_tooltips)
-        tabs.addTab(tr_tab, "Tracking")
+        self.param_tabs.addTab(tr_tab, "Tracking")
         
         fl_tab = QtWidgets.QWidget()
         fl_layout = QtWidgets.QFormLayout(fl_tab)
@@ -180,99 +255,74 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         self._add_param_field(fl_layout, "max_interpolation_distance", 5.0, param_tooltips)
         
         self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItem("Strict (Legacy)", "strict")
-        self.mode_combo.addItem("Scored (All Candidates)", "scored")
-        Tooltip.install(self.mode_combo, "<b>Strict:</b> Replicates legacy behavior exactly.<br><b>Scored:</b> Keeps more candidates and computes quality metrics.")
-        fl_layout.addRow("Filtering Mode:", self.mode_combo)
+        self.mode_combo.addItem("Legacy pipeline (no metrics)", "strict")
+        self.mode_combo.addItem("Metrics pipeline (recommended)", "scored")
+        Tooltip.install(
+            self.mode_combo,
+            "This controls the analysis pipeline run by AnalysisWorker. "
+            "Separately, the Quality Gate is available only if a valid metrics CSV is loaded."
+        )
+        fl_layout.addRow("Analysis Pipeline:", self.mode_combo)
         
-        tabs.addTab(fl_tab, "Filtering")
-        layout.addWidget(param_box)
+        self.param_tabs.addTab(fl_tab, "Filtering")
+        
+        layout.addWidget(self.param_box)
+        self.advanced_widgets.append(self.param_box) # Whole box is advanced
 
-        # Phase Map Parameters
-        phase_box = QtWidgets.QGroupBox("Phase Map Parameters")
-        phase_layout = QtWidgets.QFormLayout(phase_box)
+        # --- 6. Phase Map Parameters ---
+        self.phase_box = QtWidgets.QGroupBox("Phase Map Parameters")
+        phase_layout = QtWidgets.QFormLayout(self.phase_box)
+        
+        # Basic Phase Controls
         self.analysis_method_combo = QtWidgets.QComboBox()
         self.analysis_method_combo.addItems(["FFT (SNR)", "Cosinor (p-value)"])
         phase_layout.addRow("Analysis Method:", self.analysis_method_combo)
         
-        self.use_subregion_ref_check = QtWidgets.QCheckBox("Use Drawn Sub-Region as Phase Reference")
-        Tooltip.install(
-            self.use_subregion_ref_check,
-            "<b>What it does:</b> If checked, the mean phase of only the cells inside your drawn 'Phase Reference' polygon will be used as the 'zero point' for the phase map."
-        )
-        self.use_subregion_ref_check.setEnabled(False)
-        phase_layout.addRow(self.use_subregion_ref_check)        
-
         self._add_phase_field(phase_layout, "minutes_per_frame", 15.0)
+        
         self.discovered_period_edit = QtWidgets.QLineEdit("N/A")
         self.discovered_period_edit.setReadOnly(True)
         phase_layout.addRow("Discovered Period (hrs):", self.discovered_period_edit)
-        self._add_phase_field(phase_layout, "period_min", 22.0)
-        self._add_phase_field(phase_layout, "period_max", 28.0)
-        self._add_phase_field(phase_layout, "trend_window_hours", 36.0)
-        self._add_phase_field(phase_layout, "grid_resolution", 100, int)
         
-        _, self.rhythm_threshold_label = self._add_phase_field(
-            phase_layout, "rhythm_threshold", 2.0,
-        )
-        rsquared_le, rsquared_label = self._add_phase_field(
-            phase_layout, "r_squared_threshold", 0.3,
-        )
-        self.rsquared_widgets = (rsquared_label, rsquared_le)
-
-        self.emphasize_rhythm_check = QtWidgets.QCheckBox("Emphasize rhythmic cells in all plots")
-        Tooltip.install(
-            self.emphasize_rhythm_check,
-            "<b>What it does:</b> de-emphasizes non-rhythmic cells in all visualizations "
-            "(Heatmap, Center of Mass, Phase Maps). Rhythmic cells remain fully visible.",
-        )
-        phase_layout.addRow(self.emphasize_rhythm_check)
-
-        self.strict_cycle_check = QtWidgets.QCheckBox("Require >= 2 cycles (strict filter)")
-        Tooltip.install(
-            self.strict_cycle_check,
-            "<b>What it does:</b> after FFT/Cosinor thresholds, only keeps cells that show at "
-            "least two cycles near the target period, based on peak counting.",
-        )
+        _, self.rhythm_threshold_label = self._add_phase_field(phase_layout, "rhythm_threshold", 2.0)
+        
+        # Cosinor specific (Conditional)
+        self.rsquared_le, self.rsquared_label = self._add_phase_field(phase_layout, "r_squared_threshold", 0.3)
+        self.rsquared_widgets = [self.rsquared_le, self.rsquared_label]
+        
+        self.strict_cycle_check = QtWidgets.QCheckBox("Require >= 2 cycles")
         phase_layout.addRow(self.strict_cycle_check)
-
-        self.btn_regen_phase = QtWidgets.QPushButton(get_icon('fa5s.sync'), "Update Plots")
-        Tooltip.install(self.btn_regen_phase, "Re-calculates all relevant plots (Heatmap, Center of Mass, Phase Maps).")
-        self.btn_regen_phase.setEnabled(False)
         
-        self.btn_save_rhythm = QtWidgets.QPushButton(get_icon('fa5s.save'), "Save Rhythm Results")
-        Tooltip.install(self.btn_save_rhythm, "Saves the current rhythmicity status (Approved/Rejected) and phase data for every cell to a CSV file. This locks in these results for Group Analysis.")
-        self.btn_save_rhythm.setEnabled(False)
+        self.emphasize_rhythm_check = QtWidgets.QCheckBox("Emphasize rhythmic cells")
+        phase_layout.addRow(self.emphasize_rhythm_check)
         
+        # Advanced Phase Controls (Collected for toggling)
+        self.adv_phase_rows = []
+        
+        self.adv_phase_rows.extend(self._add_phase_field(phase_layout, "period_min", 22.0, is_advanced=True))
+        self.adv_phase_rows.extend(self._add_phase_field(phase_layout, "period_max", 28.0, is_advanced=True))
+        self.adv_phase_rows.extend(self._add_phase_field(phase_layout, "trend_window_hours", 36.0, is_advanced=True))
+        self.adv_phase_rows.extend(self._add_phase_field(phase_layout, "grid_resolution", 100, int, is_advanced=True))
+        
+        self.use_subregion_ref_check = QtWidgets.QCheckBox("Set phase zero using reference polygon")
+        self.use_subregion_ref_check.setEnabled(False)
+        phase_layout.addRow(self.use_subregion_ref_check)
+        self.adv_phase_rows.append(self.use_subregion_ref_check)
+        
+        # Actions (Always visible)
         btn_row = QtWidgets.QHBoxLayout()
+        self.btn_regen_phase = QtWidgets.QPushButton(get_icon('fa5s.sync'), "Update Plots")
+        self.btn_save_rhythm = QtWidgets.QPushButton(get_icon('fa5s.save'), "Save Rhythm Results")
+        self.btn_save_rhythm.setEnabled(False)
         btn_row.addWidget(self.btn_regen_phase)
         btn_row.addWidget(self.btn_save_rhythm)
         phase_layout.addRow(btn_row)
-
-        layout.addWidget(phase_box)
+        
+        layout.addWidget(self.phase_box)
         layout.addStretch(1)
         
+        # Init dynamic UI state
         self._on_analysis_method_changed(0)
-
-    def connect_signals(self):
-        self.btn_load_movie.clicked.connect(self.load_movie)
-        self.output_base_edit.textChanged.connect(self.update_output_basename)
-        self.btn_define_roi.clicked.connect(self.open_roi_tool)
-        self.btn_clear_roi.clicked.connect(self.clear_roi_filter)
-        self.btn_save_params.clicked.connect(self.save_parameters)
-        self.btn_load_params.clicked.connect(self.load_parameters)
-        self.btn_apply_filters.clicked.connect(self.apply_post_hoc_filters)
-        
-        self.mw.btn_run_analysis.clicked.connect(self.start_analysis)
-        self.mw.btn_load_results.clicked.connect(self.load_results)
-        self.mw.btn_export_plot.clicked.connect(self.export_current_plot)
-        self.mw.btn_export_data.clicked.connect(self.export_current_data)
-        
-        self.btn_regen_phase.clicked.connect(self.regenerate_phase_maps)
-        self.btn_save_rhythm.clicked.connect(self.save_rhythm_results)
-        self.emphasize_rhythm_check.stateChanged.connect(self.regenerate_phase_maps)
-        self.use_subregion_ref_check.stateChanged.connect(self.regenerate_phase_maps)
-        self.analysis_method_combo.currentIndexChanged.connect(self._on_analysis_method_changed)
 
     def _add_param_field(self, layout, name, default, tooltips=None):
         label = QtWidgets.QLabel(f"{name}:")
@@ -283,36 +333,184 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         self.params[name] = (le, type(default))
         return le, label
 
-    def _add_phase_field(self, layout, name, default, typ=float, tooltips=None):
+    def _add_phase_field(self, layout, name, default, typ=float, is_advanced=False):
         label = QtWidgets.QLabel(f"{name}:")
-        if tooltips and name in tooltips:
-            Tooltip.install(label, tooltips[name])
         le = QtWidgets.QLineEdit(str(default))
         layout.addRow(label, le)
         self.phase_params[name] = (le, typ)
-        return le, label
+        if is_advanced:
+            self.advanced_widgets.append(label)
+            self.advanced_widgets.append(le)
+            return [label, le]
+        return [le, label]
 
-    def reset_state(self):
-        self.filtered_indices = None
-        self.rois = None
-        self.phase_reference_rois = None
-        self.use_subregion_ref_check.setChecked(False)
-        self.use_subregion_ref_check.setEnabled(False)
-        self.vmin = None
-        self.vmax = None
-        self.metrics_df = None
-        self.roi_mask = None
-        self.metric_mask = None
-        self.num_total_candidates = 0
-        self.btn_define_roi.setEnabled(False)
-        self.btn_clear_roi.setEnabled(False)
-        self.btn_regen_phase.setEnabled(False)
-        self.btn_apply_filters.setEnabled(False)
-        self.lbl_filter_status.setText("Metrics not loaded.")
-        self.lbl_counts_status.setText("Candidates: —")
-        self.status_traces_label.setText("Traces: —")
-        self.status_roi_label.setText("ROI: —")
-        self.status_traj_label.setText("Trajectories: —")
+    def connect_signals(self):
+        # Top Level
+        self.chk_advanced_mode.toggled.connect(self._set_ui_mode)
+        
+        # IO
+        self.btn_load_movie.clicked.connect(self.load_movie)
+        self.output_base_edit.textChanged.connect(self.update_output_basename)
+        
+        # ROI
+        self.btn_define_roi.clicked.connect(self.open_roi_tool)
+        self.btn_clear_roi.clicked.connect(self.clear_roi_filter)
+        
+        # Quality Gate
+        self.quality_preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        self.chk_quality_manual_override.toggled.connect(self._on_manual_override_toggled)
+        self.btn_apply_quality_gate.clicked.connect(self.apply_quality_gate)
+        
+        # Params
+        self.btn_save_params.clicked.connect(self.save_parameters)
+        self.btn_load_params.clicked.connect(self.load_parameters)
+        
+        # Main Window Hooks
+        self.mw.btn_run_analysis.clicked.connect(self.start_analysis)
+        self.mw.btn_load_results.clicked.connect(self.load_results)
+        self.mw.btn_export_plot.clicked.connect(self.export_current_plot)
+        self.mw.btn_export_data.clicked.connect(self.export_current_data)
+        
+        # Phase
+        self.btn_regen_phase.clicked.connect(self.regenerate_phase_maps)
+        self.btn_save_rhythm.clicked.connect(self.save_rhythm_results)
+        self.emphasize_rhythm_check.stateChanged.connect(self.regenerate_phase_maps)
+        self.use_subregion_ref_check.stateChanged.connect(self.regenerate_phase_maps)
+        self.analysis_method_combo.currentIndexChanged.connect(self._on_analysis_method_changed)
+
+    # --- UI Controller Logic ---
+    
+    def _set_ui_mode(self, is_advanced):
+        for widget in self.advanced_widgets:
+            widget.setVisible(is_advanced)
+        # Handle specialized advanced rows list
+        for widget in self.adv_phase_rows:
+            widget.setVisible(is_advanced)
+            
+    def _update_workflow_status(self):
+        # 1. Input
+        if self.state.input_movie_path:
+            self.lbl_status_input.setText(f"Input: {os.path.basename(self.state.input_movie_path)}")
+            self.lbl_status_input.setStyleSheet("background: #d4edda; border: 1px solid #c3e6cb;")
+        else:
+            self.lbl_status_input.setText("Input: none")
+            self.lbl_status_input.setStyleSheet("background: #f9f9f9; border: 1px solid #ccc;")
+
+        # 2. Results
+        has_traces = self.state.unfiltered_data.get("traces") is not None
+        if has_traces:
+            self.lbl_status_results.setText("Results: loaded")
+            self.lbl_status_results.setStyleSheet("background: #d4edda; border: 1px solid #c3e6cb;")
+        else:
+            self.lbl_status_results.setText("Results: none")
+            self.lbl_status_results.setStyleSheet("background: #f9f9f9; border: 1px solid #ccc;")
+            
+        # 3. Mode (Determined by metrics availability)
+        has_metrics = self.metrics_df is not None
+        if has_traces:
+            if has_metrics:
+                self.lbl_status_mode.setText("Metrics: available")
+                self.lbl_status_mode.setStyleSheet("background: #cce5ff; border: 1px solid #b8daff;")
+            else:
+                self.lbl_status_mode.setText("Metrics: missing")
+                self.lbl_status_mode.setStyleSheet("background: #fff3cd; border: 1px solid #ffeeba;")
+        else:
+            self.lbl_status_mode.setText("Mode: —")
+            self.lbl_status_mode.setStyleSheet("background: #f9f9f9;")
+
+        # 4. ROI
+        N = self.num_total_candidates
+        roi_n = self.roi_mask.sum() if self.roi_mask is not None else 0
+        if self.roi_mask is not None and roi_n < N:
+             self.lbl_status_roi.setText(f"ROI: Active ({roi_n})")
+             self.lbl_status_roi.setStyleSheet("background: #d4edda; border: 1px solid #c3e6cb;")
+        else:
+             self.lbl_status_roi.setText("ROI: Off")
+             self.lbl_status_roi.setStyleSheet("background: #f9f9f9; border: 1px solid #ccc;")
+
+        # 5. Gate
+        gate_n = self.metric_mask.sum() if self.metric_mask is not None else 0
+        if self.metric_mask is not None and gate_n < N:
+            method = "Manual" if self.chk_quality_manual_override.isChecked() else self.quality_preset_combo.currentText()
+            self.lbl_status_gate.setText(f"Gate: {method} ({gate_n})")
+            self.lbl_status_gate.setStyleSheet("background: #d4edda; border: 1px solid #c3e6cb;")
+        else:
+            self.lbl_status_gate.setText("Gate: Off")
+            self.lbl_status_gate.setStyleSheet("background: #f9f9f9; border: 1px solid #ccc;")
+            
+        # 6. Overall Counts
+        final_n = (self.roi_mask & self.metric_mask).sum() if (self.roi_mask is not None and self.metric_mask is not None) else 0
+        if N > 0:
+            pct = (final_n / N) * 100.0
+            self.lbl_quality_counts.setText(f"Passing: {final_n} / {N} ({pct:.1f}%)")
+        else:
+            self.lbl_quality_counts.setText("Passing: - / -")
+
+    def _on_preset_changed(self):
+        # Do not apply immediately. Just update UI spinboxes if we are in a mode that allows it.
+        # This gives visual feedback of what "Strict" actually means in numbers.
+        preset_name = self.quality_preset_combo.currentText()
+        if preset_name == "Manual":
+            self.chk_quality_manual_override.setChecked(True)
+            return
+
+        vals = self.quality_presets.get(preset_name)
+        if vals:
+            self.spin_coverage.setValue(vals.get('cov', 0.0))
+            self.spin_jitter.setValue(vals.get('jit', 50.0))
+            self.spin_snr.setValue(vals.get('snr', 0.0))
+
+    def _on_manual_override_toggled(self, checked):
+        self.manual_gate_widget.setVisible(checked)
+        if checked:
+            self.quality_preset_combo.setCurrentText("Manual")
+
+    def _compute_quality_presets(self):
+        """Derive preset thresholds dynamically from loaded metrics percentiles."""
+        if self.metrics_df is None: 
+            self.quality_presets = {}
+            return
+
+        df = self.metrics_df
+        presets = {}
+        
+        # Helper to get percentile or default
+        def get_p(col, p, default, reverse=False):
+            if col not in df.columns: return default
+            vals = pd.to_numeric(df[col], errors='coerce').values
+            vals = vals[np.isfinite(vals)]
+            if len(vals) == 0: return default
+            return np.percentile(vals, p)
+
+        # 1. Lenient (Bottom 50% cov, Top 95% jitter, Top 90% SNR)
+        presets["Lenient"] = {
+            'cov': get_p('detected_fraction', 50, 0.0),
+            'jit': get_p('spatial_jitter_detrended', 95, 50.0),
+            'snr': get_p('trace_snr_proxy', 10, 0.0)
+        }
+        
+        # 2. Recommended (Top 75% cov, Bottom 75% jitter, Top 25% SNR)
+        presets["Recommended"] = {
+            'cov': get_p('detected_fraction', 75, 0.5),
+            'jit': get_p('spatial_jitter_detrended', 75, 5.0),
+            'snr': get_p('trace_snr_proxy', 25, 2.0)
+        }
+        
+        # 3. Strict (Top 90% cov, Bottom 50% jitter, Top 50% SNR)
+        presets["Strict"] = {
+            'cov': get_p('detected_fraction', 90, 0.8),
+            'jit': get_p('spatial_jitter_detrended', 50, 2.0),
+            'snr': get_p('trace_snr_proxy', 50, 5.0)
+        }
+        
+        self.quality_presets = presets
+        # Update spinboxes to Recommended by default without applying
+        if "Recommended" in presets:
+            self.spin_coverage.setValue(presets["Recommended"]['cov'])
+            self.spin_jitter.setValue(presets["Recommended"]['jit'])
+            self.spin_snr.setValue(presets["Recommended"]['snr'])
+
+    # --- Data Loading & Analysis ---
 
     def load_movie(self):
         self.mw._reset_state()
@@ -320,10 +518,7 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select Movie", start_dir, "TIFF files (*.tif *.tiff);;All files (*.*)"
         )
-        if not path:
-            self.input_file_edit.clear()
-            self.output_base_edit.clear()
-            return
+        if not path: return
         
         self.mw._set_last_dir(path)
         self.state.input_movie_path = path
@@ -334,6 +529,7 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         self.mw.workflow_state["has_input"] = True
         self.mw.log_message(f"Loaded movie: {os.path.basename(path)}")
         self.mw.update_workflow_from_files()
+        self._update_workflow_status()
 
     def update_output_basename(self, text):
         self.state.output_basename = text
@@ -375,6 +571,7 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             else:
                 self.mw.log_message("Analysis failed.")
             self.mw.update_workflow_from_files()
+            self._update_workflow_status()
             
         self._analysis_worker.finished.connect(done)
         self._analysis_thread.start()
@@ -390,6 +587,7 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             return
 
         try:
+            # Load basic data
             traces = np.loadtxt(f"{basename}_traces.csv", delimiter=",")
             roi = np.loadtxt(f"{basename}_roi.csv", delimiter=",")
             traj = np.load(f"{basename}_trajectories.npy")
@@ -401,42 +599,37 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             self.state.unfiltered_data["roi"] = roi
             self.state.unfiltered_data["trajectories"] = traj
             
-            # Reset masks logic
+            # Reset masks
             self.num_total_candidates = len(roi)
             self.roi_mask = np.ones(self.num_total_candidates, dtype=bool)
             self.metric_mask = np.ones(self.num_total_candidates, dtype=bool)
             
-            # Load Metrics if available
+            # Load Metrics
             metrics_path = f"{basename}_metrics.csv"
+            has_metrics = False
+            
             if os.path.exists(metrics_path):
-                self.metrics_df = pd.read_csv(metrics_path)
-
-                if "candidate_id" not in self.metrics_df.columns:
-                    self.metrics_df = None
-                    self.lbl_filter_status.setText("Metrics missing candidate_id. Ignoring.")
-                    self.btn_apply_filters.setEnabled(False)
-                else:
-                    self.metrics_df = self.metrics_df.sort_values("candidate_id").reset_index(drop=True)
-                    ids = self.metrics_df["candidate_id"].values
-                    if len(self.metrics_df) == self.num_total_candidates and np.array_equal(ids, np.arange(self.num_total_candidates)):
-                        self.lbl_filter_status.setText(f"Metrics loaded ({len(self.metrics_df)} rows).")
-                        self.lbl_filter_status.setStyleSheet("color: green;")
-                        self.btn_apply_filters.setEnabled(True)
-                        self._log_metrics_diagnostics()
-                    else:
-                        self.metrics_df = None
-                        self.lbl_filter_status.setText("Metrics candidate_id mismatch. Ignoring.")
-                        self.lbl_filter_status.setStyleSheet("color: red;")
-                        self.btn_apply_filters.setEnabled(False)
-                                          
-            else:
+                df = pd.read_csv(metrics_path)
+                if "candidate_id" in df.columns:
+                    df = df.sort_values("candidate_id").reset_index(drop=True)
+                    if len(df) == self.num_total_candidates:
+                        self.metrics_df = df
+                        has_metrics = True
+                        self._compute_quality_presets()
+                        self.mw.log_message(f"Metrics loaded: {len(df)} rows. Scored mode active.")
+            
+            if not has_metrics:
                 self.metrics_df = None
-                self.lbl_filter_status.setText("No metrics file found.")
-                self.lbl_filter_status.setStyleSheet("color: gray;")
-                self.btn_apply_filters.setEnabled(False)
+                self.quality_gate_box.setEnabled(False)
+                self.quality_gate_box.setTitle("Quality Gate (Unavailable - No Metrics)")
+                self.mw.log_message("No valid metrics found. Strict mode active (manual ROI only).")
+            else:
+                self.quality_gate_box.setEnabled(True)
+                self.quality_gate_box.setTitle("Quality Gate")
+                self.quality_preset_combo.setCurrentText("Recommended")
 
             self.mw.log_message("Loaded ROI and trace data.")
-            self.update_counts_label()
+            self._update_workflow_status()
             
         except Exception as e:
             self.mw.log_message(f"Error loading result files: {e}")
@@ -444,7 +637,7 @@ class SingleAnimalPanel(QtWidgets.QWidget):
 
         self.btn_load_movie.setEnabled(False)
         self.mw.btn_load_results.setEnabled(False)
-        self.mw.log_message("Loading movie in background... The UI will remain responsive.")
+        self.mw.log_message("Loading movie in background...")
 
         self._movie_loader_worker = MovieLoaderWorker(self.state.input_movie_path)
         self._movie_loader_thread = QtCore.QThread(self)
@@ -462,19 +655,23 @@ class SingleAnimalPanel(QtWidgets.QWidget):
 
     @QtCore.pyqtSlot(object)
     def _on_movie_loaded(self, movie_data):
-        self.mw.log_message("Movie loaded successfully.")
+        self.mw.log_message("Movie loaded.")
         self.state.unfiltered_data["movie"] = movie_data
         self.state.unfiltered_data["background"] = movie_data[len(movie_data) // 2]
         
         self.btn_load_movie.setEnabled(True)
         self.mw.btn_load_results.setEnabled(True)
+        
+        # Enable ROI tool if results are present
+        self.btn_define_roi.setEnabled(True)
+        
         self._resolve_filters()
         self._movie_loader_thread = None
         self._movie_loader_worker = None
 
     @QtCore.pyqtSlot(str)
     def _on_movie_load_error(self, error_message):
-        self.mw.log_message(f"--- MOVIE LOAD FAILED ---\n{error_message}")
+        self.mw.log_message(f"Movie load failed: {error_message}")
         self.btn_load_movie.setEnabled(True)
         self.mw.btn_load_results.setEnabled(True)
         if self._movie_loader_thread:
@@ -482,6 +679,54 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             self._movie_loader_thread.wait()
         self._movie_loader_thread = None
         self._movie_loader_worker = None
+
+    # --- Filtering Logic ---
+
+    def apply_post_hoc_filters(self):
+        """Compatibility wrapper for apply_quality_gate."""
+        self.apply_quality_gate()
+
+    def apply_quality_gate(self):
+        if self.metrics_df is None: return
+        
+        use_manual = self.chk_quality_manual_override.isChecked()
+        preset_name = self.quality_preset_combo.currentText()
+        
+        # Determine thresholds
+        if use_manual or preset_name == "Manual":
+            cov_min = self.spin_coverage.value()
+            jit_max = self.spin_jitter.value()
+            snr_min = self.spin_snr.value()
+        else:
+            vals = self.quality_presets.get(preset_name, {})
+            cov_min = vals.get('cov', 0.0)
+            jit_max = vals.get('jit', 50.0)
+            snr_min = vals.get('snr', 0.0)
+            
+        # Get data columns (safe fallback)
+        df = self.metrics_df
+        def get_col(name):
+             if name in df.columns: return pd.to_numeric(df[name], errors='coerce').to_numpy(dtype=float)
+             return np.full(len(df), np.nan) # Fail closed if column missing? No, logic below handles NaN.
+
+        cov = get_col('detected_fraction')
+        jit = get_col('spatial_jitter_detrended')
+        snr = get_col('trace_snr_proxy')
+
+        # Compute Masks (handling NaNs as Fail)
+        cov_ok = np.isfinite(cov) & (cov >= cov_min)
+        jit_ok = np.isfinite(jit) & (jit <= jit_max)
+        snr_ok = np.isfinite(snr) & (snr >= snr_min)
+        
+        self.metric_mask = cov_ok & jit_ok & snr_ok
+        
+        # Update breakdown label
+        n_fail_cov = (~cov_ok).sum()
+        n_fail_jit = (~jit_ok).sum()
+        n_fail_snr = (~snr_ok).sum()
+        self.lbl_quality_breakdown.setText(f"Failures: Cov={n_fail_cov}, Jit={n_fail_jit}, SNR={n_fail_snr}")
+        
+        self._resolve_filters()
 
     def open_roi_tool(self):
         if "background" not in self.state.unfiltered_data:
@@ -502,163 +747,49 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         dlg.exec_()
         self.mw.update_workflow_from_files()
 
-    def _log_metrics_diagnostics(self):
-        """Log quick diagnostics for metrics scaling and failure modes."""
-        if self.metrics_df is None or self.metrics_df.empty:
-            self.mw.log_message("Metrics diagnostics: no metrics loaded.")
-            return
-
-        df = self.metrics_df
-
-        self.mw.log_message("=== Metrics diagnostics ===")
-        self.mw.log_message(f"Rows: {len(df)} | Columns: {len(df.columns)}")
-
-        def _summ(name):
-            if name not in df.columns:
-                self.mw.log_message(f"[{name}] missing")
-                return
-            x = pd.to_numeric(df[name], errors="coerce").to_numpy(dtype=float)
-            finite = np.isfinite(x)
-            n = int(finite.sum())
-            if n == 0:
-                self.mw.log_message(f"[{name}] no finite values")
-                return
-            q = np.nanpercentile(x[finite], [0, 1, 5, 25, 50, 75, 95, 99, 100])
-            self.mw.log_message(
-                f"[{name}] n={n} | "
-                f"min={q[0]:.4g} p1={q[1]:.4g} p5={q[2]:.4g} p25={q[3]:.4g} "
-                f"med={q[4]:.4g} p75={q[5]:.4g} p95={q[6]:.4g} p99={q[7]:.4g} max={q[8]:.4g}"
-            )
-
-        # Core filters
-        _summ("detected_fraction")
-        _summ("spatial_jitter_detrended")
-        _summ("trace_snr_proxy")
-
-        # Useful for understanding why coverage is low
-        _summ("max_gap")
-        _summ("max_step")
-        _summ("path_node_fraction")
-
-        # Reasons
-        if "reject_reason" in df.columns:
-            rr = df["reject_reason"].fillna("").astype(str)
-            rr = rr[rr.str.len() > 0]
-            if len(rr) == 0:
-                self.mw.log_message("[reject_reason] none recorded")
-            else:
-                top = rr.value_counts().head(10)
-                self.mw.log_message("Top reject reasons:")
-                for k, v in top.items():
-                    self.mw.log_message(f"  {k}: {v}")
-
-        # Quick correlation sanity: do “good” traces actually differ?
-        if all(c in df.columns for c in ("detected_fraction", "spatial_jitter_detrended", "trace_snr_proxy")):
-            cov = pd.to_numeric(df["detected_fraction"], errors="coerce")
-            jit = pd.to_numeric(df["spatial_jitter_detrended"], errors="coerce")
-            snr = pd.to_numeric(df["trace_snr_proxy"], errors="coerce")
-            ok = cov.notna() & jit.notna() & snr.notna()
-            if ok.sum() >= 10:
-                self.mw.log_message(
-                    f"Spearman-ish check (Pearson on ranks): "
-                    f"cov~snr={cov[ok].rank().corr(snr[ok].rank()):.3f}, "
-                    f"cov~jit={cov[ok].rank().corr(jit[ok].rank()):.3f}, "
-                    f"snr~jit={snr[ok].rank().corr(jit[ok].rank()):.3f}"
-                )
-
-        self.mw.log_message("==========================")
-
-    def update_counts_label(self):
-        N = self.num_total_candidates
-        if N == 0: return
-        roi_count = np.sum(self.roi_mask) if self.roi_mask is not None else N
-        metric_count = np.sum(self.metric_mask) if self.metric_mask is not None else N
-        
-        # Calculate intersection
-        final_mask = self.roi_mask & self.metric_mask
-        final_count = np.sum(final_mask)
-        
-        self.lbl_counts_status.setText(f"Candidates: {N} | ROI: {roi_count} | Metrics: {metric_count} | Final: {final_count}")
-        self.lbl_counts_status.setStyleSheet("color: black;")
-
-    def apply_post_hoc_filters(self):
-        if self.metrics_df is None: return
-        
-        min_cov = self.spin_coverage.value()
-        max_jit = self.spin_jitter.value()
-        min_snr = self.spin_snr.value()
-        
-        cov = self.metrics_df['detected_fraction'].to_numpy(dtype=float)
-        jit = self.metrics_df['spatial_jitter_detrended'].to_numpy(dtype=float)
-        snr = self.metrics_df['trace_snr_proxy'].to_numpy(dtype=float)
-
-        cov_ok = np.isfinite(cov) & (cov >= min_cov)
-        jit_ok = np.isfinite(jit) & (jit <= max_jit)
-        snr_ok = np.isfinite(snr) & (snr >= min_snr)
-
-        self.metric_mask = cov_ok & jit_ok & snr_ok
-        self._resolve_filters()
-
     def apply_roi_filter(self, indices, rois, phase_ref_rois, extra_mask=None):
         self.rois = rois
         self.phase_reference_rois = phase_ref_rois
         self.use_subregion_ref_check.setEnabled(bool(phase_ref_rois))
-        if not phase_ref_rois: self.use_subregion_ref_check.setChecked(False)
+        if not phase_ref_rois: 
+            self.use_subregion_ref_check.setChecked(False)
 
         if not rois:
             self.roi_mask = np.ones(self.num_total_candidates, dtype=bool)
         else:
-            include_paths = []
-            exclude_paths = []
-            
-            unknown_modes = set()
-            
-            for r in rois:
-                # Robust Mode Normalization
-                raw_mode = r.get("mode", "")
-                if not isinstance(raw_mode, str): continue
-                mode = raw_mode.strip().lower()
-                
-                if "path_vertices" not in r: continue
-                path = Path(r["path_vertices"])
-                
-                if mode == "include":
-                    include_paths.append(path)
-                elif mode == "exclude":
-                    exclude_paths.append(path)
-                elif mode in ("phase reference", "phase axis"):
-                    unknown_modes.add(raw_mode)  # phase metadata should arrive via phase_ref_rois
-                else:
-                    unknown_modes.add(raw_mode)
-            
-            if unknown_modes:
-                 self.mw.log_message(f"Warning: Ignored {len(unknown_modes)} ROI(s) with unknown modes: {', '.join(unknown_modes)}")
-
             full_roi_data = self.state.unfiltered_data["roi"]
             mask = np.zeros(self.num_total_candidates, dtype=bool)
             
-            # --- ROBUST ROI MATCHING ---
+            # Robust Include
+            has_includes = False
+            for r in rois:
+                if r.get("mode", "").lower() == "include":
+                    if "path_vertices" in r:
+                        path = Path(r["path_vertices"])
+                        mask |= path.contains_points(full_roi_data)
+                        has_includes = True
             
-            # 1. Includes
-            if include_paths:
-                for path in include_paths:
-                    mask |= path.contains_points(full_roi_data)
-            else:
-                # If no Includes defined:
-                # If exclusions or special modes exist, assume Default-All.
-                # If NOTHING valid exists (only unknowns), Default-None (Fail Closed).
-                if exclude_paths or (self.phase_reference_rois and len(self.phase_reference_rois) > 0):
-                    mask[:] = True
-                else:
-                    self.mw.log_message("Critical: ROIs detected but no valid Include/Exclude/Phase logic found. Defaulting to empty selection.")
-                    mask[:] = False
+            # If no includes defined but excludes exist, start with ALL TRUE
+            if not has_includes:
+                mask[:] = True
                 
-            # 2. Excludes
-            for path in exclude_paths:
-                 mask &= ~path.contains_points(full_roi_data)
-            
+            # Exclude
+            for r in rois:
+                if r.get("mode", "").lower() == "exclude":
+                    if "path_vertices" in r:
+                        path = Path(r["path_vertices"])
+                        mask &= ~path.contains_points(full_roi_data)
+                        
             self.roi_mask = mask
             
+        self._resolve_filters()
+
+    def clear_roi_filter(self):
+        self.rois = None
+        self.phase_reference_rois = None
+        self.use_subregion_ref_check.setChecked(False)
+        self.use_subregion_ref_check.setEnabled(False)
+        self.roi_mask = np.ones(self.num_total_candidates, dtype=bool)
         self._resolve_filters()
 
     def _resolve_filters(self):
@@ -668,9 +799,8 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         final_mask = self.roi_mask & self.metric_mask
         final_indices = np.where(final_mask)[0]
         
-        self.update_counts_label()
-
         self.filtered_indices = final_indices
+        self._update_workflow_status()
         
         # Check State Consistency
         is_filtered = len(final_indices) < self.num_total_candidates
@@ -688,15 +818,7 @@ class SingleAnimalPanel(QtWidgets.QWidget):
 
         self.populate_visualizations()
 
-    def clear_roi_filter(self):
-        self.rois = None
-        self.phase_reference_rois = None
-
-        self.use_subregion_ref_check.setChecked(False)
-        self.use_subregion_ref_check.setEnabled(False)
-
-        self.roi_mask = np.ones(self.num_total_candidates, dtype=bool)
-        self._resolve_filters()
+    # --- Parameter IO ---
 
     def save_parameters(self):
         start_dir = self.mw._get_last_dir()
@@ -725,50 +847,11 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             index = self.mode_combo.findData(data['mode'])
             if index >= 0: self.mode_combo.setCurrentIndex(index)
         self.mw.log_message(f"Parameters loaded from {os.path.basename(path)}")
-    
-    def export_current_plot(self):
-        widget = self.mw.vis_tabs.currentWidget()
-        viewer = self.mw.visualization_widgets.get(widget)
-        if not viewer or not hasattr(viewer, "fig"):
-            self.mw.log_message("No active figure to export.")
-            return
-        fig = viewer.fig
-        start_dir = self.mw._get_last_dir()
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save Plot", start_dir,
-            "PNG files (*.png);;PDF files (*.pdf);;SVG files (*.svg)"
-        )
-        if not path: return
-        self.mw._set_last_dir(path)
-        try:
-            fig.savefig(path, dpi=300, bbox_inches="tight")
-            self.mw.log_message(f"Plot saved to {os.path.basename(path)}")
-        except Exception as e:
-            self.mw.log_message(f"Error saving plot: {e}")
 
-    def export_current_data(self):
-        widget = self.mw.vis_tabs.currentWidget()
-        viewer = self.mw.visualization_widgets.get(widget)
-        if viewer and hasattr(viewer, "get_export_data"):
-            df, default_name = viewer.get_export_data()
-            if df is not None and not df.empty:
-                start_dir = self.mw._get_last_dir()
-                path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                    self, "Export Data", os.path.join(start_dir, default_name), "CSV files (*.csv)"
-                )
-                if path:
-                    self.mw._set_last_dir(path)
-                    try:
-                        df.to_csv(path, index=False)
-                        self.mw.log_message(f"Data exported to {os.path.basename(path)}")
-                    except Exception as e:
-                        self.mw.log_message(f"Error exporting data: {e}")
-            else:
-                self.mw.log_message("No data available to export from this view.")
-        else:
-            self.mw.log_message("The current tab does not support data export.")
+    # --- Visualization & Interaction ---
 
     def on_roi_selected(self, original_index):
+        """Handle selection from a viewer (e.g. click on map)."""
         self.mw.log_message(f"ROI {original_index + 1} selected.")
         
         local_index = -1
@@ -779,58 +862,23 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         else:
             local_index = original_index
 
-        # --- RUNTIME SANITY CHECK ---
-        # Prove that the local index points to the same physical coordinates as the original index
         if local_index != -1:
-            try:
-                # State consistency check: treat as filtered only if the mask actually reduced N
-                is_filtered = (
-                    self.filtered_indices is not None
-                    and len(self.filtered_indices) < self.num_total_candidates
-                )
-                raw_len = len(self.state.unfiltered_data["roi"])
-                load_len = len(self.state.loaded_data["roi"])
-
-                if (not is_filtered) and (raw_len != load_len):
-                    self.mw.log_message(
-                        f"CRITICAL WARNING: State desync. Unfiltered view but loaded_data has {load_len} != {raw_len}"
-                    )
-
-                raw_pt = self.state.unfiltered_data["roi"][original_index]
-                view_pt = self.state.loaded_data["roi"][local_index]
-                
-                if not np.allclose(raw_pt, view_pt, atol=1e-5):
-                     self.mw.log_message(f"CRITICAL ERROR: Index mismatch! Local {local_index} != Original {original_index}")
-                     self.mw.log_message(f"Raw: {raw_pt}, View: {view_pt}")
-            except Exception as e:
-                self.mw.log_message(f"Error checking index sanity: {e}")
-        # ----------------------------
-
-        # Update Viewers - Explicit API usage
-        
-        # 1. Trajectory Inspector: Expects LOCAL index (it works on filtered trajectory array)
-        traj_viewer = self.mw.visualization_widgets.get(self.mw.traj_tab)
-        if traj_viewer:
-            if local_index != -1:
+            traj_viewer = self.mw.visualization_widgets.get(self.mw.traj_tab)
+            if traj_viewer:
                 traj_viewer.set_trajectory(local_index)
                 self.mw.vis_tabs.setCurrentWidget(self.mw.traj_tab)
-            else:
-                self.mw.log_message(f"Selected ROI {original_index+1} is filtered out of current view.")
+            
+            heatmap_viewer = self.mw.visualization_widgets.get(self.mw.heatmap_tab)
+            if heatmap_viewer: 
+                heatmap_viewer.update_selected_trace(original_index)
 
-        # 2. Contrast Viewer: Expects GLOBAL index (Handles conversion internally)
-        com_viewer = self.mw.visualization_widgets.get(self.mw.com_tab)
-        if com_viewer: 
-            com_viewer.highlight_point(original_index)
-        
-        # 3. Heatmap Viewer: Expects GLOBAL index (Handles conversion internally)
-        heatmap_viewer = self.mw.visualization_widgets.get(self.mw.heatmap_tab)
-        if heatmap_viewer: 
-            heatmap_viewer.update_selected_trace(original_index)
-
-        # 4. Phase Map Viewer: Expects GLOBAL index (Handles conversion internally)
-        phase_viewer = self.mw.visualization_widgets.get(self.mw.phase_tab)
-        if phase_viewer: 
-            phase_viewer.highlight_point(original_index)
+            com_viewer = self.mw.visualization_widgets.get(self.mw.com_tab)
+            if com_viewer: 
+                com_viewer.highlight_point(original_index)
+                
+            phase_viewer = self.mw.visualization_widgets.get(self.mw.phase_tab)
+            if phase_viewer: 
+                phase_viewer.highlight_point(original_index)
 
     def on_contrast_change(self, vmin, vmax):
         self.vmin = vmin
@@ -840,259 +888,271 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         phase_viewer = self.mw.visualization_widgets.get(self.mw.phase_tab)
         if phase_viewer: phase_viewer.update_contrast(vmin, vmax)
 
+    def _normalize_rois_for_viewers(self, rois):
+        """
+        Normalize ROI dicts for viewers.
+
+        Important:
+        - Some ROI dicts may already contain a matplotlib Path under key "path".
+          We preserve it if present.
+        - Some viewers only need path_vertices (and will rebuild Path internally).
+        - Never assume "path" exists, never require it.
+        """
+        if not rois:
+            return []
+
+        clean = []
+        for r in rois:
+            verts = r.get("path_vertices", None)
+            if verts is None:
+                continue
+
+            item = {
+                "path_vertices": verts,
+                "mode": r.get("mode", "Include"),
+            }
+
+            # Preserve prebuilt Path if present (optional, do not require).
+            p = r.get("path", None)
+            if isinstance(p, Path):
+                item["path"] = p
+
+            clean.append(item)
+
+        return clean
+
     def populate_visualizations(self):
         if not self.state.loaded_data or "background" not in self.state.unfiltered_data: return
-        self.mw.log_message("Generating interactive plots...")
+        
         bg = self.state.unfiltered_data["background"]
         movie = self.state.unfiltered_data.get("movie")
-        if movie is None:
-            self.mw.log_message("Error: Full movie stack not found in state.")
-            return
+        if movie is None: return
+        
         self.vmin, self.vmax = float(bg.min()), float(bg.max())
-        single_animal_tabs = [self.mw.heatmap_tab, self.mw.com_tab, self.mw.traj_tab, self.mw.phase_tab, self.mw.interp_tab]
-        group_tabs = [self.mw.group_scatter_tab, self.mw.group_avg_tab]
-        for tab in single_animal_tabs: self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(tab), True)
-        for tab in group_tabs: self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(tab), False)
+        
+        # Enable Tabs
+        for tab in [self.mw.heatmap_tab, self.mw.com_tab, self.mw.traj_tab, self.mw.phase_tab, self.mw.interp_tab]:
+            self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(tab), True)
+
+        # 1. Heatmap
         try:
             phases, period, sort_scores, filter_scores, rhythm_sort_desc = self._calculate_rhythms()
-        except Exception as e:
-            self.mw.log_message(f"Could not calculate rhythms: {e}")
+        except:
             phases, period, sort_scores, filter_scores, rhythm_sort_desc = None, None, None, None, True
-        is_emphasized = self.emphasize_rhythm_check.isChecked()
+            
         fig_h, _ = add_mpl_to_tab(self.mw.heatmap_tab)
-        viewer_h = HeatmapViewer(fig_h, self.state.loaded_data, self.filtered_indices, phases, sort_scores, is_emphasized, rhythm_sort_desc, period=period, minutes_per_frame=None, reference_phase=None)
+        viewer_h = HeatmapViewer(fig_h, self.state.loaded_data, self.filtered_indices, phases, sort_scores, 
+                                 self.emphasize_rhythm_check.isChecked(), rhythm_sort_desc, 
+                                 period=period)
         self.mw.visualization_widgets[self.mw.heatmap_tab] = viewer_h
+
+        # 2. CoM
         fig_c, _ = add_mpl_to_tab(self.mw.com_tab)
-        current_rois = []
-        if self.rois: current_rois.extend(self.rois)
-        if self.phase_reference_rois: current_rois.extend(self.phase_reference_rois)
-        viewer_c = ContrastViewer(fig_c, fig_c.add_subplot(111), bg, self.state.loaded_data["roi"], self.on_contrast_change, self.on_roi_selected, filtered_indices=self.filtered_indices, rois=current_rois)
+        
+        current_rois = self._normalize_rois_for_viewers((self.rois or []) + (self.phase_reference_rois or []))
+        
+        viewer_c = ContrastViewer(fig_c, fig_c.add_subplot(111), bg, self.state.loaded_data["roi"], 
+                                  self.on_contrast_change, self.on_roi_selected, 
+                                  filtered_indices=self.filtered_indices, rois=current_rois)
         self.mw.visualization_widgets[self.mw.com_tab] = viewer_c
+
+        # 3. Trajectory
         fig_t, _ = add_mpl_to_tab(self.mw.traj_tab)
         viewer_t = TrajectoryInspector(fig_t, fig_t.add_subplot(111), self.state.loaded_data["trajectories"], movie)
         self.mw.visualization_widgets[self.mw.traj_tab] = viewer_t
+
         self.regenerate_phase_maps()
-        self.mw.btn_export_plot.setEnabled(True)
-        self.mw.btn_export_data.setEnabled(True)
 
     def _calculate_rhythms(self):
         method = self.analysis_method_combo.currentText()
-        self.mw.log_message(f"Calculating rhythms using {method} method...")
-        phase_args = {name: t(w.text()) for name, (w, t) in self.phase_params.items() if w.text() and name not in ("grid_resolution", "rhythm_threshold", "r_squared_threshold")}
+        phase_args = {name: t(w.text()) for name, (w, t) in self.phase_params.items() 
+                      if w.text() and name not in ("grid_resolution", "rhythm_threshold", "r_squared_threshold")}
+        
         if not phase_args.get("minutes_per_frame"): raise ValueError("Minutes per frame is required.")
         if "trend_window_hours" in phase_args: phase_args["detrend_window_hours"] = phase_args.pop("trend_window_hours")
+        
+        # NOTE (tech debt): FFT is currently called twice (once for discovered_period, once for phases/scores).
+        # This is acceptable for now but should be refactored later to avoid redundant work.
+        
+        # 1. Discover Period
         _, discovered_period, _ = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
         self.discovered_period_edit.setText(f"{discovered_period:.2f}")
+        
+        # 2. Compute Metrics
         if "FFT" in method:
             phases, period, snr_scores = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
-            return phases, period, snr_scores, snr_scores, True
+            return phases, period, snr_scores, snr_scores, True # FFT sort descending (SNR)
         elif "Cosinor" in method:
             traces = self.state.loaded_data["traces"]
             time_points_hours = traces[:, 0] * (phase_args["minutes_per_frame"] / 60.0)
-            phases = []
-            p_values = []
-            r_squareds = []
-            detrend_method = "running_median"
-            minutes_per_frame = phase_args["minutes_per_frame"]
-            T = traces.shape[0]
+            
+            phases, p_values, r_squareds = [], [], []
+            
+            # Use same detrend logic as FFT
             trend_window_hours = phase_args.get("detrend_window_hours", RHYTHM_TREND_WINDOW_HOURS)
-            median_window_frames = compute_median_window_frames(minutes_per_frame, trend_window_hours, T=T)
+            med_win = compute_median_window_frames(phase_args["minutes_per_frame"], trend_window_hours, T=traces.shape[0])
+            
             for i in range(1, traces.shape[1]):
-                raw_intensity = traces[:, i]
-                intensity = preprocess_for_rhythmicity(raw_intensity, method=detrend_method, median_window_frames=median_window_frames)
-                result = csn.cosinor_analysis(intensity, time_points_hours, period=discovered_period)
-                phases.append(result["acrophase"])
-                p_values.append(result["p_value"])
-                r_squareds.append(result["r_squared"])
+                res = csn.cosinor_analysis(
+                    preprocess_for_rhythmicity(traces[:, i], method="running_median", median_window_frames=med_win),
+                    time_points_hours, 
+                    period=discovered_period
+                )
+                phases.append(res["acrophase"])
+                p_values.append(res["p_value"])
+                r_squareds.append(res["r_squared"])
+                
             return np.array(phases), discovered_period, np.array(r_squareds), np.array(p_values), True
+
         return None, None, None, None, True
 
     @QtCore.pyqtSlot(int)
     def _on_analysis_method_changed(self, index):
         method = self.analysis_method_combo.currentText()
         thresh_edit = self.phase_params["rhythm_threshold"][0]
+        
         if "FFT" in method:
-            self.rhythm_threshold_label.setText("Rhythm SNR Threshold (>=):")
+            self.rhythm_threshold_label.setText("SNR Threshold (>=):")
             thresh_edit.setText("2.0")
-            if hasattr(self, 'rsquared_widgets'):
-                for widget in self.rsquared_widgets: widget.hide()
+            for w in self.rsquared_widgets: w.setVisible(False)
         elif "Cosinor" in method:
-            self.rhythm_threshold_label.setText("Rhythm p-value (<=):")
+            self.rhythm_threshold_label.setText("p-value (<=):")
             thresh_edit.setText("0.05")
-            if hasattr(self, 'rsquared_widgets'):
-                for widget in self.rsquared_widgets: widget.show()
+            # Only show R2 if in Advanced Mode, or force visibility?
+            # Basic Mode rules say R2 is visible for Cosinor.
+            # So we respect the current mode logic or just show it if Basic?
+            # User requirement: "Show r_squared_threshold widgets" if Cosinor selected.
+            # But check Advanced/Basic toggle.
+            is_adv = self.chk_advanced_mode.isChecked()
+            # If basic, we still show R2 if Cosinor is picked.
+            for w in self.rsquared_widgets: w.setVisible(True)
 
     def regenerate_phase_maps(self):
-        if not self.state.loaded_data or "traces" not in self.state.loaded_data:
-            if self.emphasize_rhythm_check.isChecked(): self.mw.log_message("Load data before enabling rhythm emphasis.")
-            return
-        self.mw.log_message("Updating plots based on phase parameters...")
-        for tab in (self.mw.phase_tab, self.mw.interp_tab): clear_layout(tab.layout())
+        if not self.state.loaded_data or "traces" not in self.state.loaded_data: return
+        
         self.btn_save_rhythm.setEnabled(False)
-        self.latest_rhythm_df = None 
+        for tab in (self.mw.phase_tab, self.mw.interp_tab): clear_layout(tab.layout())
+        
         try:
             phases, period, sort_scores, filter_scores, sort_desc = self._calculate_rhythms()
-            if phases is None: raise ValueError("Rhythm calculation failed.")
+            if phases is None: return
+            
             method = self.analysis_method_combo.currentText()
             thresh = float(self.phase_params["rhythm_threshold"][0].text())
             mpf = float(self.phase_params["minutes_per_frame"][0].text())
             try: trend_win = float(self.phase_params["trend_window_hours"][0].text())
             except: trend_win = 36.0
+            
+            # --- Rhythm Gating ---
             if "Cosinor" in method:
                 r_thresh = float(self.phase_params["r_squared_threshold"][0].text())
                 rhythm_mask = (filter_scores <= thresh) & (sort_scores >= r_thresh)
-                self.mw.log_message(f"Applying Cosinor filter: p <= {thresh} AND R² >= {r_thresh}")
                 phases_hours = phases
             else:
                 rhythm_mask = filter_scores >= thresh
-                self.mw.log_message(f"Applying FFT filter: SNR >= {thresh}")
                 phases_hours = ((phases / (2 * np.pi)) * period) % period
-            if self.strict_cycle_check.isChecked():
-                rhythm_mask = strict_cycle_mask(self.state.loaded_data["traces"], minutes_per_frame=mpf, period_hours=period, base_mask=rhythm_mask, min_cycles=2, trend_window_hours=trend_win)
-                self.mw.log_message("Strict cycle filter applied: requiring >= 2 cycles.")
-            is_emphasized = self.emphasize_rhythm_check.isChecked()
-            com_viewer = self.mw.visualization_widgets.get(self.mw.com_tab)
-            if com_viewer: com_viewer.update_rhythm_emphasis(rhythm_mask, is_emphasized)
-            rhythmic_indices_relative = np.where(rhythm_mask)[0]
-            self.mw.log_message(f"{len(rhythmic_indices_relative)} cells pass rhythmicity threshold(s).")
-            if len(rhythmic_indices_relative) == 0:
-                for t in [self.mw.phase_tab, self.mw.interp_tab]:
-                    fig, canvas = add_mpl_to_tab(t)
-                    ax = fig.add_subplot(111)
-                    ax.text(0.5, 0.5, "No cells passed the rhythmicity filter.", ha='center', va='center')
-                    canvas.draw()
-                self.mw.log_message("No cells passed rhythmicity filter.")
-                empty_df = pd.DataFrame()
-                fig_p, _ = add_mpl_to_tab(self.mw.phase_tab) 
-                viewer_p = PhaseMapViewer(fig_p, fig_p.add_subplot(111), self.state.unfiltered_data["background"], empty_df, None, vmin=self.vmin, vmax=self.vmax)
-                self.mw.visualization_widgets[self.mw.phase_tab] = viewer_p
-                heatmap_viewer = self.mw.visualization_widgets.get(self.mw.heatmap_tab)
-                if heatmap_viewer: heatmap_viewer.update_phase_data(phases_hours, sort_scores, rhythm_mask, sort_desc, period=period, minutes_per_frame=mpf, reference_phase=None, trend_window_hours=trend_win)
-                return
-            mean_h = 0.0
-            def calc_circ_mean_hours(h_vals, p):
-                rads = (h_vals % p) * (2 * np.pi / p)
-                m_rad = circmean(rads)
-                m_h = m_rad * (p / (2 * np.pi))
-                return m_h
-            if self.use_subregion_ref_check.isChecked() and self.phase_reference_rois:
-                self.mw.log_message("Using drawn sub-region as phase reference.")
-                rhythmic_coords = self.state.loaded_data['roi'][rhythmic_indices_relative]
-                ref_mask = np.zeros(len(rhythmic_coords), dtype=bool)
-                for roi in self.phase_reference_rois:
-                    if "path" in roi: path = roi["path"]
-                    else: path = Path(roi['path_vertices'])
-                    ref_mask |= path.contains_points(rhythmic_coords)
-                ref_indices_in_rhythmic_array = np.where(ref_mask)[0]
-                self.mw.log_message(f"  -> Found {len(ref_indices_in_rhythmic_array)} rhythmic cells inside reference ROI.")
-                if len(ref_indices_in_rhythmic_array) > 0:
-                    ref_phases = phases_hours[rhythmic_indices_relative][ref_indices_in_rhythmic_array]
-                    mean_h = calc_circ_mean_hours(ref_phases, period)
-                    self.mw.log_message(f"  -> Reference Mean Phase: {mean_h:.2f} hours")
-                else:
-                    self.mw.log_message("  -> Warning: Reference ROI is empty of rhythmic cells. Falling back to global mean.")
-                    mean_h = calc_circ_mean_hours(phases_hours[rhythmic_indices_relative], period)
-                    self.mw.log_message(f"  -> Global Mean Phase: {mean_h:.2f} hours")
-            else:
-                if self.use_subregion_ref_check.isChecked():
-                    self.mw.log_message("Sub-region reference selected, but no sub-region is defined. Using global mean.")
-                mean_h = calc_circ_mean_hours(phases_hours[rhythmic_indices_relative], period)
-                self.mw.log_message(f"Global Mean Phase: {mean_h:.2f} hours")
-            
-            if "Cosinor" in method: final_phases_h = phases
-            else: final_phases_h = ((phases / (2 * np.pi)) * period) % period
-            
-            save_data = {
-                'Original_ROI_Index': np.arange(len(phases)) + 1,
-                'Phase_Hours': final_phases_h,
-                'Period_Hours': np.full(len(phases), period),
-                'Is_Rhythmic': rhythm_mask
-            }
-            if "Cosinor" in method:
-                save_data['P_Value'] = filter_scores
-                save_data['R_Squared'] = sort_scores
-            else:
-                save_data['SNR'] = sort_scores
                 
-            self.latest_rhythm_df = pd.DataFrame(save_data)
-            self.btn_save_rhythm.setEnabled(True) 
+            if self.strict_cycle_check.isChecked():
+                rhythm_mask = strict_cycle_mask(self.state.loaded_data["traces"], mpf, period, rhythm_mask, min_cycles=2, trend_window_hours=trend_win)
+            
+            # --- Emphasis & Viewers ---
+            com_viewer = self.mw.visualization_widgets.get(self.mw.com_tab)
+            if com_viewer: com_viewer.update_rhythm_emphasis(rhythm_mask, self.emphasize_rhythm_check.isChecked())
             
             heatmap_viewer = self.mw.visualization_widgets.get(self.mw.heatmap_tab)
-            if heatmap_viewer:
-                 heatmap_viewer.update_phase_data(phases_hours, sort_scores, rhythm_mask, sort_desc, period=period, minutes_per_frame=mpf, reference_phase=mean_h, trend_window_hours=trend_win)
-                 heatmap_viewer.update_rhythm_emphasis(rhythm_mask, is_emphasized)
+            if heatmap_viewer: 
+                heatmap_viewer.update_phase_data(phases_hours, sort_scores, rhythm_mask, sort_desc, period=period, minutes_per_frame=mpf)
 
-            rel_phases = (phases_hours[rhythmic_indices_relative] - mean_h + period / 2) % period - period / 2
-            if self.filtered_indices is not None:
-                rhythmic_indices_original = self.filtered_indices[rhythmic_indices_relative]
+            rhythmic_indices = np.where(rhythm_mask)[0]
+            if len(rhythmic_indices) == 0:
+                self.mw.log_message("No rhythmic cells found.")
+                return
+
+            # --- Reference Phase ---
+            mean_h = 0.0
+            
+            if self.use_subregion_ref_check.isChecked() and self.phase_reference_rois:
+                # Calc subset mean
+                r_coords = self.state.loaded_data['roi'][rhythmic_indices]
+                sub_mask = np.zeros(len(r_coords), dtype=bool)
+                for r in self.phase_reference_rois:
+                    p = Path(r["path_vertices"])
+                    sub_mask |= p.contains_points(r_coords)
+                
+                if sub_mask.sum() > 0:
+                    sub_phases = phases_hours[rhythmic_indices][sub_mask]
+                    rads = (sub_phases % period) * (2 * np.pi / period)
+                    mean_h = (circmean(rads) / (2 * np.pi)) * period
+                    self.mw.log_message(f"Ref Phase (Subregion): {mean_h:.2f}h")
+                else:
+                    self.mw.log_message("Ref Region empty of rhythmic cells. Using global mean.")
+                    rads = (phases_hours[rhythmic_indices] % period) * (2 * np.pi / period)
+                    mean_h = (circmean(rads) / (2 * np.pi)) * period
             else:
-                rhythmic_indices_original = rhythmic_indices_relative
+                rads = (phases_hours[rhythmic_indices] % period) * (2 * np.pi / period)
+                mean_h = (circmean(rads) / (2 * np.pi)) * period
 
-            df_data = {
-                'Original_ROI_Index': rhythmic_indices_original + 1,
-                'X_Position': self.state.loaded_data['roi'][rhythmic_indices_relative, 0],
-                'Y_Position': self.state.loaded_data['roi'][rhythmic_indices_relative, 1],
-                'Phase_Hours': phases_hours[rhythmic_indices_relative],
+            # --- Dataframes ---
+            rel_phases = (phases_hours[rhythmic_indices] - mean_h + period / 2) % period - period / 2
+            
+            orig_indices = self.filtered_indices[rhythmic_indices] if self.filtered_indices is not None else rhythmic_indices
+            
+            df_map = pd.DataFrame({
+                'Original_ROI_Index': orig_indices + 1,
+                'X_Position': self.state.loaded_data['roi'][rhythmic_indices, 0],
+                'Y_Position': self.state.loaded_data['roi'][rhythmic_indices, 1],
                 'Relative_Phase_Hours': rel_phases,
                 'Period_Hours': period
-            }
+            })
+            
+            # Save DF (Full set for group)
             if "Cosinor" in method:
-                df_data['R_Squared'] = sort_scores[rhythmic_indices_relative]
-                df_data['P_Value'] = filter_scores[rhythmic_indices_relative]
+                 raw_phases = phases
             else:
-                df_data['SNR'] = sort_scores[rhythmic_indices_relative]
-            
-            rhythmic_df = pd.DataFrame(df_data)
-            
-            def phase_map_callback(selected_phase_index):
-                try:
-                    i = int(selected_phase_index)
-                except Exception:
-                    self.mw.log_message(f"Warning: invalid phase selection index: {selected_phase_index}")
-                    return
+                 raw_phases = ((phases / (2 * np.pi)) * period) % period
+                 
+            self.latest_rhythm_df = pd.DataFrame({
+                'Original_ROI_Index': np.arange(len(phases)) + 1,
+                'Phase_Hours': raw_phases,
+                'Period_Hours': period,
+                'Is_Rhythmic': rhythm_mask,
+                'Metric_Score': sort_scores, # R2 or SNR
+                'Filter_Score': filter_scores # p-value or SNR
+            })
+            self.btn_save_rhythm.setEnabled(True)
 
-                if i < 0 or i >= len(rhythmic_df):
-                    self.mw.log_message(f"Warning: phase selection out of range: {i}")
-                    return
+            # --- Map Viewers ---
+            def on_map_click(idx):
+                if 0 <= idx < len(df_map):
+                    self.on_roi_selected(int(df_map.iloc[idx]['Original_ROI_Index']) - 1)
 
-                original_index = int(rhythmic_df["Original_ROI_Index"].iloc[i]) - 1
-                self.on_roi_selected(original_index)
-            
             fig_p, _ = add_mpl_to_tab(self.mw.phase_tab)
-            viewer_p = PhaseMapViewer(fig_p, fig_p.add_subplot(111), self.state.unfiltered_data["background"], rhythmic_df, phase_map_callback, vmin=self.vmin, vmax=self.vmax)
+            viewer_p = PhaseMapViewer(fig_p, fig_p.add_subplot(111), self.state.unfiltered_data["background"], df_map, on_map_click, vmin=self.vmin, vmax=self.vmax)
             self.mw.visualization_widgets[self.mw.phase_tab] = viewer_p
             
             grid_res = int(self.phase_params["grid_resolution"][0].text())
             fig_i, _ = add_mpl_to_tab(self.mw.interp_tab)
-            viewer_i = InterpolatedMapViewer(fig_i, fig_i.add_subplot(111), rhythmic_df[['X_Position', 'Y_Position']].values, rhythmic_df['Relative_Phase_Hours'].values, period, grid_res, rois=self.rois)
+            
+            # Fix: Ensure ROIs are clean dicts for interpolator
+            clean_rois = self._normalize_rois_for_viewers(self.rois)
+            viewer_i = InterpolatedMapViewer(fig_i, fig_i.add_subplot(111), df_map[['X_Position', 'Y_Position']].values, df_map['Relative_Phase_Hours'].values, period, grid_res, rois=clean_rois)
             self.mw.visualization_widgets[self.mw.interp_tab] = viewer_i
             
-            self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.phase_tab), True)
-            self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.interp_tab), True)
-            self.btn_regen_phase.setEnabled(True)
-            self.mw.log_message("Phase-based plots updated. Review and click 'Save Rhythm Results' to commit.")
-            
         except Exception as e:
-            self.mw.log_message(f"Could not update plots: {e}")
-            import traceback
-            self.mw.log_message(traceback.format_exc())
-            self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.phase_tab), False)
-            self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.interp_tab), False)
+            self.mw.log_message(f"Plot Error: {e}")
 
-    def save_rhythm_results(self):
-        if self.latest_rhythm_df is None:
-            return
-        
-        basename = self.state.output_basename
-        if not basename:
-            self.mw.log_message("Error: No output basename defined.")
-            return
-            
-        filename = f"{basename}_rhythm_results.csv"
-        
-        try:
-            self.latest_rhythm_df.to_csv(filename, index=False)
-            self.mw.log_message(f"SUCCESS: Rhythm results saved to {os.path.basename(filename)}")
-            self.mw.log_message("These approved cells will now be used for Group Analysis.")
-        except Exception as e:
-            self.mw.log_message(f"Error saving rhythm results: {e}")
+    def export_current_plot(self):
+        widget = self.mw.vis_tabs.currentWidget()
+        viewer = self.mw.visualization_widgets.get(widget)
+        if not viewer or not hasattr(viewer, "fig"): return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Plot", self.mw._get_last_dir(), "PNG (*.png)")
+        if path: viewer.fig.savefig(path, dpi=300, bbox_inches="tight")
+
+    def export_current_data(self):
+        widget = self.mw.vis_tabs.currentWidget()
+        viewer = self.mw.visualization_widgets.get(widget)
+        if viewer and hasattr(viewer, "get_export_data"):
+            df, name = viewer.get_export_data()
+            if df is not None:
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export", os.path.join(self.mw._get_last_dir(), name), "CSV (*.csv)")
+                if path: df.to_csv(path, index=False)
