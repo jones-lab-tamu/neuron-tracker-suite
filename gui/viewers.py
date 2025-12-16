@@ -859,7 +859,6 @@ class GroupAverageMapViewer:
         return self.full_scatter, "group_data.csv"
 
 class InterpolatedMapViewer:
-    # [No changes needed here, used for single animal]
     def __init__(self, fig, ax, roi_data, relative_phases,
                  period_hours, grid_resolution, rois=None):
         self.fig = fig
@@ -890,7 +889,7 @@ class InterpolatedMapViewer:
         if rois:
             include_verts = []
             for r in rois:
-                if r.get("mode") == "Include" and "path_vertices" in r:
+                if isinstance(r.get("mode"), str) and r.get("mode").strip().lower() == "include" and "path_vertices" in r:
                     include_verts.append(np.array(r["path_vertices"]))
             
             if include_verts:
@@ -924,24 +923,59 @@ class InterpolatedMapViewer:
 
         if rois:
             final_mask = np.zeros(grid_x.shape, dtype=bool)
-            include_paths = [r["path"] for r in rois if r["mode"] == "Include"]
+
+            def _mode_lower(r):
+                m = r.get("mode", "")
+                return m.strip().lower() if isinstance(m, str) else ""
+
+            def _as_path(r):
+                # Prefer prebuilt Path, otherwise build from vertices
+                p = r.get("path", None)
+                if isinstance(p, Path):
+                    return p
+                verts = r.get("path_vertices", None)
+                if verts is None:
+                    return None
+                try:
+                    return Path(verts)
+                except Exception:
+                    return None
+
+            include_paths = []
+            exclude_paths = []
+
+            for r in rois:
+                mode = _mode_lower(r)
+                p = _as_path(r)
+                if p is None:
+                    continue
+                if mode == "include":
+                    include_paths.append(p)
+                elif mode == "exclude":
+                    exclude_paths.append(p)
+
             if include_paths:
-                for path in include_paths:
-                    final_mask |= path.contains_points(grid_points).reshape(grid_x.shape)
+                for p in include_paths:
+                    final_mask |= p.contains_points(grid_points).reshape(grid_x.shape)
             else:
+                # Fallback: convex hull of the rhythmic ROI points
                 if len(roi_data) > 2:
                     hull = ConvexHull(roi_data)
                     hpath = Path(roi_data[hull.vertices])
                     final_mask = hpath.contains_points(grid_points).reshape(grid_x.shape)
-            for roi in rois:
-                if roi["mode"] == "Exclude":
-                    final_mask &= ~roi["path"].contains_points(grid_points).reshape(grid_x.shape)
+
+            for p in exclude_paths:
+                final_mask &= ~p.contains_points(grid_points).reshape(grid_x.shape)
+
             grid_z[~final_mask] = np.nan
-        elif len(roi_data) > 2:
-            hull = ConvexHull(roi_data)
-            hpath = Path(roi_data[hull.vertices])
-            mask = hpath.contains_points(grid_points).reshape(grid_x.shape)
-            grid_z[~mask] = np.nan
+            
+            else:
+            # No ROIs provided, fall back to convex hull of data points
+            if len(roi_data) > 2:
+                hull = ConvexHull(roi_data)
+                hpath = Path(roi_data[hull.vertices])
+                mask = hpath.contains_points(grid_points).reshape(grid_x.shape)
+                grid_z[~mask] = np.nan
 
         self.im = ax.imshow(
             grid_z.T,
