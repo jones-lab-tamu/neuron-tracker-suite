@@ -422,6 +422,7 @@ class SingleAnimalPanel(QtWidgets.QWidget):
                         self.lbl_filter_status.setText(f"Metrics loaded ({len(self.metrics_df)} rows).")
                         self.lbl_filter_status.setStyleSheet("color: green;")
                         self.btn_apply_filters.setEnabled(True)
+                        self._log_metrics_diagnostics()
                     else:
                         self.metrics_df = None
                         self.lbl_filter_status.setText("Metrics candidate_id mismatch. Ignoring.")
@@ -500,6 +501,72 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         )
         dlg.exec_()
         self.mw.update_workflow_from_files()
+
+    def _log_metrics_diagnostics(self):
+        """Log quick diagnostics for metrics scaling and failure modes."""
+        if self.metrics_df is None or self.metrics_df.empty:
+            self.mw.log_message("Metrics diagnostics: no metrics loaded.")
+            return
+
+        df = self.metrics_df
+
+        self.mw.log_message("=== Metrics diagnostics ===")
+        self.mw.log_message(f"Rows: {len(df)} | Columns: {len(df.columns)}")
+
+        def _summ(name):
+            if name not in df.columns:
+                self.mw.log_message(f"[{name}] missing")
+                return
+            x = pd.to_numeric(df[name], errors="coerce").to_numpy(dtype=float)
+            finite = np.isfinite(x)
+            n = int(finite.sum())
+            if n == 0:
+                self.mw.log_message(f"[{name}] no finite values")
+                return
+            q = np.nanpercentile(x[finite], [0, 1, 5, 25, 50, 75, 95, 99, 100])
+            self.mw.log_message(
+                f"[{name}] n={n} | "
+                f"min={q[0]:.4g} p1={q[1]:.4g} p5={q[2]:.4g} p25={q[3]:.4g} "
+                f"med={q[4]:.4g} p75={q[5]:.4g} p95={q[6]:.4g} p99={q[7]:.4g} max={q[8]:.4g}"
+            )
+
+        # Core filters
+        _summ("detected_fraction")
+        _summ("spatial_jitter_detrended")
+        _summ("trace_snr_proxy")
+
+        # Useful for understanding why coverage is low
+        _summ("max_gap")
+        _summ("max_step")
+        _summ("path_node_fraction")
+
+        # Reasons
+        if "reject_reason" in df.columns:
+            rr = df["reject_reason"].fillna("").astype(str)
+            rr = rr[rr.str.len() > 0]
+            if len(rr) == 0:
+                self.mw.log_message("[reject_reason] none recorded")
+            else:
+                top = rr.value_counts().head(10)
+                self.mw.log_message("Top reject reasons:")
+                for k, v in top.items():
+                    self.mw.log_message(f"  {k}: {v}")
+
+        # Quick correlation sanity: do “good” traces actually differ?
+        if all(c in df.columns for c in ("detected_fraction", "spatial_jitter_detrended", "trace_snr_proxy")):
+            cov = pd.to_numeric(df["detected_fraction"], errors="coerce")
+            jit = pd.to_numeric(df["spatial_jitter_detrended"], errors="coerce")
+            snr = pd.to_numeric(df["trace_snr_proxy"], errors="coerce")
+            ok = cov.notna() & jit.notna() & snr.notna()
+            if ok.sum() >= 10:
+                self.mw.log_message(
+                    f"Spearman-ish check (Pearson on ranks): "
+                    f"cov~snr={cov[ok].rank().corr(snr[ok].rank()):.3f}, "
+                    f"cov~jit={cov[ok].rank().corr(jit[ok].rank()):.3f}, "
+                    f"snr~jit={snr[ok].rank().corr(jit[ok].rank()):.3f}"
+                )
+
+        self.mw.log_message("==========================")
 
     def update_counts_label(self):
         N = self.num_total_candidates
