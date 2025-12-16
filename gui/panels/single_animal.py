@@ -1141,6 +1141,39 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         except Exception as e:
             self.mw.log_message(f"Plot Error: {e}")
 
+    def save_rhythm_results(self):
+        """
+        Save the most recent rhythm results table to CSV.
+
+        Uses:
+        - self.latest_rhythm_df (set in regenerate_phase_maps)
+        - self.state.output_basename (for default filename)
+        """
+        if self.latest_rhythm_df is None or len(self.latest_rhythm_df) == 0:
+            self.mw.log_message("No rhythm results available to save. Click 'Update Plots' first.")
+            return
+
+        start_dir = self.mw._get_last_dir()
+        default_name = "rhythm_results.csv"
+        if getattr(self.state, "output_basename", None):
+            default_name = os.path.basename(self.state.output_basename) + "_rhythm_results.csv"
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Rhythm Results",
+            os.path.join(start_dir, default_name),
+            "CSV files (*.csv)"
+        )
+        if not path:
+            return
+
+        self.mw._set_last_dir(path)
+        try:
+            self.latest_rhythm_df.to_csv(path, index=False)
+            self.mw.log_message(f"Rhythm results saved: {os.path.basename(path)}")
+        except Exception as e:
+            self.mw.log_message(f"Failed to save rhythm results: {e}")
+
     def export_current_plot(self):
         widget = self.mw.vis_tabs.currentWidget()
         viewer = self.mw.visualization_widgets.get(widget)
