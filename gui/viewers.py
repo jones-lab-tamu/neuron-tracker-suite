@@ -968,8 +968,8 @@ class InterpolatedMapViewer:
                 final_mask &= ~p.contains_points(grid_points).reshape(grid_x.shape)
 
             grid_z[~final_mask] = np.nan
-            
-            else:
+
+        else:
             # No ROIs provided, fall back to convex hull of data points
             if len(roi_data) > 2:
                 hull = ConvexHull(roi_data)
