@@ -279,6 +279,12 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             "This controls the analysis pipeline run by AnalysisWorker. "
             "Separately, the Quality Gate is available only if a valid metrics CSV is loaded."
         )
+        
+        # Default to scored pipeline so users get full candidate set, then gate post hoc.
+        idx = self.mode_combo.findData("scored")
+        if idx >= 0:
+            self.mode_combo.setCurrentIndex(idx)
+        
         fl_layout.addRow("Analysis Pipeline:", self.mode_combo)
         
         self.param_tabs.addTab(fl_tab, "Filtering")
@@ -697,6 +703,12 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             
             if not has_metrics:
                 self.metrics_df = None
+                
+                # Metrics missing, force strict mode to match what the pipeline can support.
+                idx = self.mode_combo.findData("strict")
+                if idx >= 0:
+                    self.mode_combo.setCurrentIndex(idx)
+                
                 self.quality_gate_box.setEnabled(False)
                 self.quality_gate_box.setTitle("Quality Gate (Unavailable - No Metrics)")
                 self.mw.log_message("No valid metrics found. Strict mode active (manual ROI only).")
@@ -704,6 +716,10 @@ class SingleAnimalPanel(QtWidgets.QWidget):
                 self.quality_gate_box.setEnabled(True)
                 self.quality_gate_box.setTitle("Quality Gate")
                 self.quality_preset_combo.setCurrentText("Recommended")
+                # Metrics present, scored mode is valid and should be the default.
+                idx = self.mode_combo.findData("scored")
+                if idx >= 0:
+                    self.mode_combo.setCurrentIndex(idx)
 
             self.mw.log_message("Loaded ROI and trace data.")
             self._update_workflow_status()
