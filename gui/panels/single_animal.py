@@ -129,6 +129,15 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         self.lbl_status_gate = QtWidgets.QLabel("Gate: off")
         self.lbl_status_roi = QtWidgets.QLabel("ROI: off")
         
+        # --- Legacy label aliases (MainWindow expects these attribute names) ---
+        # Keep these as direct references to the new workflow strip labels so
+        # MainWindow.update_workflow_from_files() continues to work unchanged.
+        self.status_input_label = self.lbl_status_input
+        self.status_traces_label = self.lbl_status_results
+        self.status_mode_label = self.lbl_status_mode
+        self.status_gate_label = self.lbl_status_gate
+        self.status_roi_label = self.lbl_status_roi
+        
         for lbl in [self.lbl_status_input, self.lbl_status_results, self.lbl_status_mode, self.lbl_status_gate, self.lbl_status_roi]:
             lbl.setStyleSheet("font-size: 11px; color: #333; padding: 2px; border: 1px solid #ccc; border-radius: 3px; background: #f9f9f9;")
             wf_layout.addWidget(lbl)
