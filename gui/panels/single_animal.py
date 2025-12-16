@@ -512,6 +512,66 @@ class SingleAnimalPanel(QtWidgets.QWidget):
 
     # --- Data Loading & Analysis ---
 
+    def reset_state(self):
+        """
+        Called by MainWindow._reset_state().
+
+        This must exist even if we do most state clearing in MainWindow,
+        because older workflow assumes each panel can reset itself safely.
+        """
+        # Local state (panel)
+        self.filtered_indices = None
+        self.rois = None
+        self.phase_reference_rois = None
+        self.vmin = None
+        self.vmax = None
+        self.metrics_df = None
+        self.latest_rhythm_df = None
+
+        # Masks and counts
+        self.roi_mask = None
+        self.metric_mask = None
+        self.num_total_candidates = 0
+        self.quality_presets = {}
+
+        # UI: disable things that require loaded data
+        if hasattr(self, "input_file_edit"):
+            self.input_file_edit.setText("")
+        if hasattr(self, "output_base_edit"):
+            self.output_base_edit.setText("")
+
+        if hasattr(self, "btn_define_roi"):
+            self.btn_define_roi.setEnabled(False)
+        if hasattr(self, "btn_clear_roi"):
+            self.btn_clear_roi.setEnabled(False)
+
+        # Quality gate: default to disabled until metrics load
+        if hasattr(self, "quality_gate_box"):
+            self.quality_gate_box.setEnabled(False)
+            self.quality_gate_box.setTitle("Quality Gate (Unavailable - No Metrics)")
+        if hasattr(self, "lbl_quality_counts"):
+            self.lbl_quality_counts.setText("Passing: - / -")
+        if hasattr(self, "lbl_quality_breakdown"):
+            self.lbl_quality_breakdown.setText("")
+
+        # Phase controls that depend on ROI refs
+        if hasattr(self, "use_subregion_ref_check"):
+            self.use_subregion_ref_check.setChecked(False)
+            self.use_subregion_ref_check.setEnabled(False)
+
+        if hasattr(self, "btn_save_rhythm"):
+            self.btn_save_rhythm.setEnabled(False)
+
+        # Clear visualization tabs safely if they exist
+        try:
+            for tab in (self.mw.heatmap_tab, self.mw.com_tab, self.mw.traj_tab, self.mw.phase_tab, self.mw.interp_tab):
+                if tab.layout() is not None:
+                    clear_layout(tab.layout())
+        except Exception:
+            pass
+
+        self._update_workflow_status()
+
     def load_movie(self):
         self.mw._reset_state()
         start_dir = self.mw._get_last_dir()
