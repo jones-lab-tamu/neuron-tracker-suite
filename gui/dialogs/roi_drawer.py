@@ -435,6 +435,7 @@ class ROIDrawerDialog(QtWidgets.QDialog):
                 if self.output_basename:
                     try:
                         np.savetxt(f"{self.output_basename}_roi_filtered.csv", self.roi_data[filtered_indices], delimiter=",")
+                        np.savetxt(f"{self.output_basename}_roi_filtered_ids.csv", filtered_indices + 1, header="Original_ROI_Index", comments='', fmt='%d')
                     except Exception as e:
                         QtWidgets.QMessageBox.warning(self, "Save Error", f"Error saving filtered ROI CSV:\n{e}")
 

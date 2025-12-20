@@ -1204,8 +1204,19 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             else:
                  raw_phases = ((phases / (2 * np.pi)) * period) % period
                  
+            if self.filtered_indices is not None:
+                # Ensure Original_ROI_Index aligns 1:1 with phase outputs.
+                if len(self.filtered_indices) != len(phases):
+                     raise ValueError(f"CRITICAL: Phase result count {len(phases)} != Filtered ROI count {len(self.filtered_indices)}. ID mapping corrupted.")
+                orig_ids = self.filtered_indices + 1
+            else:
+                orig_ids = np.arange(len(phases)) + 1
+            
+            if not (len(orig_ids) == len(phases) == len(rhythm_mask)):
+                  raise ValueError(f"CRITICAL: length mismatch orig_ids={len(orig_ids)} phases={len(phases)} rhythm_mask={len(rhythm_mask)}")
+
             self.latest_rhythm_df = pd.DataFrame({
-                'Original_ROI_Index': np.arange(len(phases)) + 1,
+                'Original_ROI_Index': orig_ids,
                 'Phase_Hours': raw_phases,
                 'Period_Hours': period,
                 'Is_Rhythmic': rhythm_mask,

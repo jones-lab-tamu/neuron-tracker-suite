@@ -6,12 +6,45 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 from matplotlib.path import Path
 from scipy.stats import circmean, f as f_dist
 from skimage.draw import polygon as draw_polygon
+from typing import Tuple
 
 from gui.utils import Tooltip, add_mpl_to_tab, clear_layout, project_points_to_polyline
 from gui.viewers import GroupScatterViewer, GroupAverageMapViewer, PhaseGradientViewer, RegionResultViewer
 from gui.statistics import watson_williams_f
 from gui.dialogs.roi_drawer import ROIDrawerDialog
 from gui.theme import get_icon
+
+def load_and_join_rhythm_and_coords(rhythm_csv_path: str, warped_ids_csv_path: str) -> "Tuple[pd.DataFrame, dict]":
+    """
+    Loads rhythm results and warped coordinates-with-IDs and returns:
+      - merged DataFrame (inner join on Original_ROI_Index)
+      - stats dict with keys: n_rhythm, n_warped, n_merged, drop_rhythm, drop_warped, dup_rhythm, dup_warped
+    Must not touch GUI state.
+    Must enforce the no-row-order rule.
+    """
+    rhythm_df = pd.read_csv(rhythm_csv_path)
+    warped_df = pd.read_csv(warped_ids_csv_path)
+    
+    for col in ['Original_ROI_Index', 'Is_Rhythmic', 'Phase_Hours', 'Period_Hours']:
+        if col not in rhythm_df.columns: raise ValueError(f"Missing '{col}' in {rhythm_csv_path}")
+    for col in ['Original_ROI_Index', 'X_Warped', 'Y_Warped']:
+        if col not in warped_df.columns: raise ValueError(f"Missing '{col}' in {warped_ids_csv_path}")
+
+    dup_rhythm = rhythm_df.duplicated(subset='Original_ROI_Index').sum()
+    dup_warped = warped_df.duplicated(subset='Original_ROI_Index').sum()
+    n_rhythm_raw, n_warped_raw = len(rhythm_df), len(warped_df)
+
+    rhythm_df = rhythm_df.drop_duplicates(subset='Original_ROI_Index', keep='first')
+    warped_df = warped_df.drop_duplicates(subset='Original_ROI_Index', keep='first')
+
+    merged = rhythm_df.merge(warped_df, on="Original_ROI_Index", how="inner", validate="one_to_one")
+    
+    stats = {
+        'n_rhythm': n_rhythm_raw, 'n_warped': n_warped_raw, 'n_merged': len(merged),
+        'drop_rhythm': n_rhythm_raw - len(merged), 'drop_warped': n_warped_raw - len(merged),
+        'dup_rhythm': dup_rhythm, 'dup_warped': dup_warped
+    }
+    return merged, stats
 
 class GroupViewPanel(QtWidgets.QWidget):
     def __init__(self, main_window):
@@ -187,7 +220,7 @@ class GroupViewPanel(QtWidgets.QWidget):
     def add_group_files(self):
         start_dir = self.mw._get_last_dir()
         files, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self, "Select Warped ROI Files", start_dir, "Warped ROI files (*_roi_warped.csv)"
+            self, "Select Warped ROI Files", start_dir, "Warped ROI files (*_roi_warped_with_ids.csv)"
         )
         if not files: return
         self.mw._set_last_dir(files[0])
@@ -255,32 +288,31 @@ class GroupViewPanel(QtWidgets.QWidget):
                 group_map[item.text(0)] = item.text(1)
 
             for roi_path in self.state.group_data_paths:
-                base = os.path.basename(roi_path).replace('_roi_warped.csv', '')
+                base = os.path.basename(roi_path).replace('_roi_warped_with_ids.csv', '')
                 group = group_map.get(roi_path, "Unassigned")
                 if group not in ["Control", "Experiment"]: continue
                 
-                rhythm_path = roi_path.replace("_roi_warped.csv", "_rhythm_results.csv")
+                rhythm_path = roi_path.replace("_roi_warped_with_ids.csv", "_rhythm_results.csv")
                 if not os.path.exists(rhythm_path): 
                      self.mw.log_message(f"Skipping {base}: No rhythm results.")
                      continue
-                
-                coords = np.loadtxt(roi_path, delimiter=",")
-                rhythm_df = pd.read_csv(rhythm_path)
-                
-                if len(coords) != len(rhythm_df):
-                    self.mw.log_message(f"Warning: Length mismatch in {base}. Skipping.")
-                    continue
-                    
-                mask = rhythm_df['Is_Rhythmic'].astype(bool).values
-                if not np.any(mask): continue
+                if not os.path.exists(roi_path):
+                     self.mw.log_message(f"Skipping {base}: missing _roi_warped_with_ids.csv. Re-run Apply Warp after updating pipeline.")
+                     continue
 
-                phases = rhythm_df['Phase_Hours'][mask].values
-                periods = rhythm_df['Period_Hours'][mask].values
+                merged, stats = load_and_join_rhythm_and_coords(rhythm_path, roi_path)
+                self.mw.log_message(f"Join {base}: rhythm={stats['n_rhythm']}, warped={stats['n_warped']}, merged={stats['n_merged']}, drop_rhythm={stats['drop_rhythm']}, drop_warped={stats['drop_warped']}, dup_rhythm={stats['dup_rhythm']}, dup_warped={stats['dup_warped']}")
+
+                rhythmic = merged[merged['Is_Rhythmic'].astype(bool)]
+                if rhythmic.empty: continue
+
+                phases = rhythmic['Phase_Hours'].values
+                periods = rhythmic['Period_Hours'].values
                 phases_ct = (phases / periods) * 24.0
                 
                 df = pd.DataFrame({
                     'Animal': base, 'Group': group,
-                    'X': coords[mask, 0], 'Y': coords[mask, 1],
+                    'X': rhythmic['X_Warped'].values, 'Y': rhythmic['Y_Warped'].values,
                     'Phase_CT': phases_ct,
                     'Period_Hours': 24.0
                 })

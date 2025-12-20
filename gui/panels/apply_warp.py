@@ -89,10 +89,19 @@ class ApplyWarpPanel(QtWidgets.QWidget):
             try:
                 with open(warp_file, "r") as f: warp = json.load(f)
                 roi_file = warp_file.replace("_warp_parameters.json", "_roi_filtered.csv")
+                id_file = warp_file.replace("_warp_parameters.json", "_roi_filtered_ids.csv")
                 if not os.path.exists(roi_file):
                     self.mw.log_message(f"Missing _roi_filtered.csv for {os.path.basename(warp_file)}")
                     continue
+                if not os.path.exists(id_file):
+                    self.mw.log_message(f"Missing _roi_filtered_ids.csv for {os.path.basename(warp_file)}. Re-run ROI tool.")
+                    continue
+                ids = np.atleast_1d(np.loadtxt(id_file, delimiter=",", skiprows=1)).astype(int)
                 roi_pts = np.loadtxt(roi_file, delimiter=",")
+                if len(ids) != len(roi_pts):
+                    self.mw.log_message(f"Row count mismatch between IDs ({len(ids)}) and coords ({len(roi_pts)}) for {os.path.basename(warp_file)}. Skipping.")
+                    continue
+                
                 tps = ThinPlateSplineTransform()
                 tps.estimate(np.array(warp["dest_landmarks_norm"]), np.array(warp["source_landmarks_norm"]))
                 dc = np.array(warp["dest_centroid"])
@@ -105,6 +114,12 @@ class ApplyWarpPanel(QtWidgets.QWidget):
                 out = roi_file.replace("_roi_filtered.csv", "_roi_warped.csv")
                 np.savetxt(out, warped_pts, delimiter=",")
                 self.mw.log_message(f"Created {os.path.basename(out)}")
+                
+                out_ids = roi_file.replace("_roi_filtered.csv", "_roi_warped_with_ids.csv")
+                id_header = "Original_ROI_Index,X_Warped,Y_Warped"
+                combined = np.column_stack([ids.astype(int), warped_pts[:, 0], warped_pts[:, 1]])
+                np.savetxt(out_ids, combined, delimiter=",", header=id_header, comments='', fmt=['%d', '%.6f', '%.6f'])
+                self.mw.log_message(f"Created {os.path.basename(out_ids)}")
             except Exception as e:
                 self.mw.log_message(f"Failed to process {os.path.basename(warp_file)}: {e}")
         self.mw.log_message("Warp application complete.")
