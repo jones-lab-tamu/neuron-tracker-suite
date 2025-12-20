@@ -587,7 +587,7 @@ class GroupScatterViewer:
         self.group_radio.on_clicked(self.update_filter)
 
         # Scatter setup (initially empty)
-        self.scatter = ax.scatter([], [], cmap=self.cmap_cyclic, s=25, edgecolor="black", linewidth=0.5, alpha=1.0, zorder=10)
+        self.scatter = ax.scatter([], [], c=[], cmap=self.cmap_cyclic, s=25, edgecolor="black", linewidth=0.5, alpha=1.0, zorder=10)
         
         cax = fig.add_axes([0.86, 0.25, 0.02, 0.6])
         self.cbar = fig.colorbar(self.scatter, cax=cax)
