@@ -204,6 +204,12 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         
         # Row 2: Apply & Status
         self.btn_apply_quality_gate = QtWidgets.QPushButton(get_icon('fa5s.filter'), "Apply Quality Gate")
+        Tooltip.install(
+            self.btn_apply_quality_gate,
+            "INPUT: Current ROI candidate set loaded in this panel.\n"
+            "CRITERIA: Coverage, Jitter, SNR thresholds.\n"
+            "OUTPUT: Quality-Gate pass set (subset of candidates)."
+        )
         gate_layout.addWidget(self.btn_apply_quality_gate, 2, 0, 1, 1)
         
         self.lbl_quality_counts = QtWidgets.QLabel("Passing: - / -")
@@ -335,7 +341,19 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         # Actions (Always visible)
         btn_row = QtWidgets.QHBoxLayout()
         self.btn_regen_phase = QtWidgets.QPushButton(get_icon('fa5s.sync'), "Update Plots")
+        Tooltip.install(
+            self.btn_regen_phase,
+            "INPUT: Quality-Gate pass set.\n"
+            "CRITERIA: Rhythmicity threshold (e.g. SNR/p-value), Strict Cycle check.\n"
+            "OUTPUT: Rhythmic subset (visualized in maps).\n"
+            "NOTE: This does not save files. Use 'Save Rhythm Results' to write the currently included set to disk."
+        )
         self.btn_save_rhythm = QtWidgets.QPushButton(get_icon('fa5s.save'), "Save Rhythm Results")
+        Tooltip.install(
+            self.btn_save_rhythm,
+            "Save Rhythm Results writes ONLY the currently included cells after Quality Gate and Phase Map filtering.\n"
+            "These saved rows are what Group View uses."
+        )
         self.btn_save_rhythm.setEnabled(False)
         btn_row.addWidget(self.btn_regen_phase)
         btn_row.addWidget(self.btn_save_rhythm)
@@ -686,6 +704,8 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             self.num_total_candidates = len(roi)
             self.roi_mask = np.ones(self.num_total_candidates, dtype=bool)
             self.metric_mask = np.ones(self.num_total_candidates, dtype=bool)
+
+            self.mw.log_message(f"[{basename}] ROI load: candidates={self.num_total_candidates} (file={basename}_roi.csv)")
             
             # Load Metrics
             metrics_path = f"{basename}_metrics.csv"
@@ -819,6 +839,19 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         n_fail_snr = (~snr_ok).sum()
         self.lbl_quality_breakdown.setText(f"Failures: Cov={n_fail_cov}, Jit={n_fail_jit}, SNR={n_fail_snr}")
         
+        self.lbl_quality_breakdown.setText(f"Failures: Cov={n_fail_cov}, Jit={n_fail_jit}, SNR={n_fail_snr}")
+        
+        n_in = len(self.metric_mask)
+        n_pass = int(self.metric_mask.sum())
+        base = self.state.output_basename if self.state.output_basename else "Session"
+        
+        try:
+             thresh_msg = f"Thresholds: Cov>={cov_min}, Jit<={jit_max}, SNR>={snr_min}"
+        except NameError:
+             thresh_msg = "Thresholds: unavailable"
+
+        self.mw.log_message(f"[{os.path.basename(base)}] QualityGate: in={n_in}, pass={n_pass}, drop={n_in - n_pass} | {thresh_msg}")
+
         self._resolve_filters()
 
     def open_roi_tool(self):
@@ -1148,6 +1181,24 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             if self.strict_cycle_check.isChecked():
                 rhythm_mask = strict_cycle_mask(self.state.loaded_data["traces"], mpf, period, rhythm_mask, min_cycles=2, trend_window_hours=trend_win)
             
+            if self.strict_cycle_check.isChecked():
+                rhythm_mask = strict_cycle_mask(self.state.loaded_data["traces"], mpf, period, rhythm_mask, min_cycles=2, trend_window_hours=trend_win)
+            
+            if self.strict_cycle_check.isChecked():
+                rhythm_mask = strict_cycle_mask(self.state.loaded_data["traces"], mpf, period, rhythm_mask, min_cycles=2, trend_window_hours=trend_win)
+            
+            n_in_phase = len(rhythm_mask)
+            n_rhythm = int(rhythm_mask.sum())
+            strict_status = "ON" if self.strict_cycle_check.isChecked() else "OFF"
+            base = self.state.output_basename if self.state.output_basename else "Session"
+            
+            try:
+                meth_msg = f"Method={method}, Thresh={thresh}"
+            except NameError:
+                meth_msg = "Method=unknown, Thresh=unknown"
+
+            self.mw.log_message(f"[{os.path.basename(base)}] PhaseFilter: in={n_in_phase}, pass={n_rhythm}, drop={n_in_phase - n_rhythm} | {meth_msg}, strict_cycle={strict_status}")
+            
             # --- Emphasis & Viewers ---
             com_viewer = self.mw.visualization_widgets.get(self.mw.com_tab)
             if com_viewer: com_viewer.update_rhythm_emphasis(rhythm_mask, self.emphasize_rhythm_check.isChecked())
@@ -1272,9 +1323,12 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             return
 
         self.mw._set_last_dir(path)
+        self.mw._set_last_dir(path)
         try:
             self.latest_rhythm_df.to_csv(path, index=False)
-            self.mw.log_message(f"Rhythm results saved: {os.path.basename(path)}")
+            base = self.state.output_basename if self.state.output_basename else "Session"
+            self.mw.log_message(f"[{os.path.basename(base)}] SaveRhythmResults: rows={len(self.latest_rhythm_df)}, file={os.path.basename(path)}")
+            self.mw.log_message(f"Saved set definition: (QualityGate PASS) ∩ (Phase filters PASS). These rows will drive Group View.")
         except Exception as e:
             self.mw.log_message(f"Failed to save rhythm results: {e}")
 

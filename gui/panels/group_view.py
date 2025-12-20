@@ -304,6 +304,7 @@ class GroupViewPanel(QtWidgets.QWidget):
                 self.mw.log_message(f"Join {base}: rhythm={stats['n_rhythm']}, warped={stats['n_warped']}, merged={stats['n_merged']}, drop_rhythm={stats['drop_rhythm']}, drop_warped={stats['drop_warped']}, dup_rhythm={stats['dup_rhythm']}, dup_warped={stats['dup_warped']}")
 
                 rhythmic = merged[merged['Is_Rhythmic'].astype(bool)]
+                self.mw.log_message(f"GroupView[{base}] uses only rows where Is_Rhythmic==True after join. Final Count={len(rhythmic)}")
                 if rhythmic.empty: continue
 
                 phases = rhythmic['Phase_Hours'].values
