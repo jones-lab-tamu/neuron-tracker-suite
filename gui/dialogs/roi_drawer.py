@@ -45,33 +45,68 @@ class RegionAttributesDialog(QtWidgets.QDialog):
             "name": self.name_edit.text()
         }
 
+
+        
+def select_projection_frames(n_frames, max_frames=300):
+    if n_frames <= max_frames:
+        return np.arange(n_frames)
+    # Evenly spaced indices (deterministic)
+    indices = np.linspace(0, n_frames - 1, max_frames).round().astype(int)
+    return np.unique(indices)
+
+def compute_projection(frames, mode, max_frames=300):
+    import time
+    t0 = time.time()
+    n_total = frames.shape[0]
+    
+    # Modes that benefit heavily from subsampling: Median, P95
+    # Mean/Std/Max are generally faster but can also be subsampled if desired.
+    # Per requirements, we apply subsampling to Median/P95.
+    
+    if "Median" in mode or "P95" in mode:
+        indices = select_projection_frames(n_total, max_frames)
+        stack_for_proj = frames[indices].astype(np.float32, copy=False)
+        n_used = len(indices)
+    else:
+        # Use full stack for others, NO astype needed for simple reductions usually,
+        # but to be safe with nans/dtypes we can cast, OR just rely on numpy.
+        # User requested: "For Mean/Std/Max, operate on the original frames array without forcing astype(float32)."
+        stack_for_proj = frames
+        n_used = n_total
+
+    if "Mean" in mode:
+        img = np.nanmean(stack_for_proj, axis=0)
+    elif "Median" in mode:
+        img = np.nanmedian(stack_for_proj, axis=0)
+    elif "Std" in mode:
+        img = np.nanstd(stack_for_proj, axis=0)
+    elif "Max" in mode:
+        img = np.nanmax(stack_for_proj, axis=0)
+    elif "P95" in mode:
+        img = np.nanpercentile(stack_for_proj, 95, axis=0)
+    else:
+        img = None
+
+    dt = time.time() - t0
+    return img, n_used, n_total, dt
+
 class BgComputeWorker(QtCore.QObject):
-    finished = QtCore.pyqtSignal(object, str, float) # (image, mode, seconds)
+    finished = QtCore.pyqtSignal(object, str, float, int, int, object, int) # (image, mode, seconds, n_used, n_total, dataset_key, max_frames)
     error = QtCore.pyqtSignal(str)
 
-    def __init__(self, frames, mode):
+    def __init__(self, frames, mode, max_frames=300, dataset_key=None):
         super().__init__()
         self.frames = frames
         self.mode = mode
+        self.max_frames = max_frames
+        self.dataset_key = dataset_key
 
     def run(self):
-        import time
-        t0 = time.time()
         try:
-            img = None
-            if "Mean" in self.mode:
-                img = np.nanmean(self.frames, axis=0)
-            elif "Median" in self.mode:
-                img = np.nanmedian(self.frames, axis=0)
-            elif "Std" in self.mode:
-                img = np.nanstd(self.frames, axis=0)
-            elif "Max" in self.mode:
-                img = np.nanmax(self.frames, axis=0)
-            elif "P95" in self.mode:
-                img = np.nanpercentile(self.frames, 95, axis=0)
-            
-            dt = time.time() - t0
-            self.finished.emit(img, self.mode, dt)
+            img, n_used, n_total, dt = compute_projection(
+                self.frames, self.mode, self.max_frames
+            )
+            self.finished.emit(img, self.mode, dt, n_used, n_total, self.dataset_key, self.max_frames)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -95,8 +130,21 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         self.is_region_mode = is_region_mode
         self.movie_data = movie_data
         
+        # --- Init-Safety Defaults ---
+        # update_background() might run early via some event or timer, so defines these NOW.
+        self.movie_available = False
+        self.movie_frames = None
+        self.total_frames = 0
+        self.current_frame_idx = 1
+        self.current_bg_mode = "Static"
+        self.bg_image = None
+        
         # --- Movie Data Processing & Cache Init ---
-        self._bg_cache = {}
+        self._bg_cache = {} # Key: (dataset_key, mode, max_frames)
+        # Key now derived dynamically from movie_frames
+        self._bg_cache = {} # Key: (dataset_key, mode, max_frames)
+        # Key now derived dynamically from movie_frames
+        self.roi_projection_max_frames = 150
         self._is_computing = False
         self._compute_thread = None
         self._compute_worker = None
@@ -140,10 +188,19 @@ class ROIDrawerDialog(QtWidgets.QDialog):
                       parent.mw.log_message(warn)
              
         if valid_movie:
+             self.movie_available = True
              self.total_frames = self.movie_frames.shape[0]
              self.current_frame_idx = max(1, min((self.total_frames // 2) + 1, self.total_frames))
-             self.current_bg_mode = "Median (time)"
+             
+             # Smart Default Mode:
+             settings = QtCore.QSettings("NeuronTracker", "ROIDrawer")
+             last_mode = settings.value("roi_drawer/bg_mode", "Mean (time)")
+             if "Median" in str(last_mode) or "P95" in str(last_mode):
+                 last_mode = "Mean (time)"
+             
+             self.current_bg_mode = last_mode
         else:
+             self.movie_available = False
              self.current_bg_mode = "Static"
              self.movie_frames = None
 
@@ -151,6 +208,8 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         if parent and hasattr(parent, 'mw') and hasattr(parent.mw, 'log_message'):
              state_desc = "Static (Region)" if self.is_region_mode else self.current_bg_mode
              parent.mw.log_message(f"ROI Tool opened. Mode={state_desc}, Frames={self.total_frames}")
+
+
 
 
         self.rois = []
@@ -223,15 +282,21 @@ class ROIDrawerDialog(QtWidgets.QDialog):
              modes = ["Single frame", "Mean (time)", "Median (time)", "Std (time)", "Max (time)", "P95 (time)"]
              self.bg_mode_combo.addItems(modes)
              idx = self.bg_mode_combo.findText(self.current_bg_mode)
-             if idx >= 0: self.bg_mode_combo.setCurrentIndex(idx)
+             if idx >= 0: 
+                 self.bg_mode_combo.blockSignals(True)
+                 self.bg_mode_combo.setCurrentIndex(idx)
+                 self.bg_mode_combo.blockSignals(False)
              self.bg_mode_combo.setEnabled(True)
+
         else:
              # Static or Region Mode: disable mode selector
              self.bg_mode_combo.addItem("Static")
+             self.bg_mode_combo.blockSignals(True)
              self.bg_mode_combo.setCurrentIndex(0)
+             self.bg_mode_combo.blockSignals(False)
              self.bg_mode_combo.setEnabled(False)
         
-        self.bg_mode_combo.currentIndexChanged.connect(self.update_background)
+        self.bg_mode_combo.currentTextChanged.connect(self._on_bg_mode_changed)
         bg_layout.addWidget(QtWidgets.QLabel("Mode:"))
         bg_layout.addWidget(self.bg_mode_combo)
         
@@ -334,18 +399,26 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         
         
         # Initial Background Compute & Render
-        # If default is a summary mode, we should defer it or compute synchronous?
-        # Requirement: "MAKE INITIAL RENDER INSTANT"
-        # So trigger update, which will handle cache/static logic
-        if self.current_bg_mode not in ["Static", "Single frame"] and self.current_bg_mode not in self._bg_cache:
-             # Defer initial heavy compute to allow window to show
-             # Show static for now
-             self.bg_im.set_data(self.static_bg_image)
-             self.lbl_bg_status.setText(f"Background: Static (computing {self.current_bg_mode}...)")
-             self._apply_bg_controls_state()
-             QtCore.QTimer.singleShot(50, self.update_background)
+        # Initial Background Compute & Render (instant static first)
+        # Guard against init-order issues
+        if hasattr(self, "bg_im"):
+            img0 = getattr(self, "static_bg_image", None)
+            if img0 is None:
+                img0 = getattr(self, "bg_image", None)
+            if img0 is not None:
+                self.bg_im.set_data(img0)
+        if hasattr(self, "lbl_bg_status"):
+            self.lbl_bg_status.setText("Background: Static (loading...)")
+        self._apply_bg_controls_state()
+
+        # Force current_bg_mode to match UI selection if movie is available
+        if self.movie_available and hasattr(self, "bg_mode_combo"):
+             self.current_bg_mode = self.bg_mode_combo.currentText()
         else:
-             self.update_background()
+             self.current_bg_mode = "Static"
+
+        # Defer ONE background update to the next event loop tick
+        QtCore.QTimer.singleShot(0, self.update_background)
         
         # Draw initial state
         self.redraw_finished_rois()
@@ -363,6 +436,13 @@ class ROIDrawerDialog(QtWidgets.QDialog):
             self._compute_thread.deleteLater()
             
         super().closeEvent(event)
+
+    def _get_dataset_key(self):
+        """Returns a robust key tuple for the current frame stack."""
+        if self.movie_frames is None:
+            return None
+        # Track identity, shape, and dtype to be safe against in-place modifications or replacements
+        return (id(self.movie_frames), getattr(self.movie_frames, "shape", None), getattr(self.movie_frames, "dtype", None))
 
     def _apply_bg_controls_state(self):
         """
@@ -411,8 +491,8 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         self.update_background()
 
     def compute_background(self, mode):
-        if not self.movie_available:
-            return self.bg_image
+        if not getattr(self, "movie_available", False) or self.movie_frames is None:
+            return getattr(self, "bg_image", None)
             
         if mode == "Single frame":
             # No caching for single frames, dynamic slice
@@ -444,49 +524,69 @@ class ROIDrawerDialog(QtWidgets.QDialog):
             
         return self.bg_image # Fallback
 
+    def _on_bg_mode_changed(self, mode):
+        settings = QtCore.QSettings("NeuronTracker", "ROIDrawer")
+        settings.setValue("roi_drawer/bg_mode", mode)
+        self.current_bg_mode = mode
+        self.update_background()
+
     def update_background(self):
-        mode = self.bg_mode_combo.currentText()
-        if not self.movie_available:
-            # Static mode
-            self.lbl_bg_status.setText("Background: Static")
-            self.curr_frame_widget.setEnabled(False)
-            img = self.bg_image
+        # Read mode from UI if present, else fallback to current_bg_mode
+        mode = getattr(self, "current_bg_mode", "Static")
+        if hasattr(self, "bg_mode_combo"):
+            mode = self.bg_mode_combo.currentText()
+            
+        # Defensive check for early calls
+        is_avail = getattr(self, "movie_available", False)
+        frames = getattr(self, "movie_frames", None)
+        
+        if (not is_avail) or (frames is None):
+            # Static mode (safe even during init)
+            if hasattr(self, "lbl_bg_status"):
+                self.lbl_bg_status.setText("Background: Static")
+            if hasattr(self, "curr_frame_widget"):
+                self.curr_frame_widget.setEnabled(False)
+            
+            # Prefer static_bg_image if available, else bg_image
+            img = getattr(self, "static_bg_image", None)
+            if img is None:
+                img = getattr(self, "bg_image", None)
         else:
             self.current_bg_mode = mode
+            
+            # NOTE: do NOT write QSettings here. That is handled by _on_bg_mode_changed.
             if mode == "Single frame":
-                self.curr_frame_widget.setEnabled(True)
-                self.lbl_bg_status.setText(f"Background: Single frame (frame {self.current_frame_idx} of {self.total_frames})")
-                
-                # Log change if parent available
-                if self.parent() and hasattr(self.parent(), 'mw'):
-                     # Only log if sender is user interaction to avoid spam? Or just log.
-                     pass 
+                if hasattr(self, "curr_frame_widget"):
+                    self.curr_frame_widget.setEnabled(True)
+                if hasattr(self, "lbl_bg_status"):
+                    self.lbl_bg_status.setText(f"Background: Single frame (frame {self.current_frame_idx} of {self.total_frames})")
             else:
-                self.curr_frame_widget.setEnabled(False)
-                self.lbl_bg_status.setText(f"Background: {mode}")
+                if hasattr(self, "curr_frame_widget"):
+                    self.curr_frame_widget.setEnabled(False)
+                if hasattr(self, "lbl_bg_status"):
+                    self.lbl_bg_status.setText(f"Background: {mode}")
             
             img = self.compute_background(mode)
             
-            # Log
-            if self.parent() and hasattr(self.parent(), 'mw') and hasattr(self.parent().mw, 'log_message'):
-                 # Simple deduplication could be added here if needed, but per-click logging is fine
-                 pass
+        # If we have no image yet, exit cleanly
+        if img is None:
+             return
 
-        if img is not None:
+        # CRITICAL: matplotlib widgets may not exist yet if update_background fired during init
+        if not hasattr(self, "ax") or not hasattr(self, "canvas"):
+             # Store it for later, but do not attempt to draw yet
              self.bg_image = img
-             # Update imshow
-             artists = self.ax.get_images()
-             if artists:
-                 im = artists[0]
-                 im.set_data(img)
-                 # Don't reset vmin/vmax automatically here unless it's first load?
-                 # Actually user might want stable contrast when scrubbing. 
-                 # Let's keep existing vmin/vmax of the artist unless they are None.
-                 # The init passes vmin/vmax.
-             else:
-                 self.ax.imshow(img, cmap="gray") # Should not happen given init
-             
-             self.canvas.draw_idle()
+             return
+
+        # Update stored image and redraw
+        self.bg_image = img
+        artists = self.ax.get_images()
+        if artists:
+            artists[0].set_data(img)
+        else:
+            self.ax.imshow(img, cmap="gray")
+        
+        self.canvas.draw_idle()
 
     def apply_auto_contrast(self):
         artists = self.ax.get_images()
@@ -783,7 +883,7 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         self.current_frame_idx = val
         self.update_background()
 
-    def _on_compute_finished(self, img, mode, dt):
+    def _on_compute_finished(self, img, mode, dt, n_used, n_total, dataset_key, max_frames):
         self._is_computing = False
         self.unsetCursor()
         
@@ -791,10 +891,13 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         self._apply_bg_controls_state()
         
         if img is not None:
-             self._bg_cache[mode] = img
-             self.lbl_bg_status.setText(f"Background: {mode} ready (computed in {dt:.2f}s)")
+             # Cache with dataset_key from the worker to avoid race conditions
+             cache_key = (dataset_key, mode, max_frames)
+             self._bg_cache[cache_key] = img
+             
+             self.lbl_bg_status.setText(f"Background: {mode} ready ({n_used}/{n_total} frames, {dt:.2f}s)")
              if self.parent() and hasattr(self.parent(), 'mw') and hasattr(self.parent().mw, 'log_message'):
-                  self.parent().mw.log_message(f"ROI background ready: {mode}, T={self.total_frames}, seconds={dt:.2f}")
+                  self.parent().mw.log_message(f"ROI background ready: {mode}, Used={n_used}/{n_total}, seconds={dt:.2f}")
              
              # Only update display if we are still in that mode
              if self.bg_mode_combo.currentText() == mode:
@@ -845,7 +948,14 @@ class ROIDrawerDialog(QtWidgets.QDialog):
              self.parent().mw.log_message(f"Starting async background compute: {mode}")
 
         self._compute_thread = QtCore.QThread()
-        self._compute_worker = BgComputeWorker(self.movie_frames, mode)
+        # Compute dataset key NOW to bind it to this specific computation
+        dataset_key = self._get_dataset_key()
+        self._compute_worker = BgComputeWorker(
+            self.movie_frames,
+            mode, 
+            max_frames=self.roi_projection_max_frames,
+            dataset_key=dataset_key
+        )
         self._compute_worker.moveToThread(self._compute_thread)
         
         self._compute_thread.started.connect(self._compute_worker.run)
@@ -864,6 +974,12 @@ class ROIDrawerDialog(QtWidgets.QDialog):
 
         # 1. Validate Mode
         mode = self.bg_mode_combo.currentText()
+        
+        # Save setting immediately on selection (so next open uses the last mode),
+        # but note: init sequence will override Median/P95 to Mean on startup.
+        if self.movie_available:
+             settings = QtCore.QSettings("NeuronTracker", "ROIDrawer")
+             settings.setValue("roi_drawer/bg_mode", mode)
         
         # 2. Check Static / Region Conditions
         if self.movie_frames is None or self.is_region_mode or mode == "Static":
@@ -893,8 +1009,9 @@ class ROIDrawerDialog(QtWidgets.QDialog):
             self.current_bg_mode = mode
             
             # Check cache
-            if mode in self._bg_cache:
-                img = self._bg_cache[mode]
+            cache_key = (self._get_dataset_key(), mode, self.roi_projection_max_frames)
+            if cache_key in self._bg_cache:
+                img = self._bg_cache[cache_key]
                 self.lbl_bg_status.setText(f"Background: {mode} (Cached)")
                 self._apply_bg_controls_state()
             else:
