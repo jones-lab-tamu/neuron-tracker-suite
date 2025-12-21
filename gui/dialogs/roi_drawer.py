@@ -53,7 +53,7 @@ class ROIDrawerDialog(QtWidgets.QDialog):
     Calls callback(filtered_indices, rois_dict_list)
     """
 
-    def __init__(self, parent, bg_image, roi_data, output_basename, callback, vmin=None, vmax=None, is_region_mode=False):
+    def __init__(self, parent, bg_image, roi_data, output_basename, callback, vmin=None, vmax=None, is_region_mode=False, movie_data=None):
         super().__init__(parent)
         self.setWindowTitle("Advanced ROI Definition Tool")
         self.resize(1100, 800)
@@ -62,7 +62,61 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         self.roi_data = roi_data
         self.output_basename = output_basename
         self.callback = callback
-        self.is_region_mode = is_region_mode  # Store the flag
+        self.is_region_mode = is_region_mode
+        self.movie_data = movie_data
+        
+        # --- Movie Data Processing & Cache Init ---
+        self._bg_cache = {}
+        self.movie_frames = None
+        self.total_frames = 0
+        self.current_frame_idx = 1 # 1-based index
+        self._last_bg_state = None  # (mode, frame_idx) for log deduplication
+        
+        self.static_bg_image = bg_image
+        self.current_bg_image = bg_image
+
+        # Robust Axis Inference
+        valid_movie = False
+        if self.movie_data is not None and not self.is_region_mode and self.static_bg_image is not None:
+             if self.movie_data.ndim == 3:
+                 H, W = self.static_bg_image.shape
+                 shape = self.movie_data.shape
+                 
+                 candidates = []
+                 # Check all 3 axes as potential time axis
+                 for axis in range(3):
+                     # Temporarily move axis to front: (T, Y, X)
+                     frames = np.moveaxis(self.movie_data, axis, 0)
+                     spatial = frames.shape[1:]
+                     
+                     if spatial == (H, W):
+                         candidates.append(frames) # No transpose needed
+                     elif spatial == (W, H):
+                         candidates.append(frames.transpose(0, 2, 1)) # Transpose spatial
+                 
+                 if len(candidates) == 1:
+                     self.movie_frames = candidates[0]
+                     valid_movie = True
+                 elif len(candidates) == 0:
+                     warn = f"ROI Drawer Warning: No axis in movie shape {shape} matches background {(H, W)}."
+                 else:
+                     warn = f"ROI Drawer Warning: Ambiguous axes in movie shape {shape} for background {(H, W)}."
+                 
+                 if not valid_movie and 'warn' in locals() and parent and hasattr(parent, 'mw'):
+                      parent.mw.log_message(warn)
+             
+        if valid_movie:
+             self.total_frames = self.movie_frames.shape[0]
+             self.current_frame_idx = max(1, min((self.total_frames // 2) + 1, self.total_frames))
+             self.current_bg_mode = "Median (time)"
+        else:
+             self.current_bg_mode = "Static"
+             self.movie_frames = None
+
+        # Log initial state
+        if parent and hasattr(parent, 'mw') and hasattr(parent.mw, 'log_message'):
+             state_desc = "Static (Region)" if self.is_region_mode else self.current_bg_mode
+             parent.mw.log_message(f"ROI Tool opened. Mode={state_desc}, Frames={self.total_frames}")
 
 
         self.rois = []
@@ -79,7 +133,8 @@ class ROIDrawerDialog(QtWidgets.QDialog):
                     with open(json_path, "r") as f:
                         self.rois = json.load(f)
                 except Exception as e:
-                    print(f"Error loading existing ROIs: {e}")
+                    if parent and hasattr(parent, 'mw') and hasattr(parent.mw, 'log_message'):
+                         parent.mw.log_message(f"Error loading existing ROIs: {e}")
 
         # --- Layout Setup ---
         main_layout = QtWidgets.QHBoxLayout(self)
@@ -90,7 +145,8 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         
         self.fig = Figure()
         self.ax = self.fig.add_subplot(111)
-        self.ax.imshow(bg_image, cmap="gray", vmin=vmin, vmax=vmax)
+        # Store persistent handle
+        self.bg_im = self.ax.imshow(bg_image, cmap="gray", vmin=vmin, vmax=vmax)
 
         if roi_data is not None and len(roi_data) > 0:
             self.ax.plot(roi_data[:, 0], roi_data[:, 1],
@@ -109,6 +165,86 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         ctrl_widget = QtWidgets.QWidget()
         ctrl_layout = QtWidgets.QVBoxLayout(ctrl_widget)
         
+        # --- Background Controls ---
+        bg_group = QtWidgets.QGroupBox("Background")
+        bg_layout = QtWidgets.QVBoxLayout(bg_group)
+        
+        # Mode Selector
+        self.bg_mode_combo = QtWidgets.QComboBox()
+        modes = ["Single frame", "Mean (time)", "Median (time)", "Std (time)", "Max (time)", "P95 (time)"]
+        self.bg_mode_combo.addItems(modes)
+        
+        if self.movie_frames is not None and not self.is_region_mode:
+             modes = ["Single frame", "Mean (time)", "Median (time)", "Std (time)", "Max (time)", "P95 (time)"]
+             self.bg_mode_combo.addItems(modes)
+             idx = self.bg_mode_combo.findText(self.current_bg_mode)
+             if idx >= 0: self.bg_mode_combo.setCurrentIndex(idx)
+             self.bg_mode_combo.setEnabled(True)
+        else:
+             # Static or Region Mode: disable mode selector
+             self.bg_mode_combo.addItem("Static")
+             self.bg_mode_combo.setCurrentIndex(0)
+             self.bg_mode_combo.setEnabled(False)
+        
+        self.bg_mode_combo.currentIndexChanged.connect(self.update_background)
+        bg_layout.addWidget(QtWidgets.QLabel("Mode:"))
+        bg_layout.addWidget(self.bg_mode_combo)
+        
+        # Frame Control (Slider + Spin)
+        self.curr_frame_widget = QtWidgets.QWidget()
+        cf_layout = QtWidgets.QHBoxLayout(self.curr_frame_widget)
+        cf_layout.setContentsMargins(0,0,0,0)
+        
+        self.frame_spin = QtWidgets.QSpinBox()
+        self.frame_spin.setRange(1, max(1, self.total_frames))
+        self.frame_spin.setValue(self.current_frame_idx)
+        
+        self.frame_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.frame_slider.setRange(1, max(1, self.total_frames))
+        self.frame_slider.setValue(self.current_frame_idx)
+        
+        self.frame_spin.valueChanged.connect(self.frame_slider.setValue)
+        self.frame_slider.valueChanged.connect(self.frame_spin.setValue)
+        self.frame_slider.valueChanged.connect(self._on_frame_slider_changed)
+        
+        cf_layout.addWidget(QtWidgets.QLabel("Frame:"))
+        cf_layout.addWidget(self.frame_slider)
+        cf_layout.addWidget(self.frame_spin)
+        
+        # Enable frame widget steps logic
+        # Only enable if NOT region mode, HAVE movie, Total > 1, and in Single Frame mode
+        should_enable_frames = (not self.is_region_mode) and (self.movie_frames is not None) and (self.total_frames > 1) and (self.current_bg_mode == "Single frame")
+        self.curr_frame_widget.setEnabled(should_enable_frames)
+        
+        bg_layout.addWidget(self.curr_frame_widget)
+        
+        # Auto Contrast
+        self.btn_auto_contrast = QtWidgets.QPushButton("Auto contrast")
+        self.btn_auto_contrast.clicked.connect(self.apply_auto_contrast)
+        bg_layout.addWidget(self.btn_auto_contrast)
+        
+        # Status Label
+        # Status Label
+        if self.is_region_mode:
+             state_text = "Static (Region mode)"
+        elif self.movie_frames is None:
+             state_text = "Static"
+        else:
+             state_text = self.current_bg_mode
+             
+        self.lbl_bg_status = QtWidgets.QLabel(f"Background: {state_text}")
+        self.lbl_bg_status.setStyleSheet("color: gray; font-size: 10px;")
+        bg_layout.addWidget(self.lbl_bg_status)
+        
+        # If region mode or static, disable entire group except maybe auto-contrast?
+        if self.is_region_mode:
+             bg_group.setEnabled(False)
+        elif self.movie_frames is None:
+             # If just static (no movie), combo/slider disabled above.
+             pass
+        
+        ctrl_layout.addWidget(bg_group)
+
         # Instructions
         info = QtWidgets.QLabel(
             "<b>Instructions:</b><br>"
@@ -174,8 +310,117 @@ class ROIDrawerDialog(QtWidgets.QDialog):
 
         self.cid = self.canvas.mpl_connect("button_press_event", self.on_click)
         
+        
+        # Initial Background Compute & Render
+        self.update_background()
+        
         # Draw initial state
         self.redraw_finished_rois()
+
+    def _on_frame_slider_changed(self, val):
+        self.current_frame_idx = val
+        self.update_background()
+
+    def compute_background(self, mode):
+        if not self.movie_available:
+            return self.bg_image
+            
+        if mode == "Single frame":
+            # No caching for single frames, dynamic slice
+            # existing bg_image might be a fallback if movie not valid, but movie_available checks that
+            idx = self.current_frame_idx - 1 # 0-based
+            idx = np.clip(idx, 0, self.total_frames - 1)
+            return self.movie_data[idx]
+        
+        # Time Summary Modes
+        if mode in self._bg_cache:
+            return self._bg_cache[mode]
+            
+        # Compute
+        img = None
+        if "Mean" in mode:
+            img = np.nanmean(self.movie_data, axis=0)
+        elif "Median" in mode:
+            img = np.nanmedian(self.movie_data, axis=0)
+        elif "Std" in mode:
+            img = np.nanstd(self.movie_data, axis=0)
+        elif "Max" in mode:
+            img = np.nanmax(self.movie_data, axis=0)
+        elif "P95" in mode:
+            img = np.nanpercentile(self.movie_data, 95, axis=0)
+        
+        if img is not None:
+            self._bg_cache[mode] = img
+            return img
+            
+        return self.bg_image # Fallback
+
+    def update_background(self):
+        mode = self.bg_mode_combo.currentText()
+        if not self.movie_available:
+            # Static mode
+            self.lbl_bg_status.setText("Background: Static")
+            self.curr_frame_widget.setEnabled(False)
+            img = self.bg_image
+        else:
+            self.current_bg_mode = mode
+            if mode == "Single frame":
+                self.curr_frame_widget.setEnabled(True)
+                self.lbl_bg_status.setText(f"Background: Single frame (frame {self.current_frame_idx} of {self.total_frames})")
+                
+                # Log change if parent available
+                if self.parent() and hasattr(self.parent(), 'mw'):
+                     # Only log if sender is user interaction to avoid spam? Or just log.
+                     pass 
+            else:
+                self.curr_frame_widget.setEnabled(False)
+                self.lbl_bg_status.setText(f"Background: {mode}")
+            
+            img = self.compute_background(mode)
+            
+            # Log
+            if self.parent() and hasattr(self.parent(), 'mw') and hasattr(self.parent().mw, 'log_message'):
+                 # Simple deduplication could be added here if needed, but per-click logging is fine
+                 pass
+
+        if img is not None:
+             self.bg_image = img
+             # Update imshow
+             artists = self.ax.get_images()
+             if artists:
+                 im = artists[0]
+                 im.set_data(img)
+                 # Don't reset vmin/vmax automatically here unless it's first load?
+                 # Actually user might want stable contrast when scrubbing. 
+                 # Let's keep existing vmin/vmax of the artist unless they are None.
+                 # The init passes vmin/vmax.
+             else:
+                 self.ax.imshow(img, cmap="gray") # Should not happen given init
+             
+             self.canvas.draw_idle()
+
+    def apply_auto_contrast(self):
+        artists = self.ax.get_images()
+        if not artists: return
+        im = artists[0]
+        data = im.get_array()
+        
+        if data is None: return
+        
+        flat = data[np.isfinite(data)]
+        if len(flat) == 0: return
+        
+        vmin = np.percentile(flat, 2)
+        vmax = np.percentile(flat, 98)
+        
+        if vmax <= vmin:
+            vmax = vmin + 1e-6
+            
+        im.set_clim(vmin, vmax)
+        self.canvas.draw_idle()
+        
+        if self.parent() and hasattr(self.parent(), 'mw') and hasattr(self.parent().mw, 'log_message'):
+             self.parent().mw.log_message(f"ROI AutoContrast: vmin={vmin:.2f}, vmax={vmax:.2f}")
 
     def redraw_finished_rois(self):
         for artist in self.finished_artists:
@@ -444,3 +689,105 @@ class ROIDrawerDialog(QtWidgets.QDialog):
             self.callback(filtered_indices, anatomical_rois, phase_ref_rois)
 
         self.accept()
+
+    def _on_frame_slider_changed(self, val):
+        self.current_frame_idx = val
+        self.update_background()
+
+    def compute_background(self, mode):
+        # Fallback to static checks
+        if self.movie_frames is None or self.is_region_mode:
+            return self.static_bg_image
+            
+        if mode == "Single frame":
+            # 1-based index conversion
+            idx = self.current_frame_idx - 1 
+            idx = np.clip(idx, 0, self.total_frames - 1)
+            return self.movie_frames[idx]
+        
+        # Time Summary Modes
+        if mode in self._bg_cache:
+            return self._bg_cache[mode]
+            
+        # Compute
+        img = None
+        if "Mean" in mode:
+            img = np.nanmean(self.movie_frames, axis=0)
+        elif "Median" in mode:
+            img = np.nanmedian(self.movie_frames, axis=0)
+        elif "Std" in mode:
+            img = np.nanstd(self.movie_frames, axis=0)
+        elif "Max" in mode:
+            img = np.nanmax(self.movie_frames, axis=0)
+        elif "P95" in mode:
+            img = np.nanpercentile(self.movie_frames, 95, axis=0)
+        
+        if img is not None:
+            self._bg_cache[mode] = img
+            return img
+            
+        return self.static_bg_image # Fallback
+
+    def update_background(self):
+        mode = self.bg_mode_combo.currentText()
+        if self.movie_frames is None or self.is_region_mode or mode == "Static":
+            # Static mode
+            img = self.static_bg_image
+            self.curr_frame_widget.setEnabled(False)
+            
+            if self.is_region_mode:
+                 self.lbl_bg_status.setText("Background: Static (Region mode)")
+            else:
+                 self.lbl_bg_status.setText("Background: Static")
+        else:
+            self.current_bg_mode = mode
+            is_single = (mode == "Single frame")
+            
+            # Update Frame Widget State
+            should_enable_frames = is_single and (self.total_frames > 1)
+            self.curr_frame_widget.setEnabled(should_enable_frames)
+            
+            # Status Label
+            if is_single:
+                 txt = f"Background: Single frame (frame {self.current_frame_idx} of {self.total_frames})"
+            else:
+                 txt = f"Background: {mode}"
+            self.lbl_bg_status.setText(txt)
+            
+            img = self.compute_background(mode)
+            
+            # Dedicated Logging with De-duplication
+            new_state = (mode, self.current_frame_idx if is_single else -1)
+            if new_state != self._last_bg_state:
+                if self.parent() and hasattr(self.parent(), 'mw') and hasattr(self.parent().mw, 'log_message'):
+                     msg = f"ROI Background changed: {mode}"
+                     if is_single:
+                         msg += f" ({self.current_frame_idx}/{self.total_frames})"
+                     self.parent().mw.log_message(msg)
+                self._last_bg_state = new_state
+
+        if img is not None and self.bg_im is not None:
+             self.current_bg_image = img
+             self.bg_im.set_data(img)
+             self.canvas.draw_idle()
+
+    def apply_auto_contrast(self):
+        if self.bg_im is None: return
+        data = self.bg_im.get_array()
+        
+        if data is None: return
+        
+        flat = data[np.isfinite(data)]
+        if len(flat) == 0: return
+        
+        vmin = np.percentile(flat, 2)
+        vmax = np.percentile(flat, 98)
+        
+        if vmax <= vmin:
+            vmax = vmin + 1e-6
+            
+        self.bg_im.set_clim(vmin, vmax)
+        self.canvas.draw_idle()
+        
+        if self.parent() and hasattr(self.parent(), 'mw') and hasattr(self.parent().mw, 'log_message'):
+             self.parent().mw.log_message(f"ROI AutoContrast: vmin={vmin:.2f}, vmax={vmax:.2f}")

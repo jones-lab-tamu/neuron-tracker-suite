@@ -861,6 +861,11 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         if not self.state.output_basename:
             self.mw.log_message("Error: Output Basename required.")
             return
+
+
+        movie_data = None
+        self.mw.log_message("ROI Drawer: movie frames unavailable in current pipeline, using static background only.")
+        
         dlg = ROIDrawerDialog(
             self,
             self.state.unfiltered_data["background"],
@@ -869,6 +874,8 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             self.apply_roi_filter,
             vmin=self.vmin,
             vmax=self.vmax,
+            is_region_mode=False,
+            movie_data=movie_data
         )
         dlg.exec_()
         self.mw.update_workflow_from_files()
