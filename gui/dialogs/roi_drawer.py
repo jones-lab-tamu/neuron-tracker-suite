@@ -45,6 +45,36 @@ class RegionAttributesDialog(QtWidgets.QDialog):
             "name": self.name_edit.text()
         }
 
+class BgComputeWorker(QtCore.QObject):
+    finished = QtCore.pyqtSignal(object, str, float) # (image, mode, seconds)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, frames, mode):
+        super().__init__()
+        self.frames = frames
+        self.mode = mode
+
+    def run(self):
+        import time
+        t0 = time.time()
+        try:
+            img = None
+            if "Mean" in self.mode:
+                img = np.nanmean(self.frames, axis=0)
+            elif "Median" in self.mode:
+                img = np.nanmedian(self.frames, axis=0)
+            elif "Std" in self.mode:
+                img = np.nanstd(self.frames, axis=0)
+            elif "Max" in self.mode:
+                img = np.nanmax(self.frames, axis=0)
+            elif "P95" in self.mode:
+                img = np.nanpercentile(self.frames, 95, axis=0)
+            
+            dt = time.time() - t0
+            self.finished.emit(img, self.mode, dt)
+        except Exception as e:
+            self.error.emit(str(e))
+
 class ROIDrawerDialog(QtWidgets.QDialog):
     """
     ROI drawing dialog: include/exclude polygons, writes:
@@ -67,6 +97,10 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         
         # --- Movie Data Processing & Cache Init ---
         self._bg_cache = {}
+        self._is_computing = False
+        self._compute_thread = None
+        self._compute_worker = None
+        
         self.movie_frames = None
         self.total_frames = 0
         self.current_frame_idx = 1 # 1-based index
@@ -179,6 +213,7 @@ class ROIDrawerDialog(QtWidgets.QDialog):
 
         # --- Background Controls ---
         bg_group = QtWidgets.QGroupBox("Background")
+        self.bg_group = bg_group
         bg_layout = QtWidgets.QVBoxLayout(bg_group)
         
         # Mode Selector
@@ -234,23 +269,12 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         bg_layout.addWidget(self.btn_auto_contrast)
         
         # Status Label
-        if self.is_region_mode:
-             state_text = "Static (Region mode)"
-        elif self.movie_frames is None:
-             state_text = "Static"
-        else:
-             state_text = self.current_bg_mode
-             
-        self.lbl_bg_status = QtWidgets.QLabel(f"Background: {state_text}")
+        self.lbl_bg_status = QtWidgets.QLabel("Background: Static")
         self.lbl_bg_status.setStyleSheet("color: gray; font-size: 10px;")
         bg_layout.addWidget(self.lbl_bg_status)
         
-        # If region mode or static, disable entire group except maybe auto-contrast?
-        if self.is_region_mode:
-             bg_group.setEnabled(False)
-        elif self.movie_frames is None:
-             # If just static (no movie), combo/slider disabled above.
-             pass
+        # Initialize UI state
+        self._apply_bg_controls_state()
         
         ctrl_layout.addWidget(bg_group)
 
@@ -310,10 +334,77 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         
         
         # Initial Background Compute & Render
-        self.update_background()
+        # If default is a summary mode, we should defer it or compute synchronous?
+        # Requirement: "MAKE INITIAL RENDER INSTANT"
+        # So trigger update, which will handle cache/static logic
+        if self.current_bg_mode not in ["Static", "Single frame"] and self.current_bg_mode not in self._bg_cache:
+             # Defer initial heavy compute to allow window to show
+             # Show static for now
+             self.bg_im.set_data(self.static_bg_image)
+             self.lbl_bg_status.setText(f"Background: Static (computing {self.current_bg_mode}...)")
+             self._apply_bg_controls_state()
+             QtCore.QTimer.singleShot(50, self.update_background)
+        else:
+             self.update_background()
         
         # Draw initial state
         self.redraw_finished_rois()
+
+    def closeEvent(self, event):
+        # Clean up thread if running
+        if self._compute_thread and self._compute_thread.isRunning():
+            self._compute_thread.quit()
+            self._compute_thread.wait()
+        
+        # Explicit cleanup
+        if self._compute_worker:
+            self._compute_worker.deleteLater()
+        if self._compute_thread:
+            self._compute_thread.deleteLater()
+            
+        super().closeEvent(event)
+
+    def _apply_bg_controls_state(self):
+        """
+        Robustly enable/disable background controls based on current state.
+        Call this whenever state changes or a compute finishes.
+        """
+        # Guards for init-order safety
+        if not hasattr(self, "bg_group") or not hasattr(self, "bg_mode_combo") or \
+           not hasattr(self, "curr_frame_widget") or not hasattr(self, "btn_auto_contrast"):
+             return
+
+        # A) Region Mode -> Everything disabled
+        if self.is_region_mode:
+            self.bg_group.setEnabled(False)
+            return
+
+        # B) Not region mode -> Group enabled
+        self.bg_group.setEnabled(True)
+
+        # B1) No Movie -> Static only
+        if self.movie_frames is None:
+            self.bg_mode_combo.setEnabled(False)
+            self.curr_frame_widget.setEnabled(False)
+            self.btn_auto_contrast.setEnabled(True)
+            return
+
+        # B2) Computing -> Controls disabled
+        if self._is_computing:
+            self.bg_mode_combo.setEnabled(False)
+            self.curr_frame_widget.setEnabled(False)
+            self.btn_auto_contrast.setEnabled(False)
+            return
+
+        # B3) Movie Available & Idle
+        self.bg_mode_combo.setEnabled(True)
+        self.btn_auto_contrast.setEnabled(True)
+        
+        mode = self.bg_mode_combo.currentText()
+        if mode == "Single frame" and self.total_frames > 1:
+            self.curr_frame_widget.setEnabled(True)
+        else:
+            self.curr_frame_widget.setEnabled(False)
 
     def _on_frame_slider_changed(self, val):
         self.current_frame_idx = val
@@ -692,77 +783,125 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         self.current_frame_idx = val
         self.update_background()
 
-    def compute_background(self, mode):
-        # Fallback to static checks
-        if self.movie_frames is None or self.is_region_mode:
-            return self.static_bg_image
-            
-        if mode == "Single frame":
-            # 1-based index conversion
-            idx = self.current_frame_idx - 1 
-            idx = np.clip(idx, 0, self.total_frames - 1)
-            return self.movie_frames[idx]
+    def _on_compute_finished(self, img, mode, dt):
+        self._is_computing = False
+        self.unsetCursor()
         
-        # Time Summary Modes
-        if mode in self._bg_cache:
-            return self._bg_cache[mode]
-            
-        # Compute
-        img = None
-        if "Mean" in mode:
-            img = np.nanmean(self.movie_frames, axis=0)
-        elif "Median" in mode:
-            img = np.nanmedian(self.movie_frames, axis=0)
-        elif "Std" in mode:
-            img = np.nanstd(self.movie_frames, axis=0)
-        elif "Max" in mode:
-            img = np.nanmax(self.movie_frames, axis=0)
-        elif "P95" in mode:
-            img = np.nanpercentile(self.movie_frames, 95, axis=0)
+        # Restore controls based on logic
+        self._apply_bg_controls_state()
         
         if img is not None:
-            self._bg_cache[mode] = img
-            return img
-            
-        return self.static_bg_image # Fallback
+             self._bg_cache[mode] = img
+             self.lbl_bg_status.setText(f"Background: {mode} ready (computed in {dt:.2f}s)")
+             if self.parent() and hasattr(self.parent(), 'mw') and hasattr(self.parent().mw, 'log_message'):
+                  self.parent().mw.log_message(f"ROI background ready: {mode}, T={self.total_frames}, seconds={dt:.2f}")
+             
+             # Only update display if we are still in that mode
+             if self.bg_mode_combo.currentText() == mode:
+                  self.current_bg_image = img
+                  self.bg_im.set_data(img)
+                  self.canvas.draw_idle()
+        
+        # Cleanup thread
+        if self._compute_thread:
+             self._compute_thread.quit()
+             self._compute_thread.wait()
+             self._compute_worker.deleteLater()
+             self._compute_thread.deleteLater()
+             self._compute_thread = None
+             self._compute_worker = None
+
+    def _on_compute_error(self, err_msg):
+        self._is_computing = False
+        self.unsetCursor()
+        
+        # Restore controls
+        self._apply_bg_controls_state()
+        
+        mode = self.bg_mode_combo.currentText()
+        
+        self.lbl_bg_status.setText(f"Background: {mode} failed, using previous view")
+        if self.parent() and hasattr(self.parent(), 'mw') and hasattr(self.parent().mw, 'log_message'):
+             self.parent().mw.log_message(f"ROI background compute error: {err_msg}")
+
+        if self._compute_thread:
+             self._compute_thread.quit()
+             self._compute_thread.wait()
+             self._compute_worker.deleteLater()
+             self._compute_thread.deleteLater()
+             self._compute_thread = None
+             self._compute_worker = None
+
+    def compute_background_async(self, mode):
+        # Launch QThread
+        self._is_computing = True
+        self.setCursor(QtCore.Qt.WaitCursor)
+        self.lbl_bg_status.setText(f"Background: Computing {mode} over T={self.total_frames} (please wait...)")
+        
+        # Disable controls immediately using centralized logic
+        self._apply_bg_controls_state()
+        
+        if self.parent() and hasattr(self.parent(), 'mw') and hasattr(self.parent().mw, 'log_message'):
+             self.parent().mw.log_message(f"Starting async background compute: {mode}")
+
+        self._compute_thread = QtCore.QThread()
+        self._compute_worker = BgComputeWorker(self.movie_frames, mode)
+        self._compute_worker.moveToThread(self._compute_thread)
+        
+        self._compute_thread.started.connect(self._compute_worker.run)
+        self._compute_worker.finished.connect(self._on_compute_finished)
+        self._compute_worker.error.connect(self._on_compute_error)
+        
+        self._compute_thread.start()
 
     def update_background(self):
+        # Ignore re-entrant calls if busy
+        if getattr(self, '_is_computing', False):
+             return
+
+        # Initialize img to safe default
+        img = None
+
+        # 1. Validate Mode
         mode = self.bg_mode_combo.currentText()
+        
+        # 2. Check Static / Region Conditions
         if self.movie_frames is None or self.is_region_mode or mode == "Static":
-            # Static mode
             img = self.static_bg_image
-            self.curr_frame_widget.setEnabled(False)
             
             if self.is_region_mode:
                  self.lbl_bg_status.setText("Background: Static (Region mode)")
             else:
                  self.lbl_bg_status.setText("Background: Static")
-        else:
+                 
+            self._apply_bg_controls_state()
+        
+        elif mode == "Single frame":
             self.current_bg_mode = mode
-            is_single = (mode == "Single frame")
             
-            # Update Frame Widget State
-            should_enable_frames = is_single and (self.total_frames > 1)
-            self.curr_frame_widget.setEnabled(should_enable_frames)
+            self.lbl_bg_status.setText(f"Background: Single frame (frame {self.current_frame_idx} of {self.total_frames})")
             
-            # Status Label
-            if is_single:
-                 txt = f"Background: Single frame (frame {self.current_frame_idx} of {self.total_frames})"
+            # Synchronous
+            idx = self.current_frame_idx - 1 
+            idx = np.clip(idx, 0, self.total_frames - 1)
+            img = self.movie_frames[idx]
+            
+            self._apply_bg_controls_state()
+            
+        else:
+            # Time Summary Modes
+            self.current_bg_mode = mode
+            
+            # Check cache
+            if mode in self._bg_cache:
+                img = self._bg_cache[mode]
+                self.lbl_bg_status.setText(f"Background: {mode} (Cached)")
+                self._apply_bg_controls_state()
             else:
-                 txt = f"Background: {mode}"
-            self.lbl_bg_status.setText(txt)
-            
-            img = self.compute_background(mode)
-            
-            # Dedicated Logging with De-duplication
-            new_state = (mode, self.current_frame_idx if is_single else -1)
-            if new_state != self._last_bg_state:
-                if self.parent() and hasattr(self.parent(), 'mw') and hasattr(self.parent().mw, 'log_message'):
-                     msg = f"ROI Background changed: {mode}"
-                     if is_single:
-                         msg += f" ({self.current_frame_idx}/{self.total_frames})"
-                     self.parent().mw.log_message(msg)
-                self._last_bg_state = new_state
+                # Need compute
+                self._apply_bg_controls_state()
+                self.compute_background_async(mode)
+                return # Async will update display when done
 
         if img is not None and self.bg_im is not None:
              self.current_bg_image = img
