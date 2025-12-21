@@ -173,6 +173,12 @@ class AnalysisWorker(QtCore.QObject):
                         'spatial_jitter_detrended': getattr(m, "spatial_jitter_detrended", np.nan),
                         'trace_snr_proxy': getattr(m, "trace_snr_proxy", np.nan),
 
+                        'cell_fraction': getattr(m, 'cell_fraction', np.nan),
+                        'cell_logz_median': getattr(m, 'cell_logz_median', np.nan),
+                        'cell_area_median': getattr(m, 'cell_area_median', np.nan),
+                        'cell_ecc_median': getattr(m, 'cell_ecc_median', np.nan),
+                        'cell_center_annulus_ratio_median': getattr(m, 'cell_center_annulus_ratio_median', np.nan),
+
                         'reject_reason': getattr(cand, "reject_reason", ""),
                         'is_valid_spatial': getattr(cand, "is_valid_spatial", np.nan),
                         'trace_extracted': getattr(cand, "trace_extracted", np.nan),

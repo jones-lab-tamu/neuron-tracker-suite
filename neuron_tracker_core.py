@@ -42,6 +42,13 @@ class TrajectoryMetrics:
     # Trace Metrics (Only computed if trace extracted)
     trace_snr_proxy: float = 0.0         # Median / MAD
 
+    # Cellness Metrics (Pass 2B)
+    cell_fraction: float = 0.0
+    cell_logz_median: float = 0.0
+    cell_area_median: float = 0.0
+    cell_ecc_median: float = 0.0
+    cell_center_annulus_ratio_median: float = 0.0
+
 @dataclass
 class TrajectoryCandidate:
     """A single cell trajectory candidate with its metadata and data."""
@@ -145,6 +152,83 @@ def detect_local_minima(arr):
     )
     detected_minima = local_min ^ eroded_background
     return numpy.where(detected_minima)
+
+def _robust_center_vs_dist_z(center_val, dist_arr, eps=1e-12):
+    """Compute robust z-score of a scalar relative to a distribution."""
+    med = numpy.median(dist_arr)
+    mad = numpy.median(numpy.abs(dist_arr - med))
+    return (center_val - med) / (1.4826 * mad + eps)
+
+def _compute_cellness_features_for_patch(patch, center_rc, log_sigma=1.5,
+                                         thr_k=1.0, inner_r=3, annulus_r0=6, annulus_r1=10):
+    """Compute per-patch cellness features."""
+    features = {
+        "logz": 0.0,
+        "area": 0.0,
+        "ecc": 1.0,
+        "center_annulus_ratio": 0.0,
+        "blob_ok": False
+    }
+    
+    # i) Compute LoG image
+    patch_float = patch.astype(float)
+    log_im = scipy.ndimage.gaussian_laplace(patch_float, sigma=log_sigma)
+    
+    # Peak is negative Laplacian at center. 
+    # Use -log_im for both peak extraction and distribution stats to be consistent.
+    peak_im = -log_im
+    center_val = peak_im[center_rc]
+    
+    # ii) Robust z-score of peak vs all LoG pixels
+    features["logz"] = _robust_center_vs_dist_z(center_val, peak_im)
+    
+    # iii) Threshold in INTENSITY space
+    mu = numpy.mean(patch_float)
+    sig = numpy.std(patch_float)
+    thr = mu + thr_k * sig
+    bin_im = patch_float > thr
+    
+    labeled, n_lbl = scipy.ndimage.label(bin_im)
+    lbl_at_center = labeled[center_rc]
+    
+    if lbl_at_center == 0:
+        features["area"] = 0.0
+        features["ecc"] = 1.0
+        features["blob_ok"] = False
+    else:
+        # Properties of the center component
+        coords = numpy.argwhere(labeled == lbl_at_center)
+        features["area"] = float(len(coords))
+        
+        if len(coords) > 2:
+            cov = numpy.cov(coords.T)
+            eigvals = numpy.linalg.eigvalsh(cov) # returns [min, max] typically
+            l1, l2 = eigvals[-1], eigvals[0] # l1 >= l2
+            features["ecc"] = numpy.sqrt(1.0 - (l2 / (l1 + 1e-12)))
+    
+    # iv) Center dominance ratio
+    H, W = patch.shape
+    y, x = numpy.ogrid[:H, :W]
+    r_grid = numpy.sqrt((y - center_rc[0])**2 + (x - center_rc[1])**2)
+    
+    inner_mask = r_grid <= inner_r
+    ann_mask = (r_grid >= annulus_r0) & (r_grid <= annulus_r1)
+    
+    if numpy.any(ann_mask):
+        ratio = numpy.mean(patch_float[inner_mask]) / (numpy.mean(patch_float[ann_mask]) + 1e-12)
+    else:
+        ratio = 0.0
+    features["center_annulus_ratio"] = ratio
+    
+    # v) blob_ok definition
+    features["blob_ok"] = (
+        (features["area"] >= 6) and 
+        (features["area"] <= 500) and 
+        (features["ecc"] <= 0.85) and 
+        (features["center_annulus_ratio"] >= 1.10)
+    )
+    
+    return features
 
 
 def rescale(signal, minimum, maximum):
@@ -488,6 +572,53 @@ def extract_and_interpolate_data(
             cand.metrics.trace_snr_proxy = med / mad
         else:
             cand.metrics.trace_snr_proxy = 0.0
+
+    # --- PASS 2B: CELLNESS METRICS ---
+    # Run only for spatially valid + extracted candidates
+    stride_step = max(1, T // 50)
+    patch_half = 15 # for size 31
+    
+    for cand in candidates:
+        if cand.is_valid_spatial and cand.trace_extracted:
+            valid_patches = []
+            
+            # Sampling loop
+            for t in range(0, T, stride_step):
+                y, x = cand.positions[t]
+                
+                # Extract 31x31 patch
+                # Coordinates are stored as [y, x] in int form
+                y_start = int(y) - patch_half
+                y_end = int(y) + patch_half + 1
+                x_start = int(x) - patch_half
+                x_end = int(x) + patch_half + 1
+                
+                # Bounds check strict
+                if y_start < 0 or x_start < 0 or y_end > h or x_end > w:
+                    continue
+                    
+                patch = ims[t][y_start:y_end, x_start:x_end]
+                if patch.shape != (31, 31):
+                    continue
+                
+                feats = _compute_cellness_features_for_patch(patch, (patch_half, patch_half))
+                valid_patches.append(feats)
+            
+            if valid_patches:
+                n_ok = sum(1 for f in valid_patches if f["blob_ok"])
+                cand.metrics.cell_fraction = float(n_ok) / len(valid_patches)
+                
+                # Median aggregation
+                cand.metrics.cell_logz_median = float(numpy.median([f["logz"] for f in valid_patches]))
+                cand.metrics.cell_area_median = float(numpy.median([f["area"] for f in valid_patches]))
+                cand.metrics.cell_ecc_median = float(numpy.median([f["ecc"] for f in valid_patches]))
+                cand.metrics.cell_center_annulus_ratio_median = float(numpy.median([f["center_annulus_ratio"] for f in valid_patches]))
+            else:
+                cand.metrics.cell_fraction = 0.0
+                cand.metrics.cell_logz_median = 0.0
+                cand.metrics.cell_area_median = 0.0
+                cand.metrics.cell_ecc_median = 0.0
+                cand.metrics.cell_center_annulus_ratio_median = 0.0
 
     # --- PASS 3: FINAL ACCEPTANCE ---
     for cand in candidates:

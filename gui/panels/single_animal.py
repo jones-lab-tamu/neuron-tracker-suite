@@ -181,23 +181,90 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         
         # Row 1: Manual Controls (Hidden by default unless override)
         self.manual_gate_widget = QtWidgets.QWidget()
-        manual_layout = QtWidgets.QHBoxLayout(self.manual_gate_widget)
+        # Use Grid Layout to accommodate more controls
+        manual_layout = QtWidgets.QGridLayout(self.manual_gate_widget)
         manual_layout.setContentsMargins(0, 0, 0, 0)
         
+        # --- Row 0: Basic Metrics (Cov, Jit, SNR) ---
         self.spin_coverage = QtWidgets.QDoubleSpinBox()
         self.spin_coverage.setRange(0.0, 1.0); self.spin_coverage.setSingleStep(0.05)
         self.spin_coverage.setPrefix("Cov >= ")
-        manual_layout.addWidget(self.spin_coverage)
+        self.spin_coverage.setToolTip("Detected Fraction: Fraction of frames where the cell was successfully detected by the tracker.")
+        manual_layout.addWidget(self.spin_coverage, 0, 0)
         
         self.spin_jitter = QtWidgets.QDoubleSpinBox()
         self.spin_jitter.setRange(0.0, 50.0); self.spin_jitter.setSingleStep(0.5)
         self.spin_jitter.setPrefix("Jit <= ")
-        manual_layout.addWidget(self.spin_jitter)
+        self.spin_jitter.setToolTip("Spatial Jitter: Detrended standard deviation of the trajectory centroid (stability). Lower is better.")
+        manual_layout.addWidget(self.spin_jitter, 0, 1)
         
         self.spin_snr = QtWidgets.QDoubleSpinBox()
         self.spin_snr.setRange(0.0, 50.0); self.spin_snr.setSingleStep(0.5)
         self.spin_snr.setPrefix("SNR >= ")
-        manual_layout.addWidget(self.spin_snr)
+        self.spin_snr.setToolTip("Trace SNR Proxy: Median / MAD of the extracted fluorescence trace.")
+        manual_layout.addWidget(self.spin_snr, 0, 2)
+        
+        # --- Row 1: Cellness Metrics (Fraction, LoG, Area Min) ---
+        self.spin_cell_fraction_min = QtWidgets.QDoubleSpinBox()
+        self.spin_cell_fraction_min.setRange(0.0, 1.0); self.spin_cell_fraction_min.setSingleStep(0.05)
+        self.spin_cell_fraction_min.setPrefix("CellFrac >= ")
+        self.spin_cell_fraction_min.setValue(0.60)
+        self.spin_cell_fraction_min.setToolTip(
+            "CellFrac: Fraction of sampled frames where the tracked patch looks cell-like (passes blob morphology tests). "
+            "Higher values keep only consistently cell-like tracks, lower values allow intermittent visibility."
+        )
+        manual_layout.addWidget(self.spin_cell_fraction_min, 1, 0)
+
+        self.spin_cell_logz_min = QtWidgets.QDoubleSpinBox()
+        self.spin_cell_logz_min.setRange(-50.0, 50.0); self.spin_cell_logz_min.setSingleStep(0.5)
+        self.spin_cell_logz_min.setPrefix("LoG z >= ")
+        self.spin_cell_logz_min.setValue(2.0)
+        self.spin_cell_logz_min.setToolTip(
+            "LoG z: Robust z-score of center prominence in a Laplacian-of-Gaussian (blob) filter. "
+            "Higher values demand a stronger blob-like peak at the trajectory center, rejecting single pixels and flat background."
+        )
+        manual_layout.addWidget(self.spin_cell_logz_min, 1, 1)
+        
+        self.spin_cell_area_min = QtWidgets.QSpinBox()
+        self.spin_cell_area_min.setRange(0, 5000)
+        self.spin_cell_area_min.setPrefix("Area >= ")
+        self.spin_cell_area_min.setValue(6)
+        self.spin_cell_area_min.setToolTip(
+            "Area min (px): Minimum connected-component area (in pixels) of the thresholded blob containing the center. "
+            "Increase to reject tiny speckles/pixels."
+        )
+        manual_layout.addWidget(self.spin_cell_area_min, 1, 2)
+
+        # --- Row 2: Cellness Metrics (Area Max, Ecc, Ratio) ---
+        self.spin_cell_area_max = QtWidgets.QSpinBox()
+        self.spin_cell_area_max.setRange(0, 5000)
+        self.spin_cell_area_max.setPrefix("Area <= ")
+        self.spin_cell_area_max.setValue(500)
+        self.spin_cell_area_max.setToolTip(
+            "Area max (px): Maximum connected-component area (in pixels) of the thresholded blob containing the center. "
+            "Decrease to reject merged cells/large regions."
+        )
+        manual_layout.addWidget(self.spin_cell_area_max, 2, 0)
+        
+        self.spin_cell_ecc_max = QtWidgets.QDoubleSpinBox()
+        self.spin_cell_ecc_max.setRange(0.0, 1.0); self.spin_cell_ecc_max.setSingleStep(0.05)
+        self.spin_cell_ecc_max.setPrefix("Ecc <= ")
+        self.spin_cell_ecc_max.setValue(0.85)
+        self.spin_cell_ecc_max.setToolTip(
+            "Ecc max: Maximum eccentricity of the center blob (0=circle, 1=line). "
+            "Lower values reject elongated ridges and edges, higher values allow more elongated shapes."
+        )
+        manual_layout.addWidget(self.spin_cell_ecc_max, 2, 1)
+
+        self.spin_cell_ratio_min = QtWidgets.QDoubleSpinBox()
+        self.spin_cell_ratio_min.setRange(0.0, 10.0); self.spin_cell_ratio_min.setSingleStep(0.05)
+        self.spin_cell_ratio_min.setPrefix("Ctr/Ann >= ")
+        self.spin_cell_ratio_min.setValue(1.10)
+        self.spin_cell_ratio_min.setToolTip(
+            "Ctr/Ann: Minimum ratio of mean intensity near the center vs an outer annulus. "
+            "Higher values require a bright center relative to surrounding background, rejecting edges and non-cell structures."
+        )
+        manual_layout.addWidget(self.spin_cell_ratio_min, 2, 2)
         
         gate_layout.addWidget(self.manual_gate_widget, 1, 0, 1, 3)
         self.manual_gate_widget.setVisible(False) # Initial state
@@ -810,11 +877,33 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             cov_min = self.spin_coverage.value()
             jit_max = self.spin_jitter.value()
             snr_min = self.spin_snr.value()
+            
+            # Cellness thresholds
+            cf_min = self.spin_cell_fraction_min.value()
+            logz_min = self.spin_cell_logz_min.value()
+            area_min = self.spin_cell_area_min.value()
+            area_max = self.spin_cell_area_max.value()
+            ecc_max = self.spin_cell_ecc_max.value()
+            ratio_min = self.spin_cell_ratio_min.value()
+            
+            if area_max < area_min: area_max = area_min
         else:
             vals = self.quality_presets.get(preset_name, {})
             cov_min = vals.get('cov', 0.0)
             jit_max = vals.get('jit', 50.0)
             snr_min = vals.get('snr', 0.0)
+            
+            # Default cellness thresholds for presets (keep them stable)
+            cf_min = self.spin_cell_fraction_min.value()
+            logz_min = self.spin_cell_logz_min.value()
+            area_min = self.spin_cell_area_min.value()
+            area_max = self.spin_cell_area_max.value()
+            ecc_max = self.spin_cell_ecc_max.value()
+            ratio_min = self.spin_cell_ratio_min.value()
+            
+        # Clamp Area Max globally
+        if area_max < area_min:
+             area_max = area_min
             
         # Get data columns (safe fallback)
         df = self.metrics_df
@@ -825,21 +914,50 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         cov = get_col('detected_fraction')
         jit = get_col('spatial_jitter_detrended')
         snr = get_col('trace_snr_proxy')
+        
+        cell_frac = get_col('cell_fraction')
+        logz = get_col('cell_logz_median')
+        area = get_col('cell_area_median')
+        ecc = get_col('cell_ecc_median')
+        ratio = get_col('cell_center_annulus_ratio_median')
 
         # Compute Masks (handling NaNs as Fail)
         cov_ok = np.isfinite(cov) & (cov >= cov_min)
         jit_ok = np.isfinite(jit) & (jit <= jit_max)
         snr_ok = np.isfinite(snr) & (snr >= snr_min)
         
-        self.metric_mask = cov_ok & jit_ok & snr_ok
+        # Cellness Masks
+        # Guard: Require ALL 5 columns to be present and have finite values.
+        # Otherwise, treat as legacy file and pass all.
+        cell_cols_present = all([
+            np.any(np.isfinite(cell_frac)),
+            np.any(np.isfinite(logz)),
+            np.any(np.isfinite(area)),
+            np.any(np.isfinite(ecc)),
+            np.any(np.isfinite(ratio))
+        ])
+        
+        if cell_cols_present:
+            cf_ok = np.isfinite(cell_frac) & (cell_frac >= cf_min)
+            logz_ok = np.isfinite(logz) & (logz >= logz_min)
+            area_ok = np.isfinite(area) & (area >= area_min) & (area <= area_max)
+            ecc_ok = np.isfinite(ecc) & (ecc <= ecc_max)
+            ratio_ok = np.isfinite(ratio) & (ratio >= ratio_min)
+            
+            cell_ok = cf_ok & logz_ok & area_ok & ecc_ok & ratio_ok
+        else:
+            # Backwards compatibility: Missing or empty cellness data, pass all.
+            cell_ok = np.ones(len(df), dtype=bool)
+
+        self.metric_mask = cov_ok & jit_ok & snr_ok & cell_ok
         
         # Update breakdown label
         n_fail_cov = (~cov_ok).sum()
         n_fail_jit = (~jit_ok).sum()
         n_fail_snr = (~snr_ok).sum()
-        self.lbl_quality_breakdown.setText(f"Failures: Cov={n_fail_cov}, Jit={n_fail_jit}, SNR={n_fail_snr}")
+        n_fail_cell = (~cell_ok).sum()
         
-        self.lbl_quality_breakdown.setText(f"Failures: Cov={n_fail_cov}, Jit={n_fail_jit}, SNR={n_fail_snr}")
+        self.lbl_quality_breakdown.setText(f"Failures: Cov={n_fail_cov}, Jit={n_fail_jit}, SNR={n_fail_snr}, Cell={n_fail_cell}")
         
         n_in = len(self.metric_mask)
         n_pass = int(self.metric_mask.sum())
