@@ -21,7 +21,7 @@ import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 
 import cosinor as csn
-from scipy.ndimage import label
+from scipy.ndimage import label, gaussian_laplace
 from gui.analysis import compute_median_window_frames, preprocess_for_rhythmicity
 
 # ------------------------------------------------------------
@@ -389,6 +389,90 @@ class ContrastViewer:
         if self.on_change_callback:
             self.on_change_callback(vmin, vmax)
 
+def _compute_cellness_features_for_patch_view(patch, center_rc, log_sigma, thr_k, inner_r, annulus_r0, annulus_r1,
+                                            area_min=6, area_max=500, ecc_max=0.85, ratio_min=1.1, logz_min=2.0):
+    """
+    Compute per-frame features for display in the patch view.
+    Returns a dict of features + labelled image/mask info.
+    """
+    features = {
+        "logz": 0.0, "area": 0.0, "ecc": 1.0, "center_annulus_ratio": 0.0,
+        "blob_ok": False, "thr": 0.0, "thr_k": thr_k,
+        "labeled": None, "target_label": 0
+    }
+    
+    h, w = patch.shape
+    patch_float = patch.astype(float)
+    
+    # 1. LoG z-score (Peak vs Dist)
+    peak_im = -gaussian_laplace(patch_float, sigma=log_sigma)
+    center_val = peak_im[center_rc]
+    med_peak = np.median(peak_im)
+    mad_peak = np.median(np.abs(peak_im - med_peak))
+    features["logz"] = (center_val - med_peak) / (1.4826 * mad_peak + 1e-12)
+    
+    # 2. Thresholding & Blob Analysis
+    mean_val = np.mean(patch_float)
+    std_val = np.std(patch_float)
+    features["thr"] = mean_val + thr_k * std_val
+    
+    mask = patch_float > features["thr"]
+    labeled, _ = label(mask)
+    target_lbl = labeled[center_rc]
+    features["labeled"] = labeled
+    features["target_label"] = target_lbl
+    
+    if target_lbl > 0:
+        # Area
+        coords = np.argwhere(labeled == target_lbl)
+        area = len(coords)
+        features["area"] = area
+        
+        # Eccentricity
+        if area <= 2:
+            features["ecc"] = 1.0
+        else:
+            cov = np.cov(coords.T)
+            # handle singular cases
+            try:
+                eigvals = np.linalg.eigvalsh(cov)
+                l2 = float(eigvals[0])
+                l1 = float(eigvals[-1]) # max
+                if l1 > 0:
+                    features["ecc"] = np.sqrt(max(0.0, 1 - (l2 / (l1 + 1e-12))))
+                else:
+                    features["ecc"] = 1.0
+            except:
+                features["ecc"] = 1.0
+    else:
+        features["area"] = 0.0
+        features["ecc"] = 1.0
+
+    # 3. Center/Annulus Ratio
+    # Simple grid based distance
+    y, x = np.ogrid[:h, :w]
+    cy, cx = center_rc
+    dists = np.sqrt((y - cy)**2 + (x - cx)**2)
+    
+    inner_mask = dists <= inner_r
+    annulus_mask = (dists >= annulus_r0) & (dists <= annulus_r1)
+    
+    inner_mean = np.mean(patch_float[inner_mask]) if np.any(inner_mask) else 0.0
+    annulus_mean = np.mean(patch_float[annulus_mask]) if np.any(annulus_mask) else 0.0
+    
+    features["center_annulus_ratio"] = inner_mean / (annulus_mean + 1e-12)
+
+    # 4. Blob OK Logic
+    area_ok = area_min <= features["area"] <= area_max
+    ecc_ok = features["ecc"] <= ecc_max
+    ratio_ok = features["center_annulus_ratio"] >= ratio_min
+    logz_ok = features["logz"] >= logz_min
+    
+    features["blob_ok"] = area_ok and ecc_ok and ratio_ok and logz_ok
+    
+    return features
+
+
 class TrajectoryInspector:
     def __init__(self, fig, ax, trajectories, movie_stack):
         self.fig = fig
@@ -412,6 +496,17 @@ class TrajectoryInspector:
         self.patch_size = 31
         self.show_footprint = False
         self.footprint_k = 1.0
+        
+        # Cellness Feature Defaults (Display Only)
+        self.cellness_log_sigma = 1.5
+        self.cellness_area_min = 6
+        self.cellness_area_max = 500
+        self.cellness_ecc_max = 0.85
+        self.cellness_ratio_min = 1.10
+        self.cellness_logz_min = 2.0
+        self.cellness_inner_r = 3
+        self.cellness_annulus_r0 = 6
+        self.cellness_annulus_r1 = 10
 
         # Layout: Increase bottom margin for controls and right margin for inset
         self.fig.subplots_adjust(left=0.05, bottom=0.35, right=0.80, top=0.9)
@@ -645,13 +740,43 @@ class TrajectoryInspector:
                 cx, cy = half, half
                 self.ax_patch.plot(cx, cy, '+', color='cyan', alpha=0.5, markersize=8)
                 
+                # Compute Per-Frame Features
+                feats = _compute_cellness_features_for_patch_view(
+                    patch, center_rc=(cy, cx),
+                    log_sigma=self.cellness_log_sigma,
+                    thr_k=self.footprint_k,
+                    inner_r=self.cellness_inner_r,
+                    annulus_r0=self.cellness_annulus_r0,
+                    annulus_r1=self.cellness_annulus_r1,
+                    area_min=self.cellness_area_min,
+                    area_max=self.cellness_area_max,
+                    ecc_max=self.cellness_ecc_max,
+                    ratio_min=self.cellness_ratio_min,
+                    logz_min=self.cellness_logz_min
+                )
+                
+                # Display Text Overlay
+                txt = (
+                    f"LoGz: {feats['logz']:.2f}\n"
+                    f"Area: {feats['area']:.0f}\n"
+                    f"Ecc: {feats['ecc']:.2f}\n"
+                    f"C/A: {feats['center_annulus_ratio']:.2f}\n"
+                    f"Thr: {feats['thr']:.2f}\n"
+                    f"OK: {feats['blob_ok']}"
+                )
+                
+                # Use a dark box for readability
+                props = dict(boxstyle='round', facecolor='black', alpha=0.6, edgecolor='none')
+                self.ax_patch.text(0.05, 0.95, txt, transform=self.ax_patch.transAxes,
+                                   fontsize=7, verticalalignment='top', color='white', bbox=props)
+                
                 # Footprint Overlay
                 if self.show_footprint:
-                    thr = np.mean(patch) + self.footprint_k * np.std(patch)
-                    mask = patch > thr
-                    lbl, n = label(mask)
-                    if lbl[cy, cx] > 0:
-                        target_label = lbl[cy, cx]
+                    # Reuse valid calculation if available
+                    lbl = feats['labeled']
+                    target_label = feats['target_label']
+                    
+                    if target_label > 0:
                          # Draw contour
                         self.ax_patch.contour(lbl == target_label, levels=[0.5], colors='lime', linewidths=1, alpha=0.7)
 
