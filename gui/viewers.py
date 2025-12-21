@@ -9,7 +9,7 @@ from scipy.stats import circmean, linregress, sem
 from PyQt5 import QtWidgets, QtCore, QtGui
 
 from matplotlib.widgets import Slider, RadioButtons, Button, CheckButtons
-from matplotlib.patches import Polygon, Rectangle
+from matplotlib.patches import Polygon, Rectangle, Circle
 from matplotlib.patches import Polygon as MplPolygon
 from matplotlib.path import Path
 from matplotlib.figure import Figure
@@ -21,6 +21,7 @@ import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 
 import cosinor as csn
+from scipy.ndimage import label
 from gui.analysis import compute_median_window_frames, preprocess_for_rhythmicity
 
 # ------------------------------------------------------------
@@ -400,37 +401,154 @@ class TrajectoryInspector:
         self.vmin = None
         self.vmax = None
         self.bg_artist = None
+        
+        # Marker Settings Defaults
+        self.marker_style = "Ring" # Ring, Crosshair, Dot, Off
+        self.marker_alpha = 0.45
+        self.marker_radius = 8
+        self.marker_lw = 1
+        
+        # Patch Settings Defaults
+        self.patch_size = 31
+        self.show_footprint = False
+        self.footprint_k = 1.0
 
-        self.fig.subplots_adjust(left=0.1, bottom=0.25, right=0.85, top=0.9)
+        # Layout: Increase bottom margin for controls and right margin for inset
+        self.fig.subplots_adjust(left=0.05, bottom=0.35, right=0.80, top=0.9)
 
-        ax_prev = fig.add_axes([0.65, 0.05, 0.1, 0.04])
-        ax_next = fig.add_axes([0.76, 0.05, 0.1, 0.04])
-        from matplotlib.widgets import Button
-        self.btn_prev = Button(ax_prev, "Previous")
-        self.btn_next = Button(ax_next, "Next")
-        self.btn_prev.on_clicked(self.prev_trajectory)
-        self.btn_next.on_clicked(self.next_trajectory)
+        # Map to store tooltip text for controls
+        self.controls_tooltips = {}
 
-        ax_slider = fig.add_axes([0.15, 0.10, 0.45, 0.03])
-        self.frame_slider = Slider(
-            ax=ax_slider,
-            label='Frame',
-            valmin=0,
-            valmax=self.num_frames - 1,
-            valinit=0,
-            valstep=1
-        )
+        # --- CONTROLS ---
+        # 1. Transport (Frame Slider & Nav) - Row 1 (Top of controls)
+        ax_slider = fig.add_axes([0.10, 0.25, 0.50, 0.03])
+        self.frame_slider = Slider(ax=ax_slider, label='Frame', valmin=0, valmax=self.num_frames - 1, valinit=0, valstep=1)
         self.frame_slider.on_changed(self.on_frame_change)
+        self.controls_tooltips[ax_slider] = "Frame: Select which movie frame is displayed for the currently inspected trajectory."
+        
+        ax_prev = fig.add_axes([0.62, 0.25, 0.08, 0.04])
+        from matplotlib.widgets import Button
+        self.btn_prev = Button(ax_prev, "< Prev")
+        self.btn_prev.on_clicked(self.prev_trajectory)
+        self.controls_tooltips[ax_prev] = "Previous: Switch to the previous trajectory in the list."
+        
+        ax_next = fig.add_axes([0.71, 0.25, 0.08, 0.04])
+        self.btn_next = Button(ax_next, "Next >")
+        self.btn_next.on_clicked(self.next_trajectory)
+        self.controls_tooltips[ax_next] = "Next: Switch to the next trajectory in the list."
+
+        # 2. Marker Controls - Row 2
+        # Style (Cycle Button)
+        ax_style = fig.add_axes([0.05, 0.15, 0.12, 0.04])
+        self.btn_style = Button(ax_style, f"Marker: {self.marker_style}")
+        self.btn_style.on_clicked(self.cycle_marker_style)
+        self.controls_tooltips[ax_style] = "Marker: Controls how the tracked position is drawn on the full-frame view."
+
+        # Alpha
+        ax_alpha = fig.add_axes([0.22, 0.15, 0.20, 0.03])
+        self.slider_alpha = Slider(ax=ax_alpha, label='Alpha', valmin=0.05, valmax=1.0, valinit=self.marker_alpha)
+        self.slider_alpha.on_changed(self.on_marker_param_change)
+        self.slider_alpha.label.set_size(9)
+        self.controls_tooltips[ax_alpha] = "Alpha: Marker transparency. Lower values occlude less."
+
+        # Radius
+        ax_radius = fig.add_axes([0.48, 0.15, 0.20, 0.03])
+        self.slider_radius = Slider(ax=ax_radius, label='Radius', valmin=2, valmax=30, valinit=self.marker_radius, valstep=1)
+        self.slider_radius.on_changed(self.on_marker_param_change)
+        self.slider_radius.label.set_size(9)
+        self.controls_tooltips[ax_radius] = "Radius: Marker size in pixels (data coordinates)."
+        
+        # LineWidth
+        ax_lw = fig.add_axes([0.74, 0.15, 0.15, 0.03])
+        self.slider_lw = Slider(ax=ax_lw, label='LW', valmin=1, valmax=4, valinit=self.marker_lw, valstep=1)
+        self.slider_lw.on_changed(self.on_marker_param_change)
+        self.slider_lw.label.set_size(9)
+        self.controls_tooltips[ax_lw] = "LineWidth: Marker outline thickness in pixels."
+
+        # 3. Patch Controls - Row 3
+        # Patch Size
+        ax_psize = fig.add_axes([0.15, 0.05, 0.25, 0.03])
+        self.slider_psize = Slider(ax=ax_psize, label='Patch Size', valmin=11, valmax=101, valinit=self.patch_size, valstep=2)
+        self.slider_psize.on_changed(self.on_patch_param_change)
+        self.controls_tooltips[ax_psize] = "Patch: Size of the zoomed patch centered on the tracked position (odd number of pixels)."
+
+        # Footprint Checkbox
+        ax_chk = fig.add_axes([0.45, 0.05, 0.15, 0.04])
+        self.chk_footprint = CheckButtons(ax_chk, ["Footprint"], [self.show_footprint])
+        self.chk_footprint.on_clicked(self.toggle_footprint)
+        self.controls_tooltips[ax_chk] = "Show footprint: Overlay a threshold-based outline of the center-connected blob in the patch (display only)."
+
+        # k Factor
+        ax_k = fig.add_axes([0.65, 0.05, 0.20, 0.03])
+        self.slider_k = Slider(ax=ax_k, label='k (Thr)', valmin=0.0, valmax=5.0, valinit=self.footprint_k, valstep=0.1)
+        self.slider_k.on_changed(self.on_patch_param_change)
+        self.controls_tooltips[ax_k] = "k: Threshold = mean + k·std for the footprint overlay (display only)."
+
+        # --- INSET AXES ---
+        # Right side panel for Cell Patch
+        self.ax_patch = self.fig.add_axes([0.82, 0.45, 0.15, 0.15]) # [left, bottom, width, height]
+        self.ax_patch.set_title("Cell Patch", fontsize=9)
+        self.ax_patch.set_xticks([])
+        self.ax_patch.set_yticks([])
+        
+        # Tooltip Hover Event
+        self.fig.canvas.mpl_connect("motion_notify_event", self._on_hover)
         
         self.update()
+    
+    def _on_hover(self, event):
+        """Implement real Qt tooltips by checking which axes the mouse is over."""
+        msg = ""
+        if event.inaxes and event.inaxes in self.controls_tooltips:
+            msg = self.controls_tooltips[event.inaxes]
+        
+        # Access the Qt Widget (FigureCanvasQTAgg inherits from QWidget)
+        try:
+            self.fig.canvas.setToolTip(msg)
+        except Exception:
+            pass # Fallback if backend is weird, but standard is fine.
 
-    def on_frame_change(self, frame_index):
+    def on_frame_change(self, val):
+        self.update()
+
+    def on_marker_param_change(self, val):
+        self.marker_alpha = self.slider_alpha.val
+        self.marker_radius = int(self.slider_radius.val)
+        self.marker_lw = self.slider_lw.val
+        self.update()
+
+    def cycle_marker_style(self, event):
+        modes = ["Ring", "Crosshair", "Dot", "Off"]
+        try:
+            curr_idx = modes.index(self.marker_style)
+            next_idx = (curr_idx + 1) % len(modes)
+        except ValueError:
+            next_idx = 0
+        self.marker_style = modes[next_idx]
+        self.btn_style.label.set_text(f"Marker: {self.marker_style}")
+        self.update()
+
+    def on_patch_param_change(self, val):
+        self.patch_size = int(self.slider_psize.val)
+        # Ensure odd
+        if self.patch_size % 2 == 0: self.patch_size += 1
+        self.footprint_k = self.slider_k.val
+        self.update()
+
+    def toggle_footprint(self, label):
+        self.show_footprint = not self.show_footprint
         self.update()
 
     def set_trajectory(self, index):
         if 0 <= index < self.num_trajectories:
             self.index = index
             self.update()
+
+    def _lw_px_to_points(self, lw_px: float) -> float:
+        # Convert pixel thickness to points using figure DPI
+        # points = pixels * 72 / dpi
+        dpi = float(self.fig.dpi) if getattr(self.fig, "dpi", None) else 100.0
+        return float(lw_px) * 72.0 / dpi
 
     def update_contrast(self, vmin, vmax):
         self.vmin = vmin
@@ -451,8 +569,14 @@ class TrajectoryInspector:
 
     def update(self):
         self.ax.clear()
+        self.ax_patch.clear()
+        self.ax_patch.set_xticks([])
+        self.ax_patch.set_yticks([]) 
+        self.ax_patch.set_facecolor("black")
+        
         current_frame = int(self.frame_slider.val)
-
+        
+        # --- MAIN VIEW ---
         self.bg_artist = self.ax.imshow(
             self.movie_stack[current_frame],
             cmap="gray",
@@ -462,22 +586,80 @@ class TrajectoryInspector:
         
         if self.num_trajectories > 0:
             traj = self.trajectories[self.index]
+            # Draw Path
             self.ax.plot(
-                traj[:, 1], traj[:, 0], '-', color='cyan', linewidth=1, alpha=0.7
+                traj[:, 1], traj[:, 0], '-', color='cyan', linewidth=1, alpha=0.5
             )
-            current_pos = traj[current_frame]
-            self.ax.plot(
-                current_pos[1], current_pos[0], 'o', 
-                markersize=10, 
-                markerfacecolor=(1, 1, 0, 0.5), 
-                markeredgecolor='yellow',
-                markeredgewidth=1.5
-            )
+            
+            # Draw Marker (Pixel-True Geometry)
+            current_pos = traj[current_frame] # [y, x]
+            y, x = current_pos[0], current_pos[1]
+            
+            if self.marker_style != "Off":
+                alpha = self.marker_alpha
+                rad = self.marker_radius
+                lw = self.marker_lw
+                lw_pts = self._lw_px_to_points(lw)
+                
+                if self.marker_style == "Ring":
+                    # Circle patch is in data coordinates (pixels)
+                    c = Circle((x, y), radius=rad, fill=False, edgecolor='yellow', linewidth=lw_pts, alpha=alpha)
+                    self.ax.add_patch(c)
+                elif self.marker_style == "Crosshair":
+                    # Plot lines in data coordinates
+                    L = max(3, rad)
+                    self.ax.plot([x - L, x + L], [y, y], '-', color='yellow', linewidth=lw_pts, alpha=alpha)
+                    self.ax.plot([x, x], [y - L, y + L], '-', color='yellow', linewidth=lw_pts, alpha=alpha)
+                elif self.marker_style == "Dot":
+                    # Small circle for Dot
+                    c = Circle((x, y), radius=1.0, color='yellow', alpha=alpha)
+                    self.ax.add_patch(c)
+
             self.ax.set_title(
                 f"Trajectory {self.index + 1} / {self.num_trajectories} (Frame {current_frame + 1}/{self.num_frames})"
             )
+            
+            # --- PATCH VIEW ---
+            # Extract Patch
+            img = self.movie_stack[current_frame]
+            h, w = img.shape
+            half = self.patch_size // 2
+            iy, ix = int(round(y)), int(round(x))
+            
+            y0, y1 = iy - half, iy + half + 1
+            x0, x1 = ix - half, ix + half + 1
+            
+            # Bounds check
+            if y0 < 0 or x0 < 0 or y1 > h or x1 > w:
+                self.ax_patch.text(0.5, 0.5, "Out of Bounds", ha='center', va='center', color='red', transform=self.ax_patch.transAxes)
+                self.ax_patch.set_facecolor('black')
+            else:
+                patch = img[y0:y1, x0:x1]
+                # Contrast for Patch (Robust Percentile)
+                p_vmin, p_vmax = np.percentile(patch, 5), np.percentile(patch, 99)
+                if p_vmax <= p_vmin: p_vmax = p_vmin + 1
+                
+                self.ax_patch.imshow(patch, cmap="gray", vmin=p_vmin, vmax=p_vmax, origin='upper', interpolation='nearest')
+                
+                # Crosshair in patch (fixed center)
+                cx, cy = half, half
+                self.ax_patch.plot(cx, cy, '+', color='cyan', alpha=0.5, markersize=8)
+                
+                # Footprint Overlay
+                if self.show_footprint:
+                    thr = np.mean(patch) + self.footprint_k * np.std(patch)
+                    mask = patch > thr
+                    lbl, n = label(mask)
+                    if lbl[cy, cx] > 0:
+                        target_label = lbl[cy, cx]
+                         # Draw contour
+                        self.ax_patch.contour(lbl == target_label, levels=[0.5], colors='lime', linewidths=1, alpha=0.7)
+
+            self.ax_patch.set_title(f"Patch {self.patch_size}x{self.patch_size}", fontsize=8, color='white')
+
         else:
             self.ax.set_title("No Trajectories to Display")
+            self.ax_patch.text(0.5, 0.5, "No Data", ha='center', va='center', transform=self.ax_patch.transAxes)
 
         self.ax.set_xlim(0, self.movie_stack[0].shape[1])
         self.ax.set_ylim(self.movie_stack[0].shape[0], 0)
