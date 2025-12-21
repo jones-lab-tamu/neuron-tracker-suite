@@ -586,6 +586,11 @@ class TrajectoryInspector:
         self.ax_patch.set_xticks([])
         self.ax_patch.set_yticks([])
         
+        # Metrics Panel (Below Patch)
+        self.ax_patch_metrics = self.fig.add_axes([0.82, 0.25, 0.15, 0.18])
+        self.ax_patch_metrics.set_xticks([]); self.ax_patch_metrics.set_yticks([])
+        self.ax_patch_metrics.axis('off')
+        
         # Tooltip Hover Event
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_hover)
         
@@ -665,6 +670,9 @@ class TrajectoryInspector:
     def update(self):
         self.ax.clear()
         self.ax_patch.clear()
+        self.ax_patch_metrics.clear()
+        self.ax_patch_metrics.axis('off')
+        
         self.ax_patch.set_xticks([])
         self.ax_patch.set_yticks([]) 
         self.ax_patch.set_facecolor("black")
@@ -724,10 +732,10 @@ class TrajectoryInspector:
             y0, y1 = iy - half, iy + half + 1
             x0, x1 = ix - half, ix + half + 1
             
-            # Bounds check
             if y0 < 0 or x0 < 0 or y1 > h or x1 > w:
                 self.ax_patch.text(0.5, 0.5, "Out of Bounds", ha='center', va='center', color='red', transform=self.ax_patch.transAxes)
                 self.ax_patch.set_facecolor('black')
+                self.ax_patch_metrics.text(0.5, 0.5, "No metrics\n(out of bounds)", ha='center', va='center', transform=self.ax_patch_metrics.transAxes, fontsize=8)
             else:
                 patch = img[y0:y1, x0:x1]
                 # Contrast for Patch (Robust Percentile)
@@ -765,10 +773,9 @@ class TrajectoryInspector:
                     f"OK: {feats['blob_ok']}"
                 )
                 
-                # Use a dark box for readability
-                props = dict(boxstyle='round', facecolor='black', alpha=0.6, edgecolor='none')
-                self.ax_patch.text(0.05, 0.95, txt, transform=self.ax_patch.transAxes,
-                                   fontsize=7, verticalalignment='top', color='white', bbox=props)
+                # Display in separated metrics panel
+                self.ax_patch_metrics.text(0.02, 0.98, txt, transform=self.ax_patch_metrics.transAxes,
+                                   fontsize=8, verticalalignment='top', horizontalalignment='left')
                 
                 # Footprint Overlay
                 if self.show_footprint:
@@ -785,6 +792,7 @@ class TrajectoryInspector:
         else:
             self.ax.set_title("No Trajectories to Display")
             self.ax_patch.text(0.5, 0.5, "No Data", ha='center', va='center', transform=self.ax_patch.transAxes)
+            self.ax_patch_metrics.text(0.5, 0.5, "No Data", ha='center', va='center', transform=self.ax_patch_metrics.transAxes)
 
         self.ax.set_xlim(0, self.movie_stack[0].shape[1])
         self.ax.set_ylim(self.movie_stack[0].shape[0], 0)
