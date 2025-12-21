@@ -863,8 +863,33 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             return
 
 
+        # Robust movie data lookup
         movie_data = None
-        self.mw.log_message("ROI Drawer: movie frames unavailable in current pipeline, using static background only.")
+        found_key = None
+        
+        # Check unfiltered_data
+        for key in ["movie", "movie_frames"]:
+            val = self.state.unfiltered_data.get(key)
+            if val is not None:
+                movie_data = val
+                found_key = f"unfiltered_data['{key}']"
+                break
+        
+        # Check loaded_data if still not found
+        if movie_data is None and hasattr(self.state, "loaded_data") and self.state.loaded_data:
+            for key in ["movie", "movie_frames"]:
+                val = self.state.loaded_data.get(key)
+                if val is not None:
+                    movie_data = val
+                    found_key = f"loaded_data['{key}']"
+                    break
+
+        if movie_data is not None:
+            dtype_str = str(type(movie_data))
+            shape_str = getattr(movie_data, 'shape', 'N/A')
+            self.mw.log_message(f"ROI Drawer: Found movie data in {found_key}. Type={dtype_str}, Shape={shape_str}")
+        else:
+            self.mw.log_message("ROI Drawer: movie frames unavailable in current pipeline, using static background only.")
         
         dlg = ROIDrawerDialog(
             self,

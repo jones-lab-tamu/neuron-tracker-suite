@@ -165,14 +165,24 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         ctrl_widget = QtWidgets.QWidget()
         ctrl_layout = QtWidgets.QVBoxLayout(ctrl_widget)
         
+        # Instructions
+        info = QtWidgets.QLabel(
+            "<b>Instructions:</b><br>"
+            "1. Select Mode below.<br>"
+            "2. Left-click on image to draw.<br>"
+            "3. Right-click to remove last point.<br>"
+            "4. Click 'Finish Polygon' to save.<br><br>"
+            "<b>To Delete:</b> Select from list and click Delete."
+        )
+        info.setWordWrap(True)
+        ctrl_layout.addWidget(info)
+
         # --- Background Controls ---
         bg_group = QtWidgets.QGroupBox("Background")
         bg_layout = QtWidgets.QVBoxLayout(bg_group)
         
         # Mode Selector
         self.bg_mode_combo = QtWidgets.QComboBox()
-        modes = ["Single frame", "Mean (time)", "Median (time)", "Std (time)", "Max (time)", "P95 (time)"]
-        self.bg_mode_combo.addItems(modes)
         
         if self.movie_frames is not None and not self.is_region_mode:
              modes = ["Single frame", "Mean (time)", "Median (time)", "Std (time)", "Max (time)", "P95 (time)"]
@@ -224,7 +234,6 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         bg_layout.addWidget(self.btn_auto_contrast)
         
         # Status Label
-        # Status Label
         if self.is_region_mode:
              state_text = "Static (Region mode)"
         elif self.movie_frames is None:
@@ -245,18 +254,7 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         
         ctrl_layout.addWidget(bg_group)
 
-        # Instructions
-        info = QtWidgets.QLabel(
-            "<b>Instructions:</b><br>"
-            "1. Select Mode below.<br>"
-            "2. Left-click on image to draw.<br>"
-            "3. Right-click to remove last point.<br>"
-            "4. Click 'Finish Polygon' to save.<br><br>"
-            "<b>To Delete:</b> Select from list and click Delete."
-        )
-        info.setWordWrap(True)
-        ctrl_layout.addWidget(info)
-        
+
         # Mode Selection
         mode_box = QtWidgets.QGroupBox("Drawing Mode")
         mode_layout = QtWidgets.QVBoxLayout(mode_box)
