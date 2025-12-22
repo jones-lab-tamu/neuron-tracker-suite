@@ -269,7 +269,17 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         gate_layout.addWidget(self.manual_gate_widget, 1, 0, 1, 3)
         self.manual_gate_widget.setVisible(False) # Initial state
         
-        # Row 2: Apply & Status
+        # --- Row 2: Identity Rescue Checkbox ---
+        # Displayed in Quality Gate section (always visible).
+        self.chk_cellness_robust = QtWidgets.QCheckBox("Use robust cellness (template rescue)")
+        self.chk_cellness_robust.setToolTip(
+            "Opt-in: If checked, the analysis will compute a template-based 'robust' cell fraction,\n"
+            "and the Quality Gate will use this robust metric instead of the standard cell fraction.\n"
+            "This helps keeping cells that cycle into very dim states but match their own template."
+        )
+        gate_layout.addWidget(self.chk_cellness_robust, 2, 0, 1, 3)
+
+        # --- Row 3: Apply & Status ---
         self.btn_apply_quality_gate = QtWidgets.QPushButton(get_icon('fa5s.filter'), "Apply Quality Gate")
         Tooltip.install(
             self.btn_apply_quality_gate,
@@ -277,16 +287,17 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             "CRITERIA: Coverage, Jitter, SNR thresholds.\n"
             "OUTPUT: Quality-Gate pass set (subset of candidates)."
         )
-        gate_layout.addWidget(self.btn_apply_quality_gate, 2, 0, 1, 1)
+        self.btn_apply_quality_gate.clicked.connect(self.apply_quality_gate)
+        gate_layout.addWidget(self.btn_apply_quality_gate, 3, 0, 1, 1)
         
         self.lbl_quality_counts = QtWidgets.QLabel("Passing: - / -")
         self.lbl_quality_counts.setAlignment(QtCore.Qt.AlignCenter)
         self.lbl_quality_counts.setStyleSheet("font-weight: bold;")
-        gate_layout.addWidget(self.lbl_quality_counts, 2, 1, 1, 2)
+        gate_layout.addWidget(self.lbl_quality_counts, 3, 1, 1, 2)
         
         self.lbl_quality_breakdown = QtWidgets.QLabel("")
         self.lbl_quality_breakdown.setStyleSheet("color: gray; font-size: 10px;")
-        gate_layout.addWidget(self.lbl_quality_breakdown, 3, 0, 1, 3)
+        gate_layout.addWidget(self.lbl_quality_breakdown, 4, 0, 1, 3)
         
         layout.addWidget(self.quality_gate_box)
 
@@ -711,6 +722,8 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             args = {name: t(le.text()) for name, (le, t) in self.params.items()}
             mode = self.mode_combo.currentData()
             args['mode'] = mode if mode else 'strict'
+            # Pass checkbox state to worker
+            args['enable_identity_rescue'] = self.chk_cellness_robust.isChecked()
         except ValueError as e:
             self.mw.log_message(f"Error in analysis parameters: {e}")
             return
@@ -915,7 +928,18 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         jit = get_col('spatial_jitter_detrended')
         snr = get_col('trace_snr_proxy')
         
-        cell_frac = get_col('cell_fraction')
+
+        # Conditional Cell Fraction Column
+        if self.chk_cellness_robust.isChecked():
+            if 'cell_fraction_robust' in df.columns:
+                cell_frac_col_name = 'cell_fraction_robust'
+            else:
+                self.mw.log_message("Robust cellness requires rerunning analysis with the checkbox enabled (cell_fraction_robust missing).")
+                cell_frac_col_name = 'cell_fraction'
+        else:
+            cell_frac_col_name = 'cell_fraction'
+        
+        cell_frac = get_col(cell_frac_col_name)
         logz = get_col('cell_logz_median')
         area = get_col('cell_area_median')
         ecc = get_col('cell_ecc_median')

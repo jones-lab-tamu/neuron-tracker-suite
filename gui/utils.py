@@ -130,9 +130,14 @@ def clear_layout(layout: QtWidgets.QLayout):
         return
     while layout.count():
         item = layout.takeAt(0)
-        w = item.widget()
-        if w is not None:
+        if item.widget() is not None:
+            w = item.widget()
             w.setParent(None)
+            w.deleteLater()
+        elif item.layout() is not None:
+            child = item.layout()
+            clear_layout(child)
+            child.deleteLater()
 
 
 def add_mpl_to_tab(tab: QtWidgets.QWidget):

@@ -49,6 +49,13 @@ class TrajectoryMetrics:
     cell_ecc_median: float = 0.0
     cell_center_annulus_ratio_median: float = 0.0
 
+    # Robust Cellness (Identity Rescue)
+    cell_fraction_robust: float = 0.0
+    id_template_n: int = 0
+    id_sim_median: float = 0.0
+    id_sim_p10: float = 0.0
+    id_sim_fraction_ge_thr: float = 0.0
+
 @dataclass
 class TrajectoryCandidate:
     """A single cell trajectory candidate with its metadata and data."""
@@ -158,6 +165,49 @@ def _robust_center_vs_dist_z(center_val, dist_arr, eps=1e-12):
     med = numpy.median(dist_arr)
     mad = numpy.median(numpy.abs(dist_arr - med))
     return (center_val - med) / (1.4826 * mad + eps)
+
+def _extract_center_patch(im: numpy.ndarray, y: int, x: int, patch_half: int) -> Optional[numpy.ndarray]:
+    """Extracts a square patch centered at (y, x). Returns None if out of bounds."""
+    H, W = im.shape
+    y_start = y - patch_half
+    y_end = y + patch_half + 1
+    x_start = x - patch_half
+    x_end = x + patch_half + 1
+    
+    if y_start < 0 or x_start < 0 or y_end > H or x_end > W:
+        return None
+        
+    return im[y_start:y_end, x_start:x_end]
+
+def _normalize_patch(patch: numpy.ndarray, eps: float = 1e-12) -> numpy.ndarray:
+    """Normalize patch to mean 0, std 1."""
+    p = patch.astype(numpy.float32)
+    mean = numpy.mean(p)
+    std = numpy.std(p)
+    return (p - mean) / (std + eps)
+
+def _build_template(patches: List[numpy.ndarray], method: str = "median") -> numpy.ndarray:
+    """Computes a template patch from a list of patches."""
+    if not patches:
+        raise ValueError("Cannot build template from empty patch list")
+        
+    stack = numpy.stack(patches, axis=0) # (N, S, S)
+    if method == "median":
+        return numpy.median(stack, axis=0).astype(numpy.float32)
+    else:
+        raise ValueError("Only method='median' is supported for identity templates.")
+
+def _template_similarity(template_norm: numpy.ndarray, patch_norm: numpy.ndarray, eps: float = 1e-12) -> float:
+    """Cosine similarity between two normalized patches."""
+    # Cosine sim = (A . B) / (|A| |B|)
+    # Since inputs are mean-subtracted, this is essentially correlation coeff,
+    # but we follow the prompt's formula:
+    # num = sum(template_norm * patch_norm)
+    # den = sqrt(sum(template_norm^2)) * sqrt(sum(patch_norm^2)) + eps
+    
+    num = numpy.sum(template_norm * patch_norm)
+    denom = numpy.sqrt(numpy.sum(template_norm**2)) * numpy.sqrt(numpy.sum(patch_norm**2)) + eps
+    return float(num / denom)
 
 def _compute_cellness_features_for_patch(patch, center_rc, log_sigma=1.5,
                                          thr_k=1.0, inner_r=3, annulus_r0=6, annulus_r1=10):
@@ -408,7 +458,14 @@ def extract_and_interpolate_data(
     max_interpolation_distance, 
     progress_callback=None,
     mode='strict', # 'strict' or 'scored'
-    return_candidates=False
+    return_candidates=False,
+    # Identity Rescue (Opt-in)
+    enable_identity_rescue: bool = False,
+    identity_patch_half: int = 15,
+    identity_min_template_frames: int = 8,
+    identity_stride_frames: Optional[int] = None,
+    identity_sim_threshold: float = 0.35,
+    identity_confidence_rule: str = "blob_ok"
 ):
     """Step 4: Two-Pass Pipeline (Spatial -> Trace)."""
     if progress_callback is None:
@@ -619,6 +676,84 @@ def extract_and_interpolate_data(
                 cand.metrics.cell_area_median = 0.0
                 cand.metrics.cell_ecc_median = 0.0
                 cand.metrics.cell_center_annulus_ratio_median = 0.0
+
+    # --- PASS 2C: IDENTITY RESCUE (OPTIONAL) ---
+    if enable_identity_rescue:
+        # Determine stride for identity pass
+        # "current code uses: stride_step = max(1, T // 50)"
+        if identity_stride_frames is not None:
+            id_stride = max(1, int(identity_stride_frames))
+        else:
+            id_stride = max(1, T // 50)
+             
+        for cand in candidates:
+            if cand.is_valid_spatial and cand.trace_extracted:
+                feats_list = []
+                patch_list = []
+                template_patches_norm = []
+                
+                # B1: Collect info
+                for t in range(0, T, id_stride):
+                    y, x = cand.positions[t]
+                    # Extract patch
+                    # Note: cand.positions is [y, x] (int)
+                    patch = _extract_center_patch(ims[t], int(y), int(x), identity_patch_half)
+                    if patch is None:
+                        continue
+                        
+                    feats = _compute_cellness_features_for_patch(patch, (identity_patch_half, identity_patch_half))
+                    
+                    feats_list.append(feats)
+                    patch_list.append(patch)
+                    
+                    # Confident frame check
+                    confident = False
+                    if identity_confidence_rule == "blob_ok":
+                        confident = feats["blob_ok"]
+                        
+                    if confident:
+                        template_patches_norm.append(_normalize_patch(patch))
+                
+                # B2: Build template
+                template_norm = None
+                if len(template_patches_norm) >= identity_min_template_frames:
+                    template = _build_template(template_patches_norm, method="median")
+                    template_norm = _normalize_patch(template)
+                    
+                # B3: Compute similarity
+                sim_values = []
+                ok_robust_count = 0
+                valid_count = 0
+                
+                for i in range(len(patch_list)):
+                    patch = patch_list[i]
+                    feats = feats_list[i]
+                    valid_count += 1
+                    
+                    sim = 0.0
+                    if template_norm is not None:
+                        sim = _template_similarity(template_norm, _normalize_patch(patch))
+                    sim_values.append(sim)
+                    
+                    rescue_ok = (template_norm is not None) and (sim >= identity_sim_threshold)
+                    ok_robust = feats["blob_ok"] or rescue_ok
+                    if ok_robust:
+                        ok_robust_count += 1
+                        
+                # B4: Populate metrics
+                cand.metrics.id_template_n = int(len(template_patches_norm))
+                
+                if valid_count == 0:
+                    cand.metrics.cell_fraction_robust = 0.0
+                    cand.metrics.id_sim_median = 0.0
+                    cand.metrics.id_sim_p10 = 0.0
+                    cand.metrics.id_sim_fraction_ge_thr = 0.0
+                else:
+                    cand.metrics.cell_fraction_robust = float(ok_robust_count) / float(valid_count)
+                    cand.metrics.id_sim_median = float(numpy.median(sim_values)) if sim_values else 0.0
+                    cand.metrics.id_sim_p10 = float(numpy.percentile(sim_values, 10)) if sim_values else 0.0
+                    cand.metrics.id_sim_fraction_ge_thr = float(sum(1 for s in sim_values if s >= identity_sim_threshold)) / float(len(sim_values)) if sim_values else 0.0
+
 
     # --- PASS 3: FINAL ACCEPTANCE ---
     for cand in candidates:

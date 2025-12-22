@@ -97,7 +97,8 @@ class AnalysisWorker(QtCore.QObject):
                 max_interpolation_distance=self.args["max_interpolation_distance"],
                 progress_callback=_log_progress,
                 mode=mode,
-                return_candidates=True
+                return_candidates=True,
+                enable_identity_rescue=self.args.get('enable_identity_rescue', False)
             )
 
             # --- EXPLICIT GATING LOGIC ---
@@ -178,6 +179,12 @@ class AnalysisWorker(QtCore.QObject):
                         'cell_area_median': getattr(m, 'cell_area_median', np.nan),
                         'cell_ecc_median': getattr(m, 'cell_ecc_median', np.nan),
                         'cell_center_annulus_ratio_median': getattr(m, 'cell_center_annulus_ratio_median', np.nan),
+
+                        'cell_fraction_robust': getattr(m, 'cell_fraction_robust', np.nan),
+                        'id_template_n': int(getattr(m, 'id_template_n', 0)),
+                        'id_sim_median': getattr(m, 'id_sim_median', np.nan),
+                        'id_sim_p10': getattr(m, 'id_sim_p10', np.nan),
+                        'id_sim_fraction_ge_thr': getattr(m, 'id_sim_fraction_ge_thr', np.nan),
 
                         'reject_reason': getattr(cand, "reject_reason", ""),
                         'is_valid_spatial': getattr(cand, "is_valid_spatial", np.nan),
