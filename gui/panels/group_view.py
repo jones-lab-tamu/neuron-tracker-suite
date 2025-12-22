@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 from PyQt5 import QtWidgets, QtCore, QtGui
 from matplotlib.path import Path
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+import matplotlib.pyplot as plt
 from scipy.stats import circmean, f as f_dist
 from skimage.draw import polygon as draw_polygon
 from typing import Tuple
@@ -85,6 +87,10 @@ class GroupViewPanel(QtWidgets.QWidget):
         self.group_smooth_check = QtWidgets.QCheckBox("Smooth to fill empty bins")
         param_layout.addRow("Grid Resolution:", self.group_grid_res_edit)
         param_layout.addRow(self.group_smooth_check)
+        
+        self.norm_mode_combo = QtWidgets.QComboBox()
+        self.norm_mode_combo.addItems(["Normalize: Control mean", "Normalize: Per-animal mean"])
+        param_layout.addRow(self.norm_mode_combo)
         b.addWidget(param_box)        
         
         region_box = QtWidgets.QGroupBox("Regional Analysis Setup")
@@ -135,7 +141,80 @@ class GroupViewPanel(QtWidgets.QWidget):
         self.btn_assign_exp.clicked.connect(lambda: self.assign_group("Experiment"))
         self.btn_define_regions.clicked.connect(self.define_regions)
         self.mw.btn_export_data.clicked.connect(self.export_current_data)
+        self.norm_mode_combo.currentIndexChanged.connect(self._on_norm_mode_changed)
     
+    
+    def _clear_tab_contents(self, tab_widget: QtWidgets.QWidget) -> None:
+        """
+        Remove all matplotlib canvases/figures associated with this tab to prevent duplicates.
+        Must be safe if tab has no layout, nested widgets, or scroll areas.
+        """
+        if tab_widget is None:
+            return
+
+        # (1) Drop stored viewer for this tab (if present) so it can be GC'd.
+        # IMPORTANT: viewer may not have `.fig`, so do not rely only on viewer.fig.
+        if hasattr(self.mw, "visualization_widgets") and isinstance(self.mw.visualization_widgets, dict):
+            self.mw.visualization_widgets.pop(tab_widget, None)
+
+        # (2) Close + delete ALL FigureCanvasQTAgg under this tab.
+        # This is the REQUIRED hardening: close canvas.figure even if viewer has no `.fig`.
+        for canvas in tab_widget.findChildren(FigureCanvasQTAgg):
+            try:
+                plt.close(canvas.figure)
+            except Exception:
+                pass
+            canvas.setParent(None)
+            canvas.deleteLater()
+
+        # (3) Clear ONLY the DIRECT layout on the tab (do NOT recursively clear every child layout).
+        # Reason: recursive clearing can delete non-plot UI elements if present.
+        lay = tab_widget.layout()
+        if lay is not None:
+            clear_layout(lay)
+
+    def _on_norm_mode_changed(self):
+        if not hasattr(self, "_last_master_df") or self._last_master_df is None:
+            return
+
+        df = self._last_master_df.copy()
+
+        mode = self.norm_mode_combo.currentText()
+        use_animal_norm = (mode == "Normalize: Per-animal mean")
+
+        if use_animal_norm:
+            if "Rel_Phase_Animal" not in df.columns:
+                self.mw.log_message("Error: Per-animal normalization data missing.")
+                return
+            df["Rel_Phase"] = df["Rel_Phase_Animal"]
+            self.mw.log_message("Updated to Per-Animal Normalization.")
+        else:
+            # Require valid control normalization to switch
+            if "Rel_Phase_Control" not in df.columns:
+                self.mw.log_message("Cannot switch to Control Mean: No control data available from last run.")
+                return
+            arr = df["Rel_Phase_Control"].to_numpy(dtype=float, copy=False)
+            if (~np.isfinite(arr)).all():
+                self.mw.log_message("Cannot switch to Control Mean: No valid control data available from last run.")
+                return
+            df["Rel_Phase"] = df["Rel_Phase_Control"]
+            self.mw.log_message("Updated to Control Mean Normalization.")
+
+        # Clear ALL tabs that are plotted into by THIS FILE.
+        # CRITICAL: use the real tab attribute names used in add_mpl_to_tab calls.
+        # Find all occurrences of: add_mpl_to_tab(self.mw.<TABNAME>)
+        # and clear exactly those tabs.
+        self._clear_tab_contents(self.mw.group_scatter_tab)
+        self._clear_tab_contents(self.mw.group_avg_tab)
+        self._clear_tab_contents(getattr(self.mw, 'grad_tab', None))
+
+        # If there is a regional plot tab that uses add_mpl_to_tab, include it too.
+        # DO NOT guess attribute names. Add only if found via the search above.
+
+        # Now regenerate visualizations using df (with df["Rel_Phase"] already selected)
+        self._generate_continuous_maps(df)
+        self._generate_gradient_analysis(df)
+        self._generate_regional_stats(df)
     def assign_group(self, group_name: str):
         selected_items = self.group_list.selectedItems()
         if not selected_items:
@@ -324,17 +403,74 @@ class GroupViewPanel(QtWidgets.QWidget):
                 return
             master_df = pd.concat(all_dfs, ignore_index=True)
 
-            ctrl_phases = master_df[master_df['Group'] == 'Control']['Phase_CT'].values
-            if len(ctrl_phases) == 0:
-                self.mw.log_message("Error: No control cells found for normalization.")
-                return
+            # Clear tabs BEFORE plotting new data (entrypoint hardening)
+            self._clear_tab_contents(self.mw.group_scatter_tab)
+            self._clear_tab_contents(self.mw.group_avg_tab)
+            self._clear_tab_contents(getattr(self.mw, 'grad_tab', None))
+
+            # Helpers for normalization
+            def wrap_pm12(x):
+                return (x + 12.0) % 24.0 - 12.0
+
+            def circmean_hours_from_hours(phases_hours):
+                phases_hours = phases_hours[np.isfinite(phases_hours)]
+                if len(phases_hours) == 0:
+                    return np.nan
+                phases_hours = np.mod(phases_hours, 24.0)
+                r = (phases_hours / 24.0) * (2 * np.pi)
+                m = circmean(r, low=0.0, high=2*np.pi)
+                return (m / (2 * np.pi)) * 24.0
+
+            # Determine mode EARLY
+            mode = self.norm_mode_combo.currentText()
+            use_animal_norm = (mode == "Normalize: Per-animal mean")
+
+            # 1) Control Normalization (Conditional)
+            # Only compute if needed (default mode) or if we want to support switching TO it later?
+            # User req: "Control-mean normalization should only run when needed... If use_animal_norm is True... DO NOT require controls"
+            # BUT for switching, we might want it if controls exist. 
+            # Compromise: Try to compute it if controls exist, but don't error if they don't AND we are in animal mode.
             
-            rads = (ctrl_phases / 24.0) * (2 * np.pi)
-            ref_rad = circmean(rads)
-            ref_phase = (ref_rad / (2 * np.pi)) * 24.0
+            ctrl_phases = master_df[master_df['Group'] == 'Control']['Phase_CT'].dropna().values
             
-            master_df['Rel_Phase'] = (master_df['Phase_CT'] - ref_phase + 12.0) % 24.0 - 12.0
-            self.mw.log_message(f"Normalized to Control Mean Phase: {ref_phase:.2f}h")
+            if len(ctrl_phases) > 0:
+                rads = (ctrl_phases / 24.0) * (2*np.pi)
+                ref_rad = circmean(rads, low=0.0, high=2*np.pi)
+                ref_phase = (ref_rad / (2*np.pi)) * 24.0
+                master_df['Rel_Phase_Control'] = wrap_pm12(master_df['Phase_CT'] - ref_phase)
+                if not use_animal_norm:
+                    self.mw.log_message(f"Using Control Mean Normalization: {ref_phase:.2f}h")
+            else:
+                # No controls
+                if not use_animal_norm:
+                    self.mw.log_message("Error: No control cells found for normalization.")
+                    return
+                # If using animal norm, we assume Rel_Phase_Control can be missing
+            
+            # 2) Per-Animal Normalization (Always compute for robustness or only if needed?)
+            # User Requirement D implies computing it. 
+            # It relies on each animal's own data, so always safe to compute if data exists.
+            
+            animal_means = master_df.groupby('Animal')['Phase_CT'].apply(
+                lambda s: circmean_hours_from_hours(s.to_numpy(dtype=float, copy=False))
+            )
+            master_df['Animal_Mean_Phase'] = master_df['Animal'].map(animal_means)
+            master_df['Rel_Phase_Animal'] = wrap_pm12(master_df['Phase_CT'] - master_df['Animal_Mean_Phase'])
+            
+            if use_animal_norm:
+                self.mw.log_message("Using Per-Animal Normalization.")
+                master_df['Rel_Phase'] = master_df['Rel_Phase_Animal']
+            else:
+                # We already checked for controls above
+                if 'Rel_Phase_Control' in master_df.columns:
+                    master_df['Rel_Phase'] = master_df['Rel_Phase_Control']
+                else:
+                    # Should have returned earlier
+                    return
+            
+            # Cache COPY to prevent mutation of stored state during view generation
+            self._last_master_df = master_df.copy()
+
 
             self._generate_continuous_maps(master_df)
             self._generate_gradient_analysis(master_df)
@@ -373,6 +509,13 @@ class GroupViewPanel(QtWidgets.QWidget):
             grid_y_bins = np.arange(start_y, end_y, bin_size)
             calc_x_bins = np.linspace(x_min, x_max, n_bins_x + 1)
             calc_y_bins = np.linspace(y_min, y_max, n_bins_y + 1)
+            
+
+            
+            # Select column based on combo box; logic moved to generate_group_visualizations but
+            # ensuring we use 'Rel_Phase' which is populated there.
+            # The prompt requested: "When generating scatter_df, set 'Relative_Phase_Hours' to..."
+            # Since 'Rel_Phase' in master_df is now context-sensitive (see below), we just map it.
             
             scatter_df = df.rename(columns={'Animal': 'Source_Animal', 'X': 'Warped_X', 'Y': 'Warped_Y', 'Rel_Phase': 'Relative_Phase_Hours'})
             fig_s, _ = add_mpl_to_tab(self.mw.group_scatter_tab)
