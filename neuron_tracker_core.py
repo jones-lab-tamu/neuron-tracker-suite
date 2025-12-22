@@ -242,8 +242,9 @@ def _compute_cellness_features_for_patch(patch, center_rc, log_sigma=1.5,
     lbl_at_center = labeled[center_rc]
     
     if lbl_at_center == 0:
-        features["area"] = 0.0
-        features["ecc"] = 1.0
+        features["area"] = numpy.nan
+        features["ecc"] = numpy.nan
+        features["center_annulus_ratio"] = numpy.nan  # Consistent with NaN-awareness
         features["blob_ok"] = False
     else:
         # Properties of the center component
@@ -635,6 +636,11 @@ def extract_and_interpolate_data(
     stride_step = max(1, T // 50)
     patch_half = 15 # for size 31
     
+    # Helper to safely get scalar from potentially all-NaN array
+    def safe_nanmedian(values):
+        m = numpy.nanmedian(values)
+        return float(m) if numpy.isfinite(m) else numpy.nan
+
     for cand in candidates:
         if cand.is_valid_spatial and cand.trace_extracted:
             valid_patches = []
@@ -665,11 +671,11 @@ def extract_and_interpolate_data(
                 n_ok = sum(1 for f in valid_patches if f["blob_ok"])
                 cand.metrics.cell_fraction = float(n_ok) / len(valid_patches)
                 
-                # Median aggregation
-                cand.metrics.cell_logz_median = float(numpy.median([f["logz"] for f in valid_patches]))
-                cand.metrics.cell_area_median = float(numpy.median([f["area"] for f in valid_patches]))
-                cand.metrics.cell_ecc_median = float(numpy.median([f["ecc"] for f in valid_patches]))
-                cand.metrics.cell_center_annulus_ratio_median = float(numpy.median([f["center_annulus_ratio"] for f in valid_patches]))
+                # Median aggregation (NaN-aware)
+                cand.metrics.cell_logz_median = safe_nanmedian([f["logz"] for f in valid_patches])
+                cand.metrics.cell_area_median = safe_nanmedian([f["area"] for f in valid_patches])
+                cand.metrics.cell_ecc_median = safe_nanmedian([f["ecc"] for f in valid_patches])
+                cand.metrics.cell_center_annulus_ratio_median = safe_nanmedian([f["center_annulus_ratio"] for f in valid_patches])
             else:
                 cand.metrics.cell_fraction = 0.0
                 cand.metrics.cell_logz_median = 0.0
