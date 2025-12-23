@@ -24,6 +24,7 @@ from gui.analysis import (
     strict_cycle_mask,
     RHYTHM_TREND_WINDOW_HOURS,
 )
+from neuron_tracker_core import DEFAULT_PERIOD_HOURS
 import cosinor as csn
 
 """
@@ -1276,6 +1277,12 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         
         # 1. Discover Period
         _, discovered_period, _ = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
+        
+        # 2.1: Check period validity
+        if not np.isfinite(discovered_period) or discovered_period <= 0:
+            self.mw.log_message(f"Warning: Discovered period {discovered_period} is invalid. Using fallback {DEFAULT_PERIOD_HOURS}h.")
+            discovered_period = DEFAULT_PERIOD_HOURS
+            
         self.discovered_period_edit.setText(f"{discovered_period:.2f}")
         
         # 2. Compute Metrics
@@ -1350,14 +1357,25 @@ class SingleAnimalPanel(QtWidgets.QWidget):
                 phases_hours = phases
             else:
                 rhythm_mask = filter_scores >= thresh
+                
+                # 3.1: Guard against invalid period before computation
+                if not np.isfinite(period) or period <= 0:
+                    self.mw.log_message(f"PhaseFilter: invalid period {period}, using fallback {DEFAULT_PERIOD_HOURS}h")
+                    period = DEFAULT_PERIOD_HOURS
+                    
                 phases_hours = ((phases / (2 * np.pi)) * period) % period
                 
-            if self.strict_cycle_check.isChecked():
-                rhythm_mask = strict_cycle_mask(self.state.loaded_data["traces"], mpf, period, rhythm_mask, min_cycles=2, trend_window_hours=trend_win)
-            
-            if self.strict_cycle_check.isChecked():
-                rhythm_mask = strict_cycle_mask(self.state.loaded_data["traces"], mpf, period, rhythm_mask, min_cycles=2, trend_window_hours=trend_win)
-            
+                # 3.2: Filter out non-finite phases
+                if not np.isfinite(phases_hours).all():
+                    # Replace NaNs with 0 or NaN, plotting should handle NaNs usually by dropping
+                    # But if ALL are NaN, we skip
+                    if (~np.isfinite(phases_hours)).all():
+                        self.mw.log_message("Warning: phases_hours invalid (all NaN/Inf). Clearing rhythm mask.")
+                        phases_hours = np.full_like(phases_hours, np.nan, dtype=float)
+                        rhythm_mask = np.zeros_like(rhythm_mask, dtype=bool)
+                    else:
+                        phases_hours[~np.isfinite(phases_hours)] = np.nan
+                
             if self.strict_cycle_check.isChecked():
                 rhythm_mask = strict_cycle_mask(self.state.loaded_data["traces"], mpf, period, rhythm_mask, min_cycles=2, trend_window_hours=trend_win)
             

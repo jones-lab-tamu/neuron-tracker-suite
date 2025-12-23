@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.signal import medfilt, find_peaks
+from neuron_tracker_core import DEFAULT_PERIOD_HOURS
 
 # ------------------------------------------------------------
 # Phase calculation
@@ -346,10 +347,48 @@ def calculate_phases_fft(traces_data,
         mask = np.ones_like(freqs, dtype=bool)
 
     masked_power = power_mean.copy()
-    masked_power[~mask] = 0
-    peak_idx = np.argmax(masked_power)
+
+    # Make out-of-mask bins impossible to select
+    masked_power[~mask] = -np.inf
+
+    # Make DC impossible to select
+    if len(masked_power) > 0:
+        masked_power[0] = -np.inf
+
+    peak_idx = int(np.argmax(masked_power))
+
+    # If nothing valid has positive power (or all are -inf), fall back to the closest bin to 1/DEFAULT_PERIOD_HOURS,
+    # but DO NOT keep period_hours=DEFAULT unless the chosen bin truly corresponds to 24 h.
+    bad_peak = (not np.isfinite(masked_power[peak_idx])) or (masked_power[peak_idx] <= 0)
+
+    if bad_peak:
+        target_freq = 1.0 / DEFAULT_PERIOD_HOURS
+
+        # Prefer choosing within mask (excluding DC) if any bins exist
+        candidate = np.where(mask & (freqs > 0))[0]
+        if candidate.size > 0:
+            peak_idx = int(candidate[np.argmin(np.abs(freqs[candidate] - target_freq))])
+        else:
+            # No masked positive-frequency candidates, fall back to any positive-frequency bin
+            pos = np.where(freqs > 0)[0]
+            if pos.size > 0:
+                peak_idx = int(pos[np.argmin(np.abs(freqs[pos] - target_freq))])
+            else:
+                # Truly degenerate case: no positive frequencies exist
+                peak_idx = 0
+
     peak_freq = freqs[peak_idx]
-    period_hours = 1.0 / peak_freq if peak_freq > 0 else np.inf
+
+    # period_hours MUST correspond to peak_idx used for phase extraction
+    if peak_freq > 0:
+        period_hours = 1.0 / peak_freq
+    else:
+        # last-resort fallback: if we truly cannot pick a positive frequency bin, use DEFAULT
+        period_hours = DEFAULT_PERIOD_HOURS
+
+    # Final safety check for finiteness
+    if not np.isfinite(period_hours) or period_hours <= 0:
+        period_hours = DEFAULT_PERIOD_HOURS
 
     # Sideband SNR: signal band = ±1 bins; noise = ±10 bins outside that
     signal_band = []

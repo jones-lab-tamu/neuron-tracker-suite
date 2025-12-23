@@ -16,6 +16,8 @@ from multiprocessing import Pool, shared_memory
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional, Union
 
+DEFAULT_PERIOD_HOURS = 24.0
+
 # =============================================================================
 # DATA STRUCTURES
 # =============================================================================
