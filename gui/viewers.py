@@ -21,7 +21,7 @@ import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 
 import cosinor as csn
-from scipy.ndimage import label, gaussian_laplace, gaussian_filter, binary_fill_holes
+from scipy.ndimage import label as nd_label, gaussian_laplace, gaussian_filter, binary_fill_holes
 from gui.analysis import compute_median_window_frames, preprocess_for_rhythmicity
 
 # ------------------------------------------------------------
@@ -417,7 +417,7 @@ def _compute_cellness_features_for_patch_view(patch, center_rc, log_sigma, thr_k
     features["thr"] = mean_val + thr_k * std_val
     
     mask = patch_float > features["thr"]
-    labeled, _ = label(mask)
+    labeled, _ = nd_label(mask)
     target_lbl = labeled[center_rc]
     features["labeled"] = labeled
     features["target_label"] = target_lbl
@@ -1135,13 +1135,13 @@ class GroupAverageMapViewer:
         # Recompute current selection
         self.update_filter(self.group_radio.value_selected)
 
-    def update_filter(self, label):
+    def update_filter(self, group_label):
         if self.full_scatter.empty: return
         
-        if label == 'All':
+        if group_label == 'All':
             df = self.full_scatter
         else:
-            df = self.full_scatter[self.full_scatter['Group'] == label]
+            df = self.full_scatter[self.full_scatter['Group'] == group_label]
             
         # Recalculate Binned Grid for this subset
         nx, ny = self.grid_dims
@@ -1189,7 +1189,7 @@ class GroupAverageMapViewer:
             structure = np.array([[0,1,0],
                                   [1,1,1],
                                   [0,1,0]], dtype=bool)
-            lbl, ncomp = label(occupied, structure=structure)
+            lbl, ncomp = nd_label(occupied, structure=structure)
 
             # 4) Initialize output
             smoothed = np.full_like(binned_grid, np.nan, dtype=float)
