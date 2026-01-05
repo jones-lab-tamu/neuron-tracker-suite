@@ -11,6 +11,7 @@ from gui.panels.single_animal import SingleAnimalPanel
 from gui.panels.atlas_registration import AtlasRegistrationPanel
 from gui.panels.apply_warp import ApplyWarpPanel
 from gui.panels.group_view import GroupViewPanel
+from gui.viewers import RegionResultViewer
 
 class MainWindow(QtWidgets.QMainWindow):
     """
@@ -192,6 +193,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for i in range(self.vis_tabs.count()):
             self.vis_tabs.setTabEnabled(i, False)
 
+        self.vis_tabs.currentChanged.connect(lambda index: self.update_export_buttons_state())
+
     def _build_navigation_section(self, parent_layout):
         """Builds the navigation list acting as both workflow guide and panel switcher."""
         self.nav_list = QtWidgets.QListWidget()
@@ -228,11 +231,60 @@ class MainWindow(QtWidgets.QMainWindow):
         self.nav_list.currentItemChanged.connect(self._on_nav_item_changed)
         parent_layout.addWidget(self.nav_list)
 
+    def update_export_buttons_state(self):
+        """
+        Updates the enabled state of the Export Data button based on the current context.
+        Checks if the active tab has a viewer with exportable data.
+        """
+        item = self.nav_list.currentItem()
+        if not item:
+            self.btn_export_data.setEnabled(False)
+            return
+
+        mode_key = item.data(QtCore.Qt.UserRole)
+        
+        # Only Group Analysis uses generic viewer export for now
+        if mode_key == "group_view":
+            current_tab = self.vis_tabs.currentWidget()
+            exportable = False
+            
+            try:
+                # 1. Special Case: Region Stats Tab
+                # The viewer is a child widget, not registered in visualization_widgets in the same way?
+                # Actually group_view registers it, but checking findChild is more robust for composite widgets.
+                if current_tab == getattr(self, 'region_tab', None):
+                    viewer = current_tab.findChild(RegionResultViewer)
+                    if viewer:
+                        data, _ = viewer.get_export_data()
+                        if data is not None and not data.empty:
+                            exportable = True
+                else:
+                    # 2. Standard Case: Registered Viewers
+                    viewer = self.visualization_widgets.get(current_tab)
+                    if viewer and hasattr(viewer, 'get_export_data'):
+                        res = viewer.get_export_data()
+                        # Handle (df, name) tuple or just df
+                        if isinstance(res, tuple):
+                            data = res[0]
+                        else:
+                            data = res
+                            
+                        if data is not None and not data.empty:
+                            exportable = True
+            except Exception as e:
+                self.log_message(f"Export Data check failed for tab {current_tab}: {e}")
+                exportable = False
+            
+            self.btn_export_data.setEnabled(exportable)
+        else:
+            self.btn_export_data.setEnabled(False)
+
     def _on_nav_item_changed(self, current, previous):
         if not current:
             return
         mode_key = current.data(QtCore.Qt.UserRole)
         self._switch_mode(mode_key)
+        self.update_export_buttons_state()
 
     def _build_menu(self):
         menu_bar = self.menuBar()

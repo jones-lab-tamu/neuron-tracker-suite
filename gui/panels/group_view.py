@@ -475,6 +475,7 @@ class GroupViewPanel(QtWidgets.QWidget):
             self._generate_continuous_maps(master_df)
             self._generate_gradient_analysis(master_df)
             self._generate_regional_stats(master_df)
+            self.mw.update_export_buttons_state()
 
         except Exception as e:
             self.mw.log_message(f"Analysis Error: {e}")
