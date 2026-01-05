@@ -1080,9 +1080,15 @@ class GroupAverageMapViewer:
         ax.set_title("Group Average Phase Map")
 
         # Radio Buttons
-        ax_radio = fig.add_axes([0.4, 0.05, 0.2, 0.1])
+        ax_radio = fig.add_axes([0.4, 0.01, 0.2, 0.08])
         self.group_radio = RadioButtons(ax_radio, ['All', 'Control', 'Experiment'])
         self.group_radio.on_clicked(self.update_filter)
+
+        # Smoothness Slider
+        self.smooth_scale = 0.02
+        ax_smooth = fig.add_axes([0.25, 0.10, 0.60, 0.03])
+        self.smooth_slider = Slider(ax=ax_smooth, label="Smooth", valmin=0.0, valmax=0.05, valinit=self.smooth_scale)
+        self.smooth_slider.on_changed(self._on_smooth_change)
 
         # Initial placeholder image
         self.im = ax.imshow(np.zeros((grid_dims[1], grid_dims[0])), origin="lower", cmap=self.cmap_cyclic)
@@ -1123,6 +1129,11 @@ class GroupAverageMapViewer:
                                  bbox=dict(boxstyle="round", fc="w", alpha=0.9), arrowprops=dict(arrowstyle="->"))
         self.annot.set_visible(False)
         self.fig.canvas.mpl_connect("motion_notify_event", self.hover)
+
+    def _on_smooth_change(self, val):
+        self.smooth_scale = float(val)
+        # Recompute current selection
+        self.update_filter(self.group_radio.value_selected)
 
     def update_filter(self, label):
         if self.full_scatter.empty: return
@@ -1191,7 +1202,9 @@ class GroupAverageMapViewer:
             # 2) Choose sigma in bins so smoothing remains similar as grid resolution changes.
             #    Use a fraction of grid size (NOT a constant 1-bin window).
             #    This is the key to fixing the spotty at high resolution behavior.
-            sigma_bins = max(1.0, 0.04 * max(nx, ny))   # 0.03-0.06 are reasonable defaults
+            sigma_bins = self.smooth_scale * max(nx, ny)
+            sigma_bins = max(1.0, sigma_bins)
+            sigma_bins = min(6.0, sigma_bins)
 
             # 3) Smooth on the circle using occupancy as weights
             binned_grid = smooth_circular_phase_grid(
