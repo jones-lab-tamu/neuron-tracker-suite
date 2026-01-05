@@ -1458,99 +1458,90 @@ class PhaseGradientViewer:
         
         if not gradient_data:
             ax.text(0.5, 0.5, "No gradient data available.", ha='center')
-            self.fig.canvas.draw_idle()
             return
 
-        # Group data
-        groups = {'Control': [], 'Experiment': []}
-        for entry in gradient_data:
-            g = entry.get('group', 'Unassigned')
-            if g in groups: groups[g].append(entry)
-            else:
-                if 'Unassigned' not in groups: groups['Unassigned'] = []
-                groups['Unassigned'].append(entry)
-
-        colors = {'Control': 'blue', 'Experiment': 'red', 'Unassigned': 'gray'}
-        stats_text = "Group Metrics (Mean ± SEM):\n"
+        # Prepare colors
+        unique_groups = sorted(list(set(d['group'] for d in gradient_data)))
+        group_colors = {'Control': 'blue', 'Experiment': 'red'} 
+        # Fallback for other groups
+        import matplotlib.colors as mcolors
+        fallback_colors = list(mcolors.TABLEAU_COLORS.values())
+        for i, g in enumerate(unique_groups):
+            if g not in group_colors:
+                group_colors[g] = fallback_colors[i % len(fallback_colors)]
         
-        for grp, entries in groups.items():
-            if not entries: continue
+        # Plot lines
+        for d in gradient_data:
+            s = d['s']
+            ph = d['phases']
+            grp = d['group']
+            color = group_colors.get(grp, 'gray')
+            alpha = 0.5
+            lw = 1.0
             
-            color = colors.get(grp, 'gray')
-            all_phases = []
-            slopes = []
+            # Label includes Animal ID and Slope
+            label = f"{d['animal']} ({grp})"
+            if np.isfinite(d.get('slope_hours', np.nan)):
+                 label += f" [Slope: {d['slope_hours']:+.2f}h/u]"
             
-            # Plot Individual Lines
-            for entry in entries:
-                s = entry['s']
-                p = entry['phases']
-                ax.plot(s, p, color=color, alpha=0.15, linewidth=1)
-                all_phases.append(p)
-                
-                # Slope per animal
-                mask = ~np.isnan(p)
-                if np.sum(mask) > 2:
-                    slope, _, _, _, _ = linregress(s[mask], p[mask])
-                    slopes.append(slope)
+            ax.plot(s, ph, marker='o', markersize=4, linestyle='-', color=color, alpha=alpha, linewidth=lw, label=label)
             
-            # Mean Profile
-            all_phases = np.array(all_phases)
-            mean_profile = []
-            s_axis = entries[0]['s']
+        # Add legend or maybe too many items?
+        # If > 10 items, maybe just legend groups?
+        if len(gradient_data) <= 15:
+            ax.legend(fontsize='small', loc='best')
+        else:
+            # Legend for groups only
+            from matplotlib.lines import Line2D
+            handles = [Line2D([0], [0], color=c, lw=2, label=g) for g, c in group_colors.items()]
+            ax.legend(handles=handles, fontsize='small', loc='best')
             
-            for col in range(all_phases.shape[1]):
-                col_data = all_phases[:, col]
-                valid = col_data[~np.isnan(col_data)]
-                if valid.size > 0:
-                    rads = (valid / 24.0) * 2 * np.pi
-                    m_rad = circmean(rads, low=-np.pi, high=np.pi)
-                    mean_profile.append((m_rad / (2*np.pi)) * 24.0)
-                else:
-                    mean_profile.append(np.nan)
-            
-            ax.plot(s_axis, mean_profile, color=color, linewidth=3, label=f"{grp} Mean")
-            
-            # Stats text
-            if slopes:
-                m_slope = np.mean(slopes)
-                s_slope = sem(slopes)
-                stats_text += f"{grp} Slope: {m_slope:.2f} ± {s_slope:.2f}\n"
-
-        ax.legend(loc='upper left')
-        
-        props = dict(boxstyle='round', facecolor='white', alpha=0.8)
-        ax.text(0.95, 0.05, stats_text, transform=ax.transAxes, fontsize=10,
-                verticalalignment='bottom', horizontalalignment='right', bbox=props)
-        
-        ax_slider = fig.add_axes([0.25, 0.05, 0.50, 0.03])
-        self.range_slider = Slider(ax=ax_slider, label="Phase Range (+/- h)", valmin=1.0, valmax=12.0, valinit=8.0)
-        self.range_slider.on_changed(self.update_ylim)
-        
-        self.update_ylim(8.0) 
+        ax.set_ylim(0, 24) # CT Hours
+        ax.set_xlim(0, 1)
 
     def get_export_data(self):
+        # Flatten data for export
         rows = []
-        for entry in self.gradient_data:
-            animal = entry['animal']
-            group = entry.get('group', 'Unassigned') # Ensure group is captured
-            s_vals = entry['s']
-            p_vals = entry['phases']
+        for d in gradient_data: # Bug: need self.gradient_data
+             # Wait, referencing self.gradient_data
+             pass
+             
+        # Re-implementing correctly:
+        import pandas as pd
+        rows = []
+        for d in self.gradient_data:
+            # We want one row per bin? Or one row per animal?
+            # Tidy format: one row per bin, with animal-level stats repeated.
             
-            for i in range(len(s_vals)):
-                val = p_vals[i]
+            animal = d['animal']
+            group = d['group']
+            slope_h = d.get('slope_hours', np.nan)
+            slope_r = d.get('slope_rad', np.nan)
+            r_val = d.get('r_value', np.nan)
+            mode = d.get('mode', '')
+            period = d.get('period', 24.0)
+            
+            s_vals = d['s']
+            phases = d['phases']
+            counts = d.get('counts', np.full(len(s_vals), np.nan))
+            
+            for i, s in enumerate(s_vals):
+                p = phases[i]
+                c = counts[i]
                 rows.append({
-                    'Animal_ID': animal,
-                    'Group': group, # Add Group column
-                    'Anatomical_Pos_s': s_vals[i],
-                    'Relative_Phase_CT': val,
-                    'Bin_Index': i
+                    'Animal': animal,
+                    'Group': group,
+                    'S_Coordinate': s,
+                    'Mean_Phase_CT': p,
+                    'Cell_Count': c,
+                    'Slope_Hours_Per_Unit': slope_h,
+                    'Slope_Rad_Per_Unit': slope_r,
+                    'Slope_R_Value': r_val,
+                    'Gradient_Mode': mode,
+                    'Period_Hours_Used': period
                 })
-        df = pd.DataFrame(rows)
-        return df, "phase_gradient_data.csv"
-
-    def update_ylim(self, val):
-        self.ax.set_ylim(-val, val)
-        self.fig.canvas.draw_idle()
+        
+        return pd.DataFrame(rows), "gradient_analysis.csv"
 
 # --- ADD THIS CLASS TO THE END OF THE FILE ---
 

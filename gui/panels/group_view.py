@@ -6,7 +6,7 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 from matplotlib.path import Path
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 import matplotlib.pyplot as plt
-from scipy.stats import circmean, f as f_dist
+from scipy.stats import circmean, linregress, f as f_dist
 from skimage.draw import polygon as draw_polygon
 from typing import Tuple
 
@@ -91,6 +91,14 @@ class GroupViewPanel(QtWidgets.QWidget):
         self.norm_mode_combo = QtWidgets.QComboBox()
         self.norm_mode_combo.addItems(["Normalize: Control mean", "Normalize: Per-animal mean"])
         param_layout.addRow(self.norm_mode_combo)
+        self.norm_mode_combo.addItems(["Normalize: Control mean", "Normalize: Per-animal mean"])
+        param_layout.addRow(self.norm_mode_combo)
+        
+        # Gradient Parameters
+        self.grad_mode_combo = QtWidgets.QComboBox()
+        self.grad_mode_combo.addItems(["DV (Y-normalized)", "Phase Axis (polyline)"])
+        param_layout.addRow("Gradient Coordinate:", self.grad_mode_combo)
+        
         b.addWidget(param_box)        
         
         region_box = QtWidgets.QGroupBox("Regional Analysis Setup")
@@ -629,54 +637,207 @@ class GroupViewPanel(QtWidgets.QWidget):
         self.mw.vis_tabs.setCurrentWidget(self.mw.region_tab)
         self.mw.log_message("Region Analysis Complete.")
 
+    def _get_scn_boundary_y_extents(self, atlas_data):
+        """
+        Determines the Y-extents of the SCN boundary for DV normalization.
+        Rule: Use the 'Include' mode polygon with the largest area to define the anatomical boundary.
+        Filters out degenerate (small area or invalid) polygons.
+        Returns: (y_min, y_max) or None if no valid boundary found.
+        """
+        candidate_polys = []
+        considered_count = 0
+        rejected_count = 0
+        MIN_AREA_PX2 = 500.0  # Threshold to ignore noise/strokes
+        
+        for r in atlas_data:
+            if r.get('mode') == 'Include' and 'path_vertices' in r:
+                considered_count += 1
+                try:
+                    pts = np.array(r['path_vertices'])
+                    
+                    # Validation A: Shape Structure
+                    if pts.ndim != 2 or pts.shape[1] != 2:
+                        rejected_count += 1
+                        continue
+
+                    # Validation B: Finiteness and Length
+                    if len(pts) < 3 or not np.all(np.isfinite(pts)):
+                         rejected_count += 1
+                         continue
+                         
+                    # Shoelace formula for area
+                    x, y = pts[:,0], pts[:,1]
+                    area = 0.5 * np.abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
+                    
+                    # Validation C: Area Threshold
+                    if area < MIN_AREA_PX2:
+                        rejected_count += 1
+                        continue
+                        
+                    candidate_polys.append((area, pts))
+                except Exception:
+                    rejected_count += 1
+                    continue
+        
+        if not candidate_polys:
+            if rejected_count > 0:
+                self.mw.log_message(f"SCN Boundary Search: Considered {considered_count}, Rejected {rejected_count} (Degenerate/Small). None valid found.")
+            return None
+
+        # Select largest
+        candidate_polys.sort(key=lambda x: x[0], reverse=True)
+        best_area, best_pts = candidate_polys[0]
+        accepted_count = len(candidate_polys)
+        
+        self.mw.log_message(f"SCN Boundary Search: Considered {considered_count}, Accepted {accepted_count}, Rejected {rejected_count}. Selected Largest (Area={best_area:.0f} px²).")
+        
+        y_min = np.min(best_pts[:, 1])
+        y_max = np.max(best_pts[:, 1])
+        return y_min, y_max
+
     def _generate_gradient_analysis(self, df):
         atlas_path = self.state.atlas_roi_path
         if not atlas_path: return
         try:
             with open(atlas_path, 'r') as f: atlas_data = json.load(f)
-            axis_rois = [r for r in atlas_data if r.get('mode') == 'Phase Axis']
-            if not axis_rois: return
             
-            self.mw.log_message(f"Running Gradient Analysis ({len(axis_rois)} Axes)...")
-            axis_poly = np.array(axis_rois[0]['path_vertices'])
+            # Determine Coordinate Mode
+            mode = self.grad_mode_combo.currentText()
+            self.mw.log_message(f"Running Gradient Analysis (Mode: {mode})...")
             
+            s_func = None
+            
+            # Helper to setup DV function
+            def setup_dv_func():
+                extents = self._get_scn_boundary_y_extents(atlas_data)
+                if not extents:
+                    self.mw.log_message("Error: No valid Include boundary polygon found for DV normalization.")
+                    return None, None
+                
+                y_min, y_max = extents
+                dy = y_max - y_min
+                if dy == 0: dy = 1
+                self.mw.log_message(f"DV Mode: Range Y=[{y_min:.1f}, {y_max:.1f}]. s=0@Min, s=1@Max.")
+                
+                def f(points):
+                    s = (points[:, 1] - y_min) / dy
+                    return np.clip(s, 0.0, 1.0)
+                return f, (y_min, y_max)
+
+            if mode == "DV (Y-normalized)":
+                func, _ = setup_dv_func()
+                if not func: return
+                s_func = func
+                
+            else:
+                # Phase Axis Mode
+                axis_rois = [r for r in atlas_data if r.get('mode') == 'Phase Axis']
+                
+                if not axis_rois:
+                     self.mw.log_message("Warning: No Phase Axis found. Switching to DV mode.")
+                     func, _ = setup_dv_func()
+                     if not func: return
+                     s_func = func
+                     mode = "DV (Y-normalized)"
+                
+                else:
+                    if len(axis_rois) > 1:
+                         self.mw.log_message("Warning: Multiple Phase Axes found. Using the first one.")
+                    
+                    axis_poly = np.array(axis_rois[0]['path_vertices'])
+                    def get_s_axis(points):
+                        return project_points_to_polyline(points, axis_poly)
+                    s_func = get_s_axis
+
             gradient_data = []
             animals = df['Animal'].unique()
+            min_cells_bin = 5 
+            
+            # Period for slope calculation (24.0h fixed per requirements)
+            period_for_slope = 24.0
             
             for animal in animals:
                 subset = df[df['Animal'] == animal]
                 points = subset[['X', 'Y']].values
                 phases = subset['Rel_Phase'].values
-                group_name = subset['Group'].iloc[0]  # <--- Capture Group Name
+                group_name = subset['Group'].iloc[0] 
                 
-                s_vals = project_points_to_polyline(points, axis_poly)
+                s_vals = s_func(points)
+                
                 bins = np.linspace(0, 1, 11)
                 bin_centers = (bins[:-1] + bins[1:]) / 2
                 binned_phases = []
+                binned_counts = []
+                valid_centers_for_slope = []
+                valid_phases_for_slope = [] # in hours
                 
+                # Careful binning to include s=1.0 in last bin
+                # digitize returns 1..N
+                # we want 0..N-1
+                # right=False (default): [bins[i], bins[i+1])
+                # Special handle 1.0
+                
+                # Simple loop is robust
                 for k in range(len(bins)-1):
-                    mask = (s_vals >= bins[k]) & (s_vals < bins[k+1])
-                    if np.sum(mask) > 0:
+                    low, high = bins[k], bins[k+1]
+                    # Inclusive for last bin
+                    if k == len(bins)-2:
+                        mask = (s_vals >= low) & (s_vals <= high)
+                    else:
+                        mask = (s_vals >= low) & (s_vals < high)
+                    
+                    n_cells = np.sum(mask)
+                    binned_counts.append(n_cells)
+                    
+                    if n_cells >= min_cells_bin:
                         p_bin = phases[mask]
+                        # Circular Mean
                         rads = (p_bin / 24.0) * 2 * np.pi
                         m_rad = circmean(rads, low=-np.pi, high=np.pi)
                         m_h = (m_rad / (2 * np.pi)) * 24.0
                         binned_phases.append(m_h)
+                        
+                        valid_centers_for_slope.append(bin_centers[k])
+                        valid_phases_for_slope.append(m_h)
                     else:
                         binned_phases.append(np.nan)
                 
+                # Slope Calculation
+                slope_h = np.nan
+                slope_rad = np.nan
+                r_val = np.nan
+                
+                if len(valid_centers_for_slope) >= 3:
+                     # Unwrap
+                     v_phases = np.array(valid_phases_for_slope)
+                     rads = (v_phases / period_for_slope) * 2 * np.pi
+                     unwrapped_rads = np.unwrap(rads)
+                     x_s = np.array(valid_centers_for_slope)
+                     
+                     res = linregress(x_s, unwrapped_rads)
+                     slope_rad = res.slope
+                     r_val = res.rvalue
+                     
+                     # Convert slope back to hours/unit
+                     slope_h = slope_rad * (period_for_slope / (2 * np.pi))
+                
                 gradient_data.append({
                     'animal': animal,
-                    'group': group_name, # <--- Pass Group Name
+                    'group': group_name,
                     's': bin_centers,
-                    'phases': np.array(binned_phases)
+                    'phases': np.array(binned_phases),
+                    'counts': np.array(binned_counts),
+                    'slope_hours': slope_h,
+                    'slope_rad': slope_rad,
+                    'r_value': r_val,
+                    'mode': mode,
+                    'period': period_for_slope
                 })
                 
             if not hasattr(self.mw, 'grad_tab'):
                 self.mw.grad_tab = QtWidgets.QWidget()
                 self.mw.vis_tabs.addTab(self.mw.grad_tab, "Gradient")
             
-            # Use add_mpl_to_tab which manages the layout internally
             fig, _ = add_mpl_to_tab(self.mw.grad_tab)
             viewer_g = PhaseGradientViewer(fig, fig.add_subplot(111), gradient_data)
             self.mw.visualization_widgets[self.mw.grad_tab] = viewer_g
@@ -685,6 +846,8 @@ class GroupViewPanel(QtWidgets.QWidget):
 
         except Exception as e:
             self.mw.log_message(f"Gradient Analysis Warning: {e}")
+            import traceback
+            self.mw.log_message(traceback.format_exc())
 
     def export_current_data(self):
         current_tab = self.mw.vis_tabs.currentWidget()
