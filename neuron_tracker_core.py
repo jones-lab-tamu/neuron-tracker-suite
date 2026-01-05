@@ -12,6 +12,7 @@ import numpy
 import scipy.ndimage
 import scipy.spatial
 import networkx
+import time
 from multiprocessing import Pool, shared_memory
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional, Union
@@ -499,6 +500,11 @@ def extract_and_interpolate_data(
         h, w = 0, 0 # Fallback for empty (though T=0 is unlikely here)
 
     candidates: List[TrajectoryCandidate] = []
+    
+    t0 = time.perf_counter()
+    def log_step(msg: str) -> None:
+         dt = time.perf_counter() - t0
+         progress_callback(f"[Core +{dt:0.2f}s] {msg}")
 
     # --- PASS 1: SPATIAL ANALYSIS & GATING ---
     for i, path in enumerate(pruned_subgraphs):
@@ -609,6 +615,9 @@ def extract_and_interpolate_data(
         cand.is_valid_spatial = is_valid
         candidates.append(cand)
 
+    log_step(f"Trajectory loop complete ({len(pruned_subgraphs)}/{len(pruned_subgraphs)}). Starting post-loop finalize work.")
+
+    log_step("Finalize: Trace Extraction")
     # --- PASS 2: TRACE EXTRACTION ---
     for cand in candidates:
         if not cand.is_valid_spatial:
@@ -633,6 +642,9 @@ def extract_and_interpolate_data(
         else:
             cand.metrics.trace_snr_proxy = 0.0
 
+    log_step("Finalize: Trace Extraction done")
+    
+    log_step("Finalize: Cellness Metrics")
     # --- PASS 2B: CELLNESS METRICS ---
     # Run only for spatially valid + extracted candidates
     stride_step = max(1, T // 50)
@@ -685,8 +697,11 @@ def extract_and_interpolate_data(
                 cand.metrics.cell_ecc_median = 0.0
                 cand.metrics.cell_center_annulus_ratio_median = 0.0
 
+    log_step("Finalize: Cellness Metrics done")
+
     # --- PASS 2C: IDENTITY RESCUE (OPTIONAL) ---
     if enable_identity_rescue:
+        log_step("Finalize: Identity Rescue")
         # Determine stride for identity pass
         # "current code uses: stride_step = max(1, T // 50)"
         if identity_stride_frames is not None:
@@ -762,6 +777,8 @@ def extract_and_interpolate_data(
                     cand.metrics.id_sim_p10 = float(numpy.percentile(sim_values, 10)) if sim_values else 0.0
                     cand.metrics.id_sim_fraction_ge_thr = float(sum(1 for s in sim_values if s >= identity_sim_threshold)) / float(len(sim_values)) if sim_values else 0.0
 
+        log_step("Finalize: Identity Rescue done")
+
 
     # --- PASS 3: FINAL ACCEPTANCE ---
     for cand in candidates:
@@ -773,6 +790,7 @@ def extract_and_interpolate_data(
             cand.accepted = False
             
     # --- OUTPUT GENERATION ---
+    log_step("Analysis complete")
     if return_candidates:
         return candidates
 

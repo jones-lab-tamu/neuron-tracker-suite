@@ -21,7 +21,7 @@ import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 
 import cosinor as csn
-from scipy.ndimage import label, gaussian_laplace
+from scipy.ndimage import label, gaussian_laplace, gaussian_filter
 from gui.analysis import compute_median_window_frames, preprocess_for_rhythmicity
 
 # ------------------------------------------------------------
@@ -1001,6 +1001,67 @@ class GroupScatterViewer:
     def get_export_data(self):
         return self.current_df, "group_scatter_data.csv"
 
+def smooth_circular_phase_grid(phase_grid, count_grid, period_hours, mask=None, sigma_bins=2.0, min_weight=1e-3):
+    half_range = period_hours / 2.0
+    
+    # 2) Build weights
+    w = np.asarray(count_grid, dtype=float)
+    # Defensive: ensure w itself is finite
+    w[~np.isfinite(w)] = 0.0
+    # Also enforce w=0 where phase is invalid (prevents weight-only support)
+    w[~np.isfinite(phase_grid)] = 0.0
+    
+    if mask is not None:
+        w[~mask] = 0.0
+        
+    # 3) Identify Valid Cells (Phase finite AND Weight > 0)
+    #    We must not evaluate cos/sin on NaNs.
+    valid = np.isfinite(phase_grid) & (w > 0)
+    if mask is not None:
+        valid &= mask
+        
+    # 4) Initialize u, v as zeros (safe against NaNs)
+    u = np.zeros_like(w, dtype=float)
+    v = np.zeros_like(w, dtype=float)
+    
+    # 5) Compute components ONLY on valid entries
+    if np.any(valid):
+        # theta in [-pi, pi]
+        theta_valid = (phase_grid[valid] / half_range) * np.pi
+        u[valid] = np.cos(theta_valid) * w[valid]
+        v[valid] = np.sin(theta_valid) * w[valid]
+
+    # Sanity Guard
+    if not (np.isfinite(u).all() and np.isfinite(v).all() and np.isfinite(w).all()):
+        raise ValueError("smooth_circular_phase_grid: non-finite values reached gaussian_filter inputs")
+
+    # 6) Gaussian smooth
+    u_f = gaussian_filter(u, sigma=sigma_bins, mode="nearest")
+    v_f = gaussian_filter(v, sigma=sigma_bins, mode="nearest")
+    w_f = gaussian_filter(w, sigma=sigma_bins, mode="nearest")
+    
+    # 7) Normalize
+    eps = 1e-12
+    u_s = u_f / (w_f + eps)
+    v_s = v_f / (w_f + eps)
+    
+    mag = np.sqrt(u_s*u_s + v_s*v_s)
+    ok = mag > eps
+    u_s[ok] /= mag[ok]
+    v_s[ok] /= mag[ok]
+    
+    # 8) Recover phase
+    theta_s = np.arctan2(v_s, u_s) # [-pi, pi]
+    phase_s = (theta_s / np.pi) * half_range
+    
+    # 9) Confidence & Mask cuts
+    phase_s[w_f < min_weight] = np.nan
+    
+    if mask is not None:
+        phase_s[~mask] = np.nan
+        
+    return phase_s
+
 class GroupAverageMapViewer:
     def __init__(self, fig, ax, group_binned_df, group_scatter_df, grid_dims, do_smooth):
         self.fig = fig
@@ -1103,20 +1164,44 @@ class GroupAverageMapViewer:
 
         # Smoothing
         if self.do_smooth:
-             # [Same smoothing logic as before]
-            original_grid = binned_grid.copy()
-            rows, cols = original_grid.shape
-            for r in range(rows):
-                for c in range(cols):
-                    if np.isnan(original_grid[r, c]):
-                        r_min, r_max = max(0, r-1), min(rows, r+2)
-                        c_min, c_max = max(0, c-1), min(cols, c+2)
-                        window = original_grid[r_min:r_max, c_min:c_max]
-                        valid = window[~np.isnan(window)]
-                        if valid.size > 0:
-                            rads = (valid / (self.period_hours / 2.0)) * np.pi
-                            mean_rad = circmean(rads, low=-np.pi, high=np.pi)
-                            binned_grid[r, c] = (mean_rad / np.pi) * (self.period_hours / 2.0)
+            # 1) Build a tissue footprint mask using convex hull of the actual points in df
+            #    so we do not paint outside the SCN region.
+            #    This mask is in GRID SPACE, not pixel space.
+            ny, nx = binned_grid.shape
+            xs = df["Warped_X"].to_numpy(dtype=float, copy=False)
+            ys = df["Warped_Y"].to_numpy(dtype=float, copy=False)
+
+            # If not enough points for a hull, skip mask and just smooth using weights
+            mask = None
+            if len(xs) >= 3:
+                pts = np.column_stack([xs, ys])
+                hull = ConvexHull(pts)
+                hull_path = Path(pts[hull.vertices])
+
+                # Compute grid cell centers in world coordinates using self.extent and nx, ny
+                xmin, xmax, ymin, ymax = self.extent[0], self.extent[1], self.extent[2], self.extent[3]
+                dx = (xmax - xmin) / nx
+                dy = (ymax - ymin) / ny
+                x_centers = xmin + (np.arange(nx) + 0.5) * dx
+                y_centers = ymin + (np.arange(ny) + 0.5) * dy
+                XX, YY = np.meshgrid(x_centers, y_centers)   # shapes (ny, nx)
+                grid_pts = np.column_stack([XX.ravel(), YY.ravel()])
+                mask = hull_path.contains_points(grid_pts).reshape((ny, nx))
+
+            # 2) Choose sigma in bins so smoothing remains similar as grid resolution changes.
+            #    Use a fraction of grid size (NOT a constant 1-bin window).
+            #    This is the key to fixing the spotty at high resolution behavior.
+            sigma_bins = max(1.0, 0.04 * max(nx, ny))   # 0.03-0.06 are reasonable defaults
+
+            # 3) Smooth on the circle using occupancy as weights
+            binned_grid = smooth_circular_phase_grid(
+                phase_grid=binned_grid,
+                count_grid=self.count_grid,
+                period_hours=self.period_hours,
+                mask=mask,
+                sigma_bins=sigma_bins,
+                min_weight=1e-3
+            )
 
         self.im.set_data(binned_grid)
         
