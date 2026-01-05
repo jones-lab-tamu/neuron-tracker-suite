@@ -1453,11 +1453,14 @@ class PhaseGradientViewer:
         self.fig.subplots_adjust(left=0.15, bottom=0.20, right=0.95, top=0.9)
         ax.set_title("Dorsoventral Phase Gradient")
         ax.set_xlabel("Anatomical Position (s)\n(0.0 = Dorsal/Start, 1.0 = Ventral/End)")
-        ax.set_ylabel("Relative Phase (CT Hours)")
+        ax.set_ylabel("Relative Phase (h, wrapped to [-12, +12])")
         ax.grid(True, linestyle=':', alpha=0.6)
+        
+        gradient_data = getattr(self, 'gradient_data', None)
         
         if not gradient_data:
             ax.text(0.5, 0.5, "No gradient data available.", ha='center')
+            self.fig.canvas.draw_idle()
             return
 
         # Prepare colors
@@ -1496,52 +1499,49 @@ class PhaseGradientViewer:
             handles = [Line2D([0], [0], color=c, lw=2, label=g) for g, c in group_colors.items()]
             ax.legend(handles=handles, fontsize='small', loc='best')
             
-        ax.set_ylim(0, 24) # CT Hours
+
+            
+        ax.set_ylim(-12, 12) # Relative Phase Symmetric
         ax.set_xlim(0, 1)
 
     def get_export_data(self):
         # Flatten data for export
-        rows = []
-        for d in gradient_data: # Bug: need self.gradient_data
-             # Wait, referencing self.gradient_data
-             pass
-             
-        # Re-implementing correctly:
         import pandas as pd
-        rows = []
-        for d in self.gradient_data:
-            # We want one row per bin? Or one row per animal?
-            # Tidy format: one row per bin, with animal-level stats repeated.
-            
-            animal = d['animal']
-            group = d['group']
-            slope_h = d.get('slope_hours', np.nan)
-            slope_r = d.get('slope_rad', np.nan)
-            r_val = d.get('r_value', np.nan)
-            mode = d.get('mode', '')
-            period = d.get('period', 24.0)
-            
-            s_vals = d['s']
-            phases = d['phases']
-            counts = d.get('counts', np.full(len(s_vals), np.nan))
-            
-            for i, s in enumerate(s_vals):
-                p = phases[i]
-                c = counts[i]
-                rows.append({
-                    'Animal': animal,
-                    'Group': group,
-                    'S_Coordinate': s,
-                    'Mean_Phase_CT': p,
-                    'Cell_Count': c,
-                    'Slope_Hours_Per_Unit': slope_h,
-                    'Slope_Rad_Per_Unit': slope_r,
-                    'Slope_R_Value': r_val,
-                    'Gradient_Mode': mode,
-                    'Period_Hours_Used': period
-                })
         
-        return pd.DataFrame(rows), "gradient_analysis.csv"
+        # Return empty if no data
+        if not hasattr(self, 'gradient_data') or not self.gradient_data:
+            return pd.DataFrame(), "phase_gradient_data.csv"
+
+        rows = []
+        for entry in self.gradient_data:
+            animal = entry['animal']
+            group = entry.get('group', 'Unassigned')
+            s_vals = entry['s']
+            p_vals = entry['phases']
+            counts = entry.get('counts', np.full(len(s_vals), np.nan)) 
+            slope_h = entry.get('slope_hours', np.nan)
+            slope_rad = entry.get('slope_rad', np.nan)
+            r_val = entry.get('r_value', np.nan)
+            mode = entry.get('mode', '')
+            period = entry.get('period', 24.0)
+            
+            for i in range(len(s_vals)):
+                val = p_vals[i]
+                rows.append({
+                    'Animal_ID': animal,
+                    'Group': group,
+                    'Gradient_Mode': mode,
+                    'Period_Hours_Used': period,
+                    'Bin_Index': i,
+                    'S_Coordinate': s_vals[i],
+                    'Mean_Phase_CT': val, 
+                    'N_Cells_In_Bin': counts[i],
+                    'Slope_Hours_Per_Unit': slope_h,
+                    'Slope_Rad_Per_Unit': slope_rad,
+                    'Slope_R_Value': r_val
+                })
+        df = pd.DataFrame(rows)
+        return df, "phase_gradient_data.csv"
 
 # --- ADD THIS CLASS TO THE END OF THE FILE ---
 
