@@ -21,7 +21,7 @@ import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 
 import cosinor as csn
-from scipy.ndimage import label, gaussian_laplace, gaussian_filter
+from scipy.ndimage import label, gaussian_laplace, gaussian_filter, binary_fill_holes
 from gui.analysis import compute_median_window_frames, preprocess_for_rhythmicity
 
 # ------------------------------------------------------------
@@ -1175,46 +1175,44 @@ class GroupAverageMapViewer:
 
         # Smoothing
         if self.do_smooth:
-            # 1) Build a tissue footprint mask using convex hull of the actual points in df
-            #    so we do not paint outside the SCN region.
-            #    This mask is in GRID SPACE, not pixel space.
+            # 1) Calculate Sigma (retained)
             ny, nx = binned_grid.shape
-            xs = df["Warped_X"].to_numpy(dtype=float, copy=False)
-            ys = df["Warped_Y"].to_numpy(dtype=float, copy=False)
-
-            # If not enough points for a hull, skip mask and just smooth using weights
-            mask = None
-            if len(xs) >= 3:
-                pts = np.column_stack([xs, ys])
-                hull = ConvexHull(pts)
-                hull_path = Path(pts[hull.vertices])
-
-                # Compute grid cell centers in world coordinates using self.extent and nx, ny
-                xmin, xmax, ymin, ymax = self.extent[0], self.extent[1], self.extent[2], self.extent[3]
-                dx = (xmax - xmin) / nx
-                dy = (ymax - ymin) / ny
-                x_centers = xmin + (np.arange(nx) + 0.5) * dx
-                y_centers = ymin + (np.arange(ny) + 0.5) * dy
-                XX, YY = np.meshgrid(x_centers, y_centers)   # shapes (ny, nx)
-                grid_pts = np.column_stack([XX.ravel(), YY.ravel()])
-                mask = hull_path.contains_points(grid_pts).reshape((ny, nx))
-
-            # 2) Choose sigma in bins so smoothing remains similar as grid resolution changes.
-            #    Use a fraction of grid size (NOT a constant 1-bin window).
-            #    This is the key to fixing the spotty at high resolution behavior.
             sigma_bins = self.smooth_scale * max(nx, ny)
             sigma_bins = max(1.0, sigma_bins)
             sigma_bins = min(6.0, sigma_bins)
 
-            # 3) Smooth on the circle using occupancy as weights
-            binned_grid = smooth_circular_phase_grid(
-                phase_grid=binned_grid,
-                count_grid=self.count_grid,
-                period_hours=self.period_hours,
-                mask=mask,
-                sigma_bins=sigma_bins,
-                min_weight=1e-3
-            )
+            # 2) Define occupancy in GRID space
+            occupied = (self.count_grid > 0)
+
+            # 3) Label connected components
+            # Explicit 4-connectivity to avoid bridging diagonals
+            structure = np.array([[0,1,0],
+                                  [1,1,1],
+                                  [0,1,0]], dtype=bool)
+            lbl, ncomp = label(occupied, structure=structure)
+
+            # 4) Initialize output
+            smoothed = np.full_like(binned_grid, np.nan, dtype=float)
+
+            # 5) Process each component
+            for i in range(1, ncomp + 1):
+                comp_occ = (lbl == i)
+
+                # Optional: fill enclosed holes only, DO NOT dilate outward
+                comp_mask = binary_fill_holes(comp_occ)
+
+                comp_phase = smooth_circular_phase_grid(
+                    phase_grid=binned_grid,
+                    count_grid=self.count_grid,
+                    period_hours=self.period_hours,
+                    mask=comp_mask,
+                    sigma_bins=sigma_bins,
+                    min_weight=1e-3,
+                )
+
+                smoothed[comp_mask] = comp_phase[comp_mask]
+            
+            binned_grid = smoothed
 
         self.im.set_data(binned_grid)
         
