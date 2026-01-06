@@ -1663,6 +1663,14 @@ class RegionResultViewer(QtWidgets.QWidget):
         self.btn_export_all.clicked.connect(self.export_full_cell_data)
         btn_layout.addWidget(self.btn_export_all)
         
+        self.btn_export_animal_zone = QtWidgets.QPushButton("Export: Animal×Zone Summary")
+        self.btn_export_animal_zone.clicked.connect(self._export_animal_zone_summary)
+        btn_layout.addWidget(self.btn_export_animal_zone)
+        
+        self.btn_run_stats = QtWidgets.QPushButton("Stats: Group×Zone Interaction")
+        self.btn_run_stats.clicked.connect(self._run_group_zone_interaction)
+        btn_layout.addWidget(self.btn_run_stats)
+        
         detail_layout.addLayout(btn_layout)
         
         self._draw_map()
@@ -2170,3 +2178,262 @@ class RegionResultViewer(QtWidgets.QWidget):
             
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Export Error", str(e))
+
+    def _build_animal_zone_summary_rows(self) -> list[dict]:
+        """Builds standardized list of dicts for animal-zone summary."""
+        if not hasattr(self, 'zone_stats') or not self.zone_stats:
+            return []
+            
+        all_rows = []
+        import datetime
+        ts = datetime.datetime.now().isoformat()
+        
+        for s in self.zone_stats:
+            z_id = s['id']
+            z_name = s['name']
+            
+            # Check if 'data' is present
+            if 'data' not in s: continue
+            
+            for d in s['data']:
+                animal_id = d['animal']
+                group = d['group']
+                raw_phases = np.array(d.get('raw_phases', []), dtype=float)
+                
+                # Strict finite filter
+                raw_phases = raw_phases[np.isfinite(raw_phases)]
+                
+                # Reuse existing robust logic, explicit 24h as per GUI convention
+                stats = self._compute_roi_animal_stats(raw_phases, period_h=24.0)
+                
+                # Compute Circular SD from R to Ensure Correctness
+                r_val = stats.get('R', np.nan)
+                if np.isfinite(r_val) and r_val > 0 and r_val <= 1.0:
+                    circ_sd_rad = np.sqrt(-2.0 * np.log(r_val))
+                    circ_sd_h = circ_sd_rad * (24.0 / (2*np.pi))
+                else:
+                    circ_sd_h = np.nan
+
+                all_rows.append({
+                    'Animal_ID': animal_id,
+                    'Group': group,
+                    'Zone_ID': z_id,
+                    'Zone_Name': z_name,
+                    'N_Cells': int(stats.get('n_cells', 0)),
+                    'Mean_Phase_RelHours': stats.get('mean_h', np.nan),
+                    'Mean_Phase_ModHours': stats.get('mean_h_mod24', np.nan),
+                    'Mean_Phase_Radians': stats.get('mean_rad', np.nan),
+                    'R_Resultant': r_val,
+                    'Circular_SD': circ_sd_h,
+                    'Period_Hours_Used': 24.0,
+                    'Timestamp_Exported': ts
+                })
+        return all_rows
+
+    def _build_animal_zone_summary_df(self) -> pd.DataFrame:
+        """Returns the summary data as a DataFrame with guaranteed columns."""
+        rows = self._build_animal_zone_summary_rows()
+        df = pd.DataFrame(rows)
+        
+        cols = ['Animal_ID', 'Group', 'Zone_ID', 'Zone_Name', 'N_Cells', 
+                'Mean_Phase_RelHours', 'Mean_Phase_ModHours', 'Mean_Phase_Radians', 
+                'R_Resultant', 'Circular_SD', 'Period_Hours_Used', 'Timestamp_Exported']
+        
+        if not df.empty:
+             for c in cols:
+                 if c not in df.columns: df[c] = np.nan
+             # Reorder
+             df = df[cols]
+             
+        # If empty but cols needed?
+        if df.empty and len(rows) == 0:
+             df = pd.DataFrame(columns=cols)
+             
+        return df
+
+    def _export_animal_zone_summary(self):
+        """Exports per-animal per-zone summary statistics for external analysis."""
+        df = self._build_animal_zone_summary_df()
+        
+        if df.empty:
+            QtWidgets.QMessageBox.information(self, "Export Info", "No valid region stats available to export.")
+            return
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export AnimalxZone Summary", 
+                                                        "zone_phase_animal_summary.csv", 
+                                                        "CSV (*.csv)")
+        if not path: return
+
+        try:
+            df.to_csv(path, index=False)
+            QtWidgets.QMessageBox.information(self, "Success", f"Exported {len(df)} summary rows to:\n{path}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Export Error", str(e))
+            
+    def _run_group_zone_interaction(self):
+        """Runs the Group x Zone Permutation Interaction Test in background."""
+        if not hasattr(self, 'zone_stats') or not self.zone_stats:
+             QtWidgets.QMessageBox.information(self, "Stats Info", "No zone stats available used for calculation.")
+             return
+             
+        # Build Data
+        df = self._build_animal_zone_summary_df()
+        if df.empty:
+             QtWidgets.QMessageBox.information(self, "Stats Info", "Summary data is empty. Cannot run stats.")
+             return
+             
+        # Get Parameters
+        # Simple Input Dialogs
+        nperm, ok1 = QtWidgets.QInputDialog.getInt(self, "Stats Params", "Number of Permutations:", 10000, 100, 500000)
+        if not ok1: return
+        
+        min_cells, ok2 = QtWidgets.QInputDialog.getInt(self, "Stats Params", "Min Cells per Animal per Zone:", 5, 1, 1000)
+        if not ok2: return
+        
+        min_animals, ok3 = QtWidgets.QInputDialog.getInt(self, "Stats Params", "Min Animals per Group per Zone:", 2, 1, 100)
+        if not ok3: return
+        
+        # Seed Input (Text Dialog to allow blank for None)
+        seed_str, ok4 = QtWidgets.QInputDialog.getText(self, "Stats Params", "Random Seed (blank = none):")
+        if not ok4: return
+        
+        seed = None
+        if seed_str.strip():
+            try:
+                seed_val = int(seed_str.strip())
+                if seed_val < 0 or seed_val > 2**31 - 1:
+                     raise ValueError("Seed out of range")
+                seed = seed_val
+            except ValueError:
+                QtWidgets.QMessageBox.critical(self, "Input Error", "Seed must be a valid integer (0 to 2^31-1) or blank.")
+                return
+        
+        # Get Output Path
+        out_json, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Interaction Results", 
+                                                            "group_zone_interaction_results.json", 
+                                                            "JSON (*.json)")
+        if not out_json: return
+        
+        # UI State
+        self.btn_run_stats.setEnabled(False)
+        
+        # Setup Background Worker Thread
+        self._stats_thread = QtCore.QThread(self)
+        self._stats_worker = StatsWorker(df, out_json, nperm, min_cells, min_animals, seed)
+        self._stats_worker.moveToThread(self._stats_thread)
+        
+        # Progress Dialog
+        self._stats_progress = QtWidgets.QProgressDialog("Running Permutation Test...", "Cancel", 0, 0, self)
+        self._stats_progress.setWindowModality(QtCore.Qt.WindowModal)
+        self._stats_progress.setMinimumDuration(0)
+        self._stats_progress.show()
+        
+        # Connect Signals
+        self._stats_thread.started.connect(self._stats_worker.run)
+        
+        # Finish: Update UI -> Quit Thread
+        self._stats_worker.finished.connect(self._on_stats_finished)
+        self._stats_worker.finished.connect(self._stats_thread.quit)
+        
+        # Error: Update UI -> Quit Thread
+        self._stats_worker.error.connect(self._on_stats_error)
+        self._stats_worker.error.connect(self._stats_thread.quit)
+        
+        # Cancel
+        self._stats_progress.canceled.connect(self._stats_worker.request_cancel)
+        
+        # Cleanup
+        self._stats_thread.finished.connect(self._stats_worker.deleteLater)
+        self._stats_thread.finished.connect(self._stats_thread.deleteLater)
+        
+        # Start
+        self._stats_thread.start()
+        
+    def _on_stats_finished(self, results, out_json, out_csv):
+        self.btn_run_stats.setEnabled(True)
+        if hasattr(self, "_stats_progress") and self._stats_progress:
+            self._stats_progress.close()
+        
+        msg = [
+            "Analysis Complete!",
+            "",
+            f"P-Value (Interaction): {results['permutation_p_interaction']:.4f}",
+            f"Observed T: {results['observed_T']:.4f}",
+            "",
+            "Stats:",
+            f"- Accepted Permutations: {results['permutations_accepted']}",
+            f"- Rejected Permutations: {results['permutations_rejected']}",
+            f"- Valid Zones ({len(results['valid_zones'])}): {results['valid_zones']}",
+            f"- Total Animals: {results['n_animals']}",
+            "",
+            "Data Filtering:",
+            f"- Input Rows: {results.get('n_rows_input', 'N/A')}",
+            f"- After Cell Filter: {results.get('n_rows_after_min_cells', 'N/A')}",
+            f"- Rows Used: {results.get('n_rows_used', 'N/A')}"
+        ]
+        
+        dropped = results.get('dropped_zones', [])
+        if dropped:
+            msg.append("")
+            msg.append(f"Dropped Zones ({len(dropped)}):")
+            for d in dropped:
+                z = d['Zone_Name']
+                r = d['reason']
+                msg.append(f"  - {z}: {r}")
+
+        msg.append("")
+        msg.append("Files Saved:")
+        msg.append(f"JSON: {out_json}")
+        msg.append(f"CSV: {out_csv}")
+
+        QtWidgets.QMessageBox.information(self, "Stats Results", "\n".join(msg))
+        
+    def _on_stats_error(self, err_msg):
+        self.btn_run_stats.setEnabled(True)
+        if hasattr(self, "_stats_progress") and self._stats_progress:
+            self._stats_progress.close()
+        
+        # Don't show trace for simple cancel
+        if "cancelled" in err_msg.lower():
+            return
+        QtWidgets.QMessageBox.critical(self, "Stats Error", f"Analysis failed:\n{err_msg}")
+
+class StatsWorker(QtCore.QObject):
+    finished = QtCore.pyqtSignal(dict, str, str) # results, json_path, csv_path
+    error = QtCore.pyqtSignal(str)
+    
+    def __init__(self, df, out_path, nperm, min_cells, min_animals, seed):
+        super().__init__()
+        self.df = df
+        self.out_path = out_path
+        self.params = {
+            'nperm': nperm,
+            'min_cells': min_cells,
+            'min_animals_zone': min_animals,
+            'seed': seed
+        }
+        self._is_cancelled = False
+        
+    def request_cancel(self):
+        self._is_cancelled = True
+        
+    def run(self):
+        import analysis.circular_stats as cs
+        try:
+            # Pass lambda to check cancel flag
+            results = cs.run_interaction_test_from_df(
+                self.df,
+                nperm=self.params['nperm'],
+                min_cells=self.params['min_cells'],
+                min_animals_zone=self.params['min_animals_zone'],
+                seed=self.params['seed'],
+                should_cancel=lambda: self._is_cancelled
+            )
+            
+            json_p, csv_p = cs.write_results_bundle(results, self.out_path)
+            self.finished.emit(results, json_p, csv_p)
+            
+        except Exception as e:
+            self.error.emit(str(e))
+
+
