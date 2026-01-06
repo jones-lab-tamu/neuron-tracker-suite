@@ -4,7 +4,7 @@ import colorcet as cet
 from scipy.interpolate import RBFInterpolator
 from scipy.spatial import ConvexHull
 from numpy import pi, arctan2
-from scipy.stats import circmean, linregress, sem
+from scipy.stats import circmean, circstd, linregress, sem
 
 from PyQt5 import QtWidgets, QtCore, QtGui
 
@@ -1456,15 +1456,15 @@ class PhaseGradientViewer:
         ax.set_ylabel("Relative Phase (h, wrapped to [-12, +12])")
         ax.grid(True, linestyle=':', alpha=0.6)
         
-        gradient_data = getattr(self, 'gradient_data', None)
+        gd = getattr(self, 'gradient_data', None)
         
-        if not gradient_data:
+        if not gd:
             ax.text(0.5, 0.5, "No gradient data available.", ha='center')
             self.fig.canvas.draw_idle()
             return
 
         # Prepare colors
-        unique_groups = sorted(list(set(d['group'] for d in gradient_data)))
+        unique_groups = sorted(list(set(d['group'] for d in gd)))
         group_colors = {'Control': 'blue', 'Experiment': 'red'} 
         # Fallback for other groups
         import matplotlib.colors as mcolors
@@ -1474,7 +1474,7 @@ class PhaseGradientViewer:
                 group_colors[g] = fallback_colors[i % len(fallback_colors)]
         
         # Plot lines
-        for d in gradient_data:
+        for d in gd:
             s = d['s']
             ph = d['phases']
             grp = d['group']
@@ -1491,7 +1491,7 @@ class PhaseGradientViewer:
             
         # Add legend or maybe too many items?
         # If > 10 items, maybe just legend groups?
-        if len(gradient_data) <= 15:
+        if len(gd) <= 15:
             ax.legend(fontsize='small', loc='best')
         else:
             # Legend for groups only
@@ -1508,6 +1508,7 @@ class PhaseGradientViewer:
         # Flatten data for export
         import pandas as pd
         
+        # Return empty if no data
         # Return empty if no data
         if not hasattr(self, 'gradient_data') or not self.gradient_data:
             return pd.DataFrame(), "phase_gradient_data.csv"
@@ -1534,11 +1535,14 @@ class PhaseGradientViewer:
                     'Period_Hours_Used': period,
                     'Bin_Index': i,
                     'S_Coordinate': s_vals[i],
-                    'Mean_Phase_CT': val, 
+                    'S_Coordinate': s_vals[i],
+                    'S_Coordinate': s_vals[i],
+                    'Mean_Phase_RelHours': float(self._normalize_hours(val, target='rel_pm12')), 
                     'N_Cells_In_Bin': counts[i],
                     'Slope_Hours_Per_Unit': slope_h,
                     'Slope_Rad_Per_Unit': slope_rad,
-                    'Slope_R_Value': r_val
+                    'Slope_R_Value': r_val,
+                    'Phase_Domain': 'rel_pm12'
                 })
         df = pd.DataFrame(rows)
         return df, "phase_gradient_data.csv"
@@ -1550,6 +1554,7 @@ class RegionResultViewer(QtWidgets.QWidget):
     Visualizes the results of the Region-Based Analysis.
     Tab 1: Atlas Map colored by Phase Difference.
     Tab 2: Statistical Table.
+    Tab 3: Animal Details (Wide Table + Mini Plot).
     """
     def __init__(self, zone_stats, atlas_polys_by_zone, parent=None):
         super().__init__(parent)
@@ -1584,19 +1589,41 @@ class RegionResultViewer(QtWidgets.QWidget):
         self.tabs.addTab(self.detail_tab, "Animal Details")
         detail_layout = QtWidgets.QVBoxLayout(self.detail_tab)
         
+        # Header Label
+        self.lbl_detail_header = QtWidgets.QLabel("Select a zone in 'Stats Table' to view details.")
+        self.lbl_detail_header.setStyleSheet("font-weight: bold; font-size: 14px;")
+        detail_layout.addWidget(self.lbl_detail_header)
+        
+        # Wide Table
         self.detail_table = QtWidgets.QTableWidget()
-        detail_layout.addWidget(self.detail_table)
+        self.detail_table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.detail_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        detail_layout.addWidget(self.detail_table, stretch=2)
+        
+        # Mini Plot
+        self.detail_fig = Figure(figsize=(5, 3))
+        self.detail_canvas = FigureCanvas(self.detail_fig)
+        detail_layout.addWidget(self.detail_canvas, stretch=1)
         
         # Buttons for Details Tab
         btn_layout = QtWidgets.QHBoxLayout()
+        
+        self.btn_export_detail = QtWidgets.QPushButton("Export Table (CSV)")
+        self.btn_export_detail.clicked.connect(self.export_current_detail_table)
+        btn_layout.addWidget(self.btn_export_detail)
+        
         self.btn_export_all = QtWidgets.QPushButton("Export Full Cell Data")
         self.btn_export_all.clicked.connect(self.export_full_cell_data)
         btn_layout.addWidget(self.btn_export_all)
+        
         detail_layout.addLayout(btn_layout)
         
         self._draw_map()
         self._populate_table()
-        self._populate_detail_table()
+        
+        # Trigger selection of first row if rows exist
+        if self.stats_table.rowCount() > 0:
+             self.stats_table.selectRow(0)
 
     def _draw_map(self):
         ax = self.fig.add_subplot(111)
@@ -1678,38 +1705,308 @@ class RegionResultViewer(QtWidgets.QWidget):
             self.stats_table.setItem(r, 7, p_item)
             
         self.stats_table.resizeColumnsToContents()
+        self.stats_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.stats_table.itemSelectionChanged.connect(self.on_zone_selection)
 
-    def _populate_detail_table(self):
-        """Populates the detail tab with per-animal data."""
-        cols = ["Zone ID", "Zone Name", "Group", "Animal", "Mean Phase (h)", "N Cells"]
-        self.detail_table.setColumnCount(len(cols))
-        self.detail_table.setHorizontalHeaderLabels(cols)
-        
-        # Calculate total rows
-        total_rows = sum(len(s['data']) for s in self.zone_stats)
-        self.detail_table.setRowCount(total_rows)
-        
-        row_idx = 0
-        for s in self.zone_stats:
-            z_id = str(s['id'])
-            z_name = str(s['name'])
+    def on_zone_selection(self):
+        indexes = self.stats_table.selectionModel().selectedRows()
+        if not indexes:
+            return
             
-            # Sort by group then animal for readability
-            sorted_data = sorted(s['data'], key=lambda x: (x['group'], x['animal']))
+        row = indexes[0].row()
+        # Item 0 is ID
+        z_id_item = self.stats_table.item(row, 0)
+        if not z_id_item: return
+        
+        try:
+            z_id = int(z_id_item.text())
+        except ValueError:
+            return
             
-            for d in sorted_data:
-                self.detail_table.setItem(row_idx, 0, QtWidgets.QTableWidgetItem(z_id))
-                self.detail_table.setItem(row_idx, 1, QtWidgets.QTableWidgetItem(z_name))
-                self.detail_table.setItem(row_idx, 2, QtWidgets.QTableWidgetItem(str(d['group'])))
-                self.detail_table.setItem(row_idx, 3, QtWidgets.QTableWidgetItem(str(d['animal'])))
-                self.detail_table.setItem(row_idx, 4, QtWidgets.QTableWidgetItem(f"{d['mean']:.2f}"))
-                self.detail_table.setItem(row_idx, 5, QtWidgets.QTableWidgetItem(str(d['n_cells'])))
-                row_idx += 1
+        # Find record
+        record = next((r for r in self.zone_stats if r['id'] == z_id), None)
+        if record:
+            self._update_detail_view(record)
+
+    def _update_detail_view(self, record):
+        """Builds the wide table and plots for the selected zone."""
+        self.lbl_detail_header.setText(f"ROI: {record['name']} (ID: {record['id']})")
+        self.current_detail_record = record # Store for export
+        # Store per-group summaries for mini plot reuse (avoid recomputation drift)
+        self._current_detail_group_summaries = {}
+        
+        # 1. Prepare Data
+        groups = {}
+        for d in record['data']:
+            g = d['group']
+            if g not in groups: groups[g] = []
+            groups[g].append(d)
+            
+        group_names = sorted(groups.keys())
+        if 'Control' in group_names: 
+            group_names.remove('Control')
+            group_names = ['Control'] + group_names
+            
+        # 2. Build Wide Table
+        self.detail_table.clear()
+        self.detail_table.setColumnCount(0)
+        self.detail_table.setRowCount(0)
+        
+        metrics = ["Mean (h)", "Std (h)", "Count (N)", "SEM (h)", 
+                   "Mean (rad)", "Mean (h, mod24)", "R (0-1)"]
+        summary_metrics = ["Group_Mean (h)", "Group_Std (h)", "Group_N (Animals)", "Group_SEM (h)"]
+        
+        current_row = 0
+        total_cols = 0
+        self.detail_table.setSortingEnabled(False)
+        
+        for g_name in group_names:
+            animals = sorted(groups[g_name], key=lambda x: str(x['animal']))
+            if not animals: continue
+            
+            # Header Row for Group
+            self.detail_table.insertRow(current_row)
+            self.detail_table.setItem(current_row, 0, QtWidgets.QTableWidgetItem(f"Group: {g_name}"))
+            font = QtGui.QFont()
+            font.setBold(True)
+            self.detail_table.item(current_row, 0).setFont(font)
+            self.detail_table.item(current_row, 0).setBackground(QtGui.QColor("#e0e0e0"))
+            current_row += 1
+            
+            # Column Headers
+            n_animals = len(animals)
+            needed_cols = 1 + n_animals + 1
+            if needed_cols > total_cols:
+                self.detail_table.setColumnCount(needed_cols)
+                total_cols = needed_cols
                 
+            labels = ["Metric"] + [str(a['animal']) for a in animals] + ["Group Summary"]
+            self.detail_table.insertRow(current_row)
+            for c, pwm in enumerate(labels):
+                it = QtWidgets.QTableWidgetItem(pwm)
+                it.setBackground(QtGui.QColor("#f0f0f0"))
+                self.detail_table.setItem(current_row, c, it)
+            current_row += 1
+            
+            # Data Rows
+            animal_stats_list = []
+            for d in animals:
+                stats = self._compute_roi_animal_stats(np.array(d.get('raw_phases', []), dtype=float), period_h=24.0)
+                animal_stats_list.append(stats)
+            
+            # Group Summary
+            # Collect mean_rad from animals with n_cells > 0
+            valid_mean_rads = [s['mean_rad'] for s in animal_stats_list
+                               if s.get('n_cells', 0) > 0 and np.isfinite(s.get('mean_rad', np.nan))]
+            
+            g_n = len(valid_mean_rads)
+            if g_n > 0:
+                # Group Mean of Means (angular)
+                g_mean_rad = circmean(np.array(valid_mean_rads, dtype=float), low=-np.pi, high=np.pi)
+                # Convert to hours [0, 24)
+                g_mean_h_mod24 = (g_mean_rad / (2*np.pi)) * 24.0
+                g_mean_h_mod24 = g_mean_h_mod24 % 24.0
+                if g_mean_h_mod24 < 0: g_mean_h_mod24 += 24.0
+
+                # Convert to Display Domain
+                g_mean_h_display = self._normalize_hours(np.array([g_mean_h_mod24]), target='rel_pm12')[0]
+                
+                if g_n >= 2:
+                    g_std_rad = circstd(np.array(valid_mean_rads, dtype=float), low=-np.pi, high=np.pi)
+                    g_std_h = (g_std_rad / (2*np.pi)) * 24.0
+                    g_sem_h = g_std_h / np.sqrt(g_n)
+                else:
+                    g_std_h = np.nan
+                    g_sem_h = np.nan
+                
+                group_summary = {
+                    "Group_Mean (h)": g_mean_h_display,
+                    "Group_Std (h)": g_std_h,
+                    "Group_N (Animals)": g_n,
+                    "Group_SEM (h)": g_sem_h
+                }
+            else:
+                group_summary = {}
+
+            # Persist summary for plotting and export consistency
+            self._current_detail_group_summaries[g_name] = group_summary
+
+            # Fill Metrics
+            for m in metrics:
+                self.detail_table.insertRow(current_row)
+                self.detail_table.setItem(current_row, 0, QtWidgets.QTableWidgetItem(m))
+                
+                for i, stats in enumerate(animal_stats_list):
+                    key_map = {
+                        "Mean (h)": 'mean_h', "Std (h)": 'std_h', "Count (N)": 'n_cells',
+                        "SEM (h)": 'sem_h', "Mean (rad)": 'mean_rad', "Mean (h, mod24)": 'mean_h_mod24', "R (0-1)": 'R'
+                    }
+                    val = stats.get(key_map.get(m, ''), np.nan)
+                    
+                    if m == "Count (N)" or m == "Group_N (Animals)":
+                        txt = f"{int(val)}"
+                    elif m == "R (0-1)":
+                        txt = f"{val:.3f}"
+                    else:
+                        txt = f"{val:.2f}"
+                        
+                    self.detail_table.setItem(current_row, 1+i, QtWidgets.QTableWidgetItem(txt))
+                
+                current_row += 1
+                
+            # Fill Group Summaries
+            for m in summary_metrics:
+                self.detail_table.insertRow(current_row)
+                self.detail_table.setItem(current_row, 0, QtWidgets.QTableWidgetItem(m))
+                val = group_summary.get(m, np.nan)
+                if "N (" in m: txt = f"{int(val)}" if np.isfinite(val) else "0"
+                else: txt = f"{val:.2f}"
+                item = QtWidgets.QTableWidgetItem(txt)
+                item.setFont(font)
+                self.detail_table.setItem(current_row, n_animals + 1, item)
+                current_row += 1
+                
+            # Spacer
+            self.detail_table.insertRow(current_row)
+            current_row += 1
+
         self.detail_table.resizeColumnsToContents()
+        self._plot_mini_distribution(groups)
+
+    def _normalize_hours(self, phases_h, period_h=24.0, target='rel_pm12'):
+        """
+        Normalize phase hours to a specific domain.
+        target='mod24': [0, period)
+        target='rel_pm12': [-period/2, +period/2)
+        """
+        period_h = float(period_h)
+        if not np.isfinite(period_h) or period_h <= 0:
+            raise ValueError("period_h must be a positive finite number")
+            
+        ph = np.asarray(phases_h, dtype=float)
+        # Wrap robustly to [0, period)
+        ph_mod = np.mod(ph, period_h)
+        ph_mod = (ph_mod + period_h) % period_h
+        
+        if target == 'mod24':
+            out = ph_mod
+        elif target == 'rel_pm12':
+            half = period_h / 2.0
+            out = ((ph_mod + half) % period_h) - half
+        else:
+            raise ValueError(f"Unknown target: {target}")
+        
+        # scalar-safe return
+        if out.shape == ():
+            return float(out)
+        return out
+
+    def _compute_roi_animal_stats(self, phases_hours, period_h=24.0):
+        """Computes circular stats."""
+        phases_hours = np.asarray(phases_hours, dtype=float)
+        phases_hours = phases_hours[np.isfinite(phases_hours)]
+        if phases_hours.size == 0:
+            return {'mean_h': np.nan, 'std_h': np.nan, 'n_cells': 0, 'sem_h': np.nan, 
+                    'mean_rad': np.nan, 'mean_h_mod24': np.nan, 'R': np.nan}
+            
+        period = float(period_h)
+        
+        # Strict convention: normalize to [0, period) for trig
+        ph_mod24 = self._normalize_hours(phases_hours, period_h=period, target='mod24')
+        theta = (ph_mod24 / period) * 2.0 * np.pi # domain: [0, 2pi)
+        
+        # Circular mean/std must use matching bounds for the theta domain.
+        # Compute in [0, 2pi), then wrap the returned mean into [-pi, pi) for reporting.
+        mean_rad_0_2pi = circmean(theta, low=0.0, high=2.0*np.pi)
+        mean_rad = ((mean_rad_0_2pi + np.pi) % (2.0*np.pi)) - np.pi
+        
+        # Mean Hours Mod24 [0, 24)
+        mean_h_mod24 = (mean_rad / (2.0*np.pi)) * period
+        mean_h_mod24 = mean_h_mod24 % period
+        if mean_h_mod24 < 0: mean_h_mod24 += period
+        
+        # Mean Hours Display (Relative [-12, 12))
+        mean_h_display = self._normalize_hours(np.array([mean_h_mod24]), period_h=period, target='rel_pm12')[0]
+        
+        # Resultant Vector Length R
+        C = np.mean(np.cos(theta))
+        S = np.mean(np.sin(theta))
+        R = np.sqrt(C**2 + S**2)
+        
+        # Std Dev
+        std_rad = circstd(theta, low=0.0, high=2.0*np.pi)
+        std_h = (std_rad / (2.0*np.pi)) * period
+        
+        # SEM
+        sem_h = std_h / np.sqrt(len(theta))
+        
+        return {
+            'mean_h': mean_h_display,
+            'std_h': std_h,
+            'n_cells': len(theta),
+            'sem_h': sem_h,
+            'mean_rad': mean_rad,
+            'mean_h_mod24': mean_h_mod24,
+            'R': R
+        }
+
+    def _plot_mini_distribution(self, groups):
+        self.detail_fig.clear()
+        ax = self.detail_fig.add_subplot(111)
+        
+        # Assign colors robustly, independent of exact group naming
+        color_cycle = ax._get_lines.prop_cycler
+        group_to_color = {}
+        
+        import matplotlib.colors as mcolors
+        fallback_colors = list(mcolors.TABLEAU_COLORS.values())
+        
+        for g_name in sorted(groups.keys(), key=lambda x: (x != 'Control', str(x))):
+            if g_name not in group_to_color:
+                try:
+                    group_to_color[g_name] = next(color_cycle)['color']
+                except StopIteration:
+                    group_to_color[g_name] = fallback_colors[len(group_to_color) % len(fallback_colors)]
+            animals = groups[g_name]
+            color = group_to_color[g_name]
+            
+            g_phases = []
+            for a in animals:
+                g_phases.extend(a.get('raw_phases', []))
+            
+            if not g_phases: continue
+            g_phases = np.asarray(g_phases, dtype=float)
+            g_phases = g_phases[np.isfinite(g_phases)]
+            if g_phases.size == 0:
+                continue
+
+            # Normalized to Display Domain [-12, +12)
+            g_display = self._normalize_hours(g_phases, target='rel_pm12')
+            
+            # Histogram
+            ax.hist(
+                g_display,
+                bins=24,
+                range=(-12, 12),
+                alpha=0.45,
+                label=str(g_name),
+                color=color,
+                density=True
+            )
+            
+            # Vertical Mean line must reuse the table’s between-animal group summary if available
+            gs = getattr(self, '_current_detail_group_summaries', {}).get(g_name, {})
+            gm = gs.get("Group_Mean (h)", np.nan)
+            if np.isfinite(gm):
+                ax.axvline(float(gm), color=color, linestyle='--', linewidth=2)
+
+        ax.set_title("Pooled cell phases (visualization only)")
+        ax.set_xlabel("Phase (h, wrapped to [-12, +12))")
+        ax.set_xlim(-12, 12)
+        ax.legend(fontsize='small')
+        self.detail_canvas.draw()
 
     def get_export_data(self):
-        # Flatten stats to DF
         data = []
         for s in self.zone_stats:
             row = s.copy()
@@ -1717,31 +2014,57 @@ class RegionResultViewer(QtWidgets.QWidget):
             data.append(row)
         return pd.DataFrame(data), "region_stats.csv"
 
-    def export_full_cell_data(self):
-        """
-        Exports the massive raw cell dump.
-        """
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export Full Cell Data", "region_raw_cells.csv", "CSV (*.csv)")
-        if not path:
+    def export_current_detail_table(self):
+        """Exports the currently displayed detailed table."""
+        if not hasattr(self, 'current_detail_record') or not self.current_detail_record:
             return
             
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export Detail Table", 
+                                                        f"roi_{self.current_detail_record['id']}_details.csv", 
+                                                        "CSV (*.csv)")
+        if not path: return
+        
+        import csv
+        with open(path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            
+            # Metadata Header
+            rec = self.current_detail_record
+            writer.writerow(["ROI_ID", rec['id'], "ROI_NAME", rec['name'], "PHASE_DOMAIN", "rel_pm12", "PERIOD_H", "24.0"])
+            writer.writerow([]) # Blank row
+            
+            # Table Dump
+            for r in range(self.detail_table.rowCount()):
+                row_data = []
+                for c in range(self.detail_table.columnCount()):
+                    item = self.detail_table.item(r, c)
+                    text = item.text() if item else ""
+                    row_data.append(text)
+                writer.writerow(row_data)
+                
+    def export_full_cell_data(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export Full Cell Data", "region_raw_cells.csv", "CSV (*.csv)")
+        if not path: return
+            
         try:
-            # Build huge list
             all_rows = []
             for s in self.zone_stats:
                 z_id = s['id']
                 z_name = s['name']
                 for d in s['data']:
-                    # d['raw_phases'] is a list or array
                     for ph in d.get('raw_phases', []):
                         all_rows.append({
                             'Zone_ID': z_id,
                             'Zone_Name': z_name,
                             'Group': d['group'],
                             'Animal': d['animal'],
-                            'Cell_Phase_CT': ph
+                            'Group': d['group'],
+                            'Animal': d['animal'],
+                            'Cell_Phase_RelHours': float(self._normalize_hours(ph, target='rel_pm12')),
+                            'Phase_Domain': 'rel_pm12'
                         })
             
+            import pandas as pd
             df = pd.DataFrame(all_rows)
             df.to_csv(path, index=False)
             QtWidgets.QMessageBox.information(self, "Success", f"Exported {len(df)} cell records to:\n{path}")
