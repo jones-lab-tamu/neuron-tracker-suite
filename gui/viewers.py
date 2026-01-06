@@ -24,6 +24,37 @@ import cosinor as csn
 from scipy.ndimage import label as nd_label, gaussian_laplace, gaussian_filter, binary_fill_holes
 from gui.analysis import compute_median_window_frames, preprocess_for_rhythmicity
 
+def _normalize_hours_impl(phases_h, period_h=24.0, target='rel_pm12'):
+    """
+    Normalize phase hours to a specific domain.
+    target='mod24': [0, period)
+    target='rel_pm12': [-period/2, +period/2)
+    """
+    period_h = float(period_h)
+    if not np.isfinite(period_h) or period_h <= 0:
+        raise ValueError("period_h must be a positive finite number")
+        
+    ph = np.asarray(phases_h, dtype=float)
+    # Wrap robustly to [0, period)
+    ph_mod = np.mod(ph, period_h)
+    ph_mod = (ph_mod + period_h) % period_h
+    
+    if target == 'mod24':
+        out = ph_mod
+    elif target == 'rel_pm12':
+        half = period_h / 2.0
+        out = ((ph_mod + half) % period_h) - half
+    else:
+        raise ValueError(f"Unknown target: {target}")
+    
+    # scalar-safe return
+    if out.shape == ():
+        return float(out)
+    return out
+
+# Compatibility alias
+normalize_hours = _normalize_hours_impl
+
 # ------------------------------------------------------------
 # Visualization Viewers
 # ------------------------------------------------------------
@@ -1504,6 +1535,19 @@ class PhaseGradientViewer:
         ax.set_ylim(-12, 12) # Relative Phase Symmetric
         ax.set_xlim(0, 1)
 
+    def _normalize_hours(self, phases_h, period_h=24.0, target='rel_pm12'):
+        return _normalize_hours_impl(phases_h, period_h=period_h, target=target)
+
+    def _to_scalar_float_or_nan(self, x):
+        """Robust scalar converter for export fields."""
+        try:
+            val = x
+            if np.ndim(val) != 0: 
+                val = np.asarray(val).ravel()[0]
+            return float(val)
+        except (ValueError, TypeError, AttributeError, IndexError):
+            return np.nan
+
     def get_export_data(self):
         # Flatten data for export
         import pandas as pd
@@ -1528,6 +1572,10 @@ class PhaseGradientViewer:
             
             for i in range(len(s_vals)):
                 val = p_vals[i]
+                
+                # Compute scalar safe
+                mean_rel = self._to_scalar_float_or_nan(self._normalize_hours(val, target='rel_pm12'))
+
                 rows.append({
                     'Animal_ID': animal,
                     'Group': group,
@@ -1535,9 +1583,7 @@ class PhaseGradientViewer:
                     'Period_Hours_Used': period,
                     'Bin_Index': i,
                     'S_Coordinate': s_vals[i],
-                    'S_Coordinate': s_vals[i],
-                    'S_Coordinate': s_vals[i],
-                    'Mean_Phase_RelHours': float(self._normalize_hours(val, target='rel_pm12')), 
+                    'Mean_Phase_RelHours': mean_rel, 
                     'N_Cells_In_Bin': counts[i],
                     'Slope_Hours_Per_Unit': slope_h,
                     'Slope_Rad_Per_Unit': slope_rad,
@@ -1561,6 +1607,7 @@ class RegionResultViewer(QtWidgets.QWidget):
         self.zone_stats = zone_stats
         self.atlas_polys = atlas_polys_by_zone
         
+
         layout = QtWidgets.QVBoxLayout(self)
         
         self.tabs = QtWidgets.QTabWidget()
@@ -1624,6 +1671,51 @@ class RegionResultViewer(QtWidgets.QWidget):
         # Trigger selection of first row if rows exist
         if self.stats_table.rowCount() > 0:
              self.stats_table.selectRow(0)
+
+    def _ensure_table_item(self, table, row, col, text=None, allow_resize=True):
+        """
+        Ensure QTableWidget has a QTableWidgetItem at (row, col).
+        Guarantees return of a valid item or raises RuntimeError.
+        
+        If allow_resize is False, raises RuntimeError if row/col are out of bounds.
+        """
+        if row < 0 or col < 0:
+            raise RuntimeError(f"Invalid table coordinates: ({row}, {col})")
+            
+        if not allow_resize:
+            if row >= table.rowCount() or col >= table.columnCount():
+                raise RuntimeError(f"Table index out of bounds ({row}, {col}) and allow_resize=False")
+        else:
+            if row >= table.rowCount():
+                 table.setRowCount(row + 1)
+            if col >= table.columnCount():
+                table.setColumnCount(col + 1)
+            
+        # Item Creation
+        item = table.item(row, col)
+        if item is None:
+            item = QtWidgets.QTableWidgetItem()
+            table.setItem(row, col, item)
+            # Re-read key robustness step
+            item = table.item(row, col)
+            
+        if item is None:
+            raise RuntimeError(f"Failed to set QTableWidgetItem at ({row}, {col})")
+            
+        if text is not None:
+            item.setText(str(text))
+            
+        return item
+        
+    def _to_scalar_float_or_nan(self, x):
+        """Robust scalar converter for export fields."""
+        try:
+            val = x
+            if np.ndim(val) != 0: 
+                val = np.asarray(val).ravel()[0]
+            return float(val)
+        except (ValueError, TypeError, AttributeError, IndexError):
+            return np.nan
 
     def _draw_map(self):
         ax = self.fig.add_subplot(111)
@@ -1749,16 +1841,23 @@ class RegionResultViewer(QtWidgets.QWidget):
             
         # 2. Build Wide Table
         self.detail_table.clear()
-        self.detail_table.setColumnCount(0)
-        self.detail_table.setRowCount(0)
         
+        # Precompute required columns ONCE
+        max_animals = 0
+        if groups:
+            max_animals = max(len(g) for g in groups.values())
+        
+        # Columns: Metric (1) + Animals (max_animals) + Group Summary (1)
+        required_cols = 1 + max_animals + 1
+        self.detail_table.setColumnCount(required_cols)
+        self.detail_table.setRowCount(0)
+        self.detail_table.setSortingEnabled(False)
+
         metrics = ["Mean (h)", "Std (h)", "Count (N)", "SEM (h)", 
                    "Mean (rad)", "Mean (h, mod24)", "R (0-1)"]
         summary_metrics = ["Group_Mean (h)", "Group_Std (h)", "Group_N (Animals)", "Group_SEM (h)"]
         
         current_row = 0
-        total_cols = 0
-        self.detail_table.setSortingEnabled(False)
         
         for g_name in group_names:
             animals = sorted(groups[g_name], key=lambda x: str(x['animal']))
@@ -1766,26 +1865,32 @@ class RegionResultViewer(QtWidgets.QWidget):
             
             # Header Row for Group
             self.detail_table.insertRow(current_row)
-            self.detail_table.setItem(current_row, 0, QtWidgets.QTableWidgetItem(f"Group: {g_name}"))
+            # Safe styling pattern
+            it0 = self._ensure_table_item(self.detail_table, current_row, 0, text=f"Group: {g_name}", allow_resize=False)
             font = QtGui.QFont()
             font.setBold(True)
-            self.detail_table.item(current_row, 0).setFont(font)
-            self.detail_table.item(current_row, 0).setBackground(QtGui.QColor("#e0e0e0"))
+            it0.setFont(font)
+            it0.setBackground(QtGui.QColor("#e0e0e0"))
+            
+            # Clear stale columns in header row
+            for c_clear in range(1, required_cols):
+                 self._ensure_table_item(self.detail_table, current_row, c_clear, text="", allow_resize=False)
+            
             current_row += 1
             
             # Column Headers
             n_animals = len(animals)
-            needed_cols = 1 + n_animals + 1
-            if needed_cols > total_cols:
-                self.detail_table.setColumnCount(needed_cols)
-                total_cols = needed_cols
-                
+            
             labels = ["Metric"] + [str(a['animal']) for a in animals] + ["Group Summary"]
             self.detail_table.insertRow(current_row)
             for c, pwm in enumerate(labels):
-                it = QtWidgets.QTableWidgetItem(pwm)
+                it = self._ensure_table_item(self.detail_table, current_row, c, text=pwm, allow_resize=False)
                 it.setBackground(QtGui.QColor("#f0f0f0"))
-                self.detail_table.setItem(current_row, c, it)
+            
+            # Clear stale columns in label row
+            for c_clear in range(len(labels), required_cols):
+                self._ensure_table_item(self.detail_table, current_row, c_clear, text="", allow_resize=False)
+
             current_row += 1
             
             # Data Rows
@@ -1834,7 +1939,7 @@ class RegionResultViewer(QtWidgets.QWidget):
             # Fill Metrics
             for m in metrics:
                 self.detail_table.insertRow(current_row)
-                self.detail_table.setItem(current_row, 0, QtWidgets.QTableWidgetItem(m))
+                self._ensure_table_item(self.detail_table, current_row, 0, text=m, allow_resize=False)
                 
                 for i, stats in enumerate(animal_stats_list):
                     key_map = {
@@ -1850,21 +1955,33 @@ class RegionResultViewer(QtWidgets.QWidget):
                     else:
                         txt = f"{val:.2f}"
                         
-                    self.detail_table.setItem(current_row, 1+i, QtWidgets.QTableWidgetItem(txt))
+                    self._ensure_table_item(self.detail_table, current_row, 1+i, text=txt, allow_resize=False)
+                
+                # Clear stale columns in metric row
+                for c_clear in range(1 + n_animals, required_cols):
+                     self._ensure_table_item(self.detail_table, current_row, c_clear, text="", allow_resize=False)
                 
                 current_row += 1
                 
             # Fill Group Summaries
             for m in summary_metrics:
-                self.detail_table.insertRow(current_row)
-                self.detail_table.setItem(current_row, 0, QtWidgets.QTableWidgetItem(m))
+                summary_row = current_row
+                self.detail_table.insertRow(summary_row)
+                self._ensure_table_item(self.detail_table, summary_row, 0, text=m, allow_resize=False)
+
                 val = group_summary.get(m, np.nan)
                 if "N (" in m: txt = f"{int(val)}" if np.isfinite(val) else "0"
                 else: txt = f"{val:.2f}"
-                item = QtWidgets.QTableWidgetItem(txt)
-                item.setFont(font)
-                self.detail_table.setItem(current_row, n_animals + 1, item)
-                current_row += 1
+                
+                it_sum = self._ensure_table_item(self.detail_table, summary_row, n_animals + 1, text=txt, allow_resize=False)
+                it_sum.setFont(font)
+                
+                # Clear stale columns
+                for c_blk in range(1, n_animals + 1):
+                    self._ensure_table_item(self.detail_table, summary_row, c_blk, text="", allow_resize=False)
+                for c_clear in range(n_animals + 2, required_cols):
+                    self._ensure_table_item(self.detail_table, summary_row, c_clear, text="", allow_resize=False)
+                current_row = summary_row + 1
                 
             # Spacer
             self.detail_table.insertRow(current_row)
@@ -1874,32 +1991,7 @@ class RegionResultViewer(QtWidgets.QWidget):
         self._plot_mini_distribution(groups)
 
     def _normalize_hours(self, phases_h, period_h=24.0, target='rel_pm12'):
-        """
-        Normalize phase hours to a specific domain.
-        target='mod24': [0, period)
-        target='rel_pm12': [-period/2, +period/2)
-        """
-        period_h = float(period_h)
-        if not np.isfinite(period_h) or period_h <= 0:
-            raise ValueError("period_h must be a positive finite number")
-            
-        ph = np.asarray(phases_h, dtype=float)
-        # Wrap robustly to [0, period)
-        ph_mod = np.mod(ph, period_h)
-        ph_mod = (ph_mod + period_h) % period_h
-        
-        if target == 'mod24':
-            out = ph_mod
-        elif target == 'rel_pm12':
-            half = period_h / 2.0
-            out = ((ph_mod + half) % period_h) - half
-        else:
-            raise ValueError(f"Unknown target: {target}")
-        
-        # scalar-safe return
-        if out.shape == ():
-            return float(out)
-        return out
+        return _normalize_hours_impl(phases_h, period_h=period_h, target=target)
 
     def _compute_roi_animal_stats(self, phases_hours, period_h=24.0):
         """Computes circular stats."""
@@ -1955,7 +2047,12 @@ class RegionResultViewer(QtWidgets.QWidget):
         ax = self.detail_fig.add_subplot(111)
         
         # Assign colors robustly, independent of exact group naming
-        color_cycle = ax._get_lines.prop_cycler
+        import matplotlib.pyplot as plt
+        import itertools
+        # Use standard prop_cycle
+        prop_cycle = plt.rcParams['axes.prop_cycle']
+        color_cycle = itertools.cycle(prop_cycle)
+        
         group_to_color = {}
         
         import matplotlib.colors as mcolors
@@ -1965,7 +2062,7 @@ class RegionResultViewer(QtWidgets.QWidget):
             if g_name not in group_to_color:
                 try:
                     group_to_color[g_name] = next(color_cycle)['color']
-                except StopIteration:
+                except (StopIteration, KeyError):
                     group_to_color[g_name] = fallback_colors[len(group_to_color) % len(fallback_colors)]
             animals = groups[g_name]
             color = group_to_color[g_name]
@@ -1973,6 +2070,7 @@ class RegionResultViewer(QtWidgets.QWidget):
             g_phases = []
             for a in animals:
                 g_phases.extend(a.get('raw_phases', []))
+            
             
             if not g_phases: continue
             g_phases = np.asarray(g_phases, dtype=float)
@@ -2053,14 +2151,15 @@ class RegionResultViewer(QtWidgets.QWidget):
                 z_name = s['name']
                 for d in s['data']:
                     for ph in d.get('raw_phases', []):
+                        # Compute scalar safe
+                        cell_ph_rel = self._to_scalar_float_or_nan(self._normalize_hours(ph, target='rel_pm12'))
+
                         all_rows.append({
                             'Zone_ID': z_id,
                             'Zone_Name': z_name,
                             'Group': d['group'],
                             'Animal': d['animal'],
-                            'Group': d['group'],
-                            'Animal': d['animal'],
-                            'Cell_Phase_RelHours': float(self._normalize_hours(ph, target='rel_pm12')),
+                            'Cell_Phase_RelHours': cell_ph_rel,
                             'Phase_Domain': 'rel_pm12'
                         })
             
