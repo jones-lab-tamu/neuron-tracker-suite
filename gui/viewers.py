@@ -2179,14 +2179,29 @@ class RegionResultViewer(QtWidgets.QWidget):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Export Error", str(e))
 
-    def _build_animal_zone_summary_rows(self) -> list[dict]:
-        """Builds standardized list of dicts for animal-zone summary."""
+    def _build_animal_zone_summary_rows(self) -> tuple[list[dict], dict]:
+        """
+        Builds standardized list of dicts for animal-zone summary.
+        Returns (rows, diagnostics).
+        """
         if not hasattr(self, 'zone_stats') or not self.zone_stats:
-            return []
+            return [], {}
             
         all_rows = []
         import datetime
+        from collections import defaultdict
+        
         ts = datetime.datetime.now().isoformat()
+        
+        diag = {
+            'expected_pairs_seen': 0,
+            'rows_emitted': 0,
+            'rows_skipped': 0,
+            'skip_reasons': defaultdict(int),
+            'skipped_by_zone': defaultdict(int),
+            'emitted_by_zone': defaultdict(int),
+            'missing_keys_examples': []
+        }
         
         for s in self.zone_stats:
             z_id = s['id']
@@ -2196,16 +2211,102 @@ class RegionResultViewer(QtWidgets.QWidget):
             if 'data' not in s: continue
             
             for d in s['data']:
-                animal_id = d['animal']
-                group = d['group']
-                raw_phases = np.array(d.get('raw_phases', []), dtype=float)
+                diag['expected_pairs_seen'] += 1
+                missing_context = None
                 
-                # Strict finite filter
-                raw_phases = raw_phases[np.isfinite(raw_phases)]
+                # Robust key lookup
+                animal_id = d.get('animal') or d.get('Animal_ID', 'Unknown')
+                group = d.get('group') or d.get('Group', 'Unknown')
                 
-                # Reuse existing robust logic, explicit 24h as per GUI convention
-                stats = self._compute_roi_animal_stats(raw_phases, period_h=24.0)
+                # Detect pre-computed stats with robust key fallbacks
+                mean_rad = d.get('mean_rad') if d.get('mean_rad') is not None else d.get('Mean_Phase_Radians')
+                n_cells = d.get('n_cells') if d.get('n_cells') is not None else d.get('N_Cells')
+                r_val_raw = d.get('R') if d.get('R') is not None else d.get('R_Resultant')
                 
+                # Criteria: Finite mean_rad, Finite R, n_cells > 0
+                has_precomputed = (
+                    mean_rad is not None and np.isfinite(mean_rad) and 
+                    r_val_raw is not None and np.isfinite(r_val_raw) and 
+                    n_cells is not None and n_cells > 0
+                )
+                
+                stats = {}
+                fail_reason = None
+                
+                if has_precomputed:
+                     stats = {
+                         'n_cells': n_cells,
+                         'mean_h': d.get('mean_h', d.get('Mean_Phase_RelHours', np.nan)),
+                         'mean_h_mod24': d.get('mean_h_mod24', d.get('Mean_Phase_ModHours', np.nan)),
+                         'mean_rad': mean_rad,
+                         'R': r_val_raw
+                     }
+                else:
+                    # Fallback: Recompute from raw phases if available
+                    raw_phases = np.array(d.get('raw_phases', []), dtype=float)
+                    # Strict finite filter
+                    raw_phases = raw_phases[np.isfinite(raw_phases)]
+                    
+                    if raw_phases.size > 0:
+                        # Reuse existing robust logic, explicit 24h as per GUI convention
+                        stats = self._compute_roi_animal_stats(raw_phases, period_h=24.0)
+                        
+                        if stats.get('n_cells', 0) <= 0:
+                            fail_reason = "n_cells_zero_or_missing"
+                    else:
+                        if mean_rad is not None and not np.isfinite(mean_rad): 
+                            fail_reason = "nonfinite_mean_rad"
+                        elif 'raw_phases' not in d:
+                             # If raw_phases is missing, it implies we also failed precomputed check
+                             # Check if we were expecting precomputed but got partial/missing keys
+                             missing = []
+                             if mean_rad is None: missing.append("mean_rad")
+                             if r_val_raw is None: missing.append("R")
+                             if n_cells is None: missing.append("n_cells")
+                             
+                             if missing:
+                                 fail_reason = "missing_precomputed_keys"
+                                 missing_context = missing
+                             else:
+                                 # Keys are present but check failed. Determine why.
+                                 if n_cells is not None and n_cells <= 0:
+                                     fail_reason = "precomputed_invalid_n_cells"
+                                 elif r_val_raw is not None and not np.isfinite(r_val_raw):
+                                     fail_reason = "precomputed_nonfinite_R"
+                                 elif mean_rad is not None and not np.isfinite(mean_rad): 
+                                     fail_reason = "precomputed_nonfinite_mean_rad"
+                                 else:
+                                     fail_reason = "precomputed_present_but_invalid"
+                                 
+                                 missing_context = []
+
+                        else:
+                             fail_reason = "empty_raw_phases_after_filter"
+
+                if fail_reason:
+                    diag['rows_skipped'] += 1
+                    diag['skip_reasons'][fail_reason] += 1
+                    diag['skipped_by_zone'][z_name] += 1
+                    
+                    if len(diag['missing_keys_examples']) < 5:
+                        ex = {
+                            'Zone_Name': z_name,
+                            'Animal_ID': animal_id,
+                            'Group': group,
+                            'reason': fail_reason,
+                            'missing_keys': missing_context,
+                            'keys_present': list(d.keys())
+                        }
+                        diag['missing_keys_examples'].append(ex)
+                    continue
+                
+                # Final Validity Check
+                if stats.get('n_cells', 0) == 0:
+                     diag['rows_skipped'] += 1
+                     diag['skip_reasons']['n_cells_zero_or_missing'] += 1
+                     diag['skipped_by_zone'][z_name] += 1
+                     continue
+
                 # Compute Circular SD from R to Ensure Correctness
                 r_val = stats.get('R', np.nan)
                 if np.isfinite(r_val) and r_val > 0 and r_val <= 1.0:
@@ -2228,11 +2329,20 @@ class RegionResultViewer(QtWidgets.QWidget):
                     'Period_Hours_Used': 24.0,
                     'Timestamp_Exported': ts
                 })
-        return all_rows
+                
+                diag['rows_emitted'] += 1
+                diag['emitted_by_zone'][z_name] += 1
+        
+        # Convert defaultdicts to regular dicts
+        diag['skip_reasons'] = dict(diag['skip_reasons'])
+        diag['skipped_by_zone'] = dict(diag['skipped_by_zone'])
+        diag['emitted_by_zone'] = dict(diag['emitted_by_zone'])
+        
+        return all_rows, diag
 
-    def _build_animal_zone_summary_df(self) -> pd.DataFrame:
-        """Returns the summary data as a DataFrame with guaranteed columns."""
-        rows = self._build_animal_zone_summary_rows()
+    def _build_animal_zone_summary_df(self) -> tuple[pd.DataFrame, dict]:
+        """Returns (df, diagnostic_dict)."""
+        rows, diag = self._build_animal_zone_summary_rows()
         df = pd.DataFrame(rows)
         
         cols = ['Animal_ID', 'Group', 'Zone_ID', 'Zone_Name', 'N_Cells', 
@@ -2249,14 +2359,28 @@ class RegionResultViewer(QtWidgets.QWidget):
         if df.empty and len(rows) == 0:
              df = pd.DataFrame(columns=cols)
              
-        return df
+        return df, diag
 
     def _export_animal_zone_summary(self):
         """Exports per-animal per-zone summary statistics for external analysis."""
-        df = self._build_animal_zone_summary_df()
+        df, diag = self._build_animal_zone_summary_df()
         
         if df.empty:
-            QtWidgets.QMessageBox.information(self, "Export Info", "No valid region stats available to export.")
+            msg = [
+                "No valid region stats available to export.",
+                "",
+                "Diagnostics:",
+                f"- Pairs Visited: {diag.get('expected_pairs_seen', 0)}",
+                f"- Rows Skipped: {diag.get('rows_skipped', 0)}",
+                f"- Rows Emitted: {diag.get('rows_emitted', 0)}",
+                "",
+                "Top Skip Reasons:"
+            ]
+            reasons = sorted(diag.get('skip_reasons', {}).items(), key=lambda x: x[1], reverse=True)
+            for r, c in reasons[:3]:
+                msg.append(f"  - {r}: {c}")
+            
+            QtWidgets.QMessageBox.information(self, "Export Info", "\n".join(msg))
             return
 
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export AnimalxZone Summary", 
@@ -2277,11 +2401,46 @@ class RegionResultViewer(QtWidgets.QWidget):
              return
              
         # Build Data
-        df = self._build_animal_zone_summary_df()
+        df, diag = self._build_animal_zone_summary_df()
+        
         if df.empty:
-             QtWidgets.QMessageBox.information(self, "Stats Info", "Summary data is empty. Cannot run stats.")
+             msg = ["Summary data is empty. Cannot run stats.", ""]
+             msg.append(f"Visited: {diag.get('expected_pairs_seen', 0)}, Skipped: {diag.get('rows_skipped', 0)}")
+             QtWidgets.QMessageBox.information(self, "Stats Info", "\n".join(msg))
              return
              
+        # Warning if data was dropped
+        if diag.get('rows_skipped', 0) > 0:
+            msg = [
+                "Warning: Some animal/zone data rows were skipped/incomplete.",
+                "They will be excluded from the interaction test.",
+                "",
+                f"Data Included: {len(df)} rows",
+                f"Data Skipped: {diag['rows_skipped']} rows",
+                "",
+                "Top Skipped Zones:"
+            ]
+            
+            # Sort zones by skip count descending
+            skipped_zones = sorted(diag['skipped_by_zone'].items(), key=lambda x: x[1], reverse=True)
+            for z, count in skipped_zones[:5]:
+                msg.append(f"  - {z}: {count}")
+                
+            msg.append("")
+            msg.append("Top Reasons:")
+            reasons = sorted(diag['skip_reasons'].items(), key=lambda x: x[1], reverse=True)
+            for r, count in reasons[:3]:
+                msg.append(f"  - {r}: {count}")
+                
+            msg.append("")
+            msg.append("Continue with remaining valid data?")
+            
+            ans = QtWidgets.QMessageBox.warning(self, "Data Integrity Warning", "\n".join(msg), 
+                                                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+            
+            if ans != QtWidgets.QMessageBox.Yes:
+                return
+
         # Get Parameters
         # Simple Input Dialogs
         nperm, ok1 = QtWidgets.QInputDialog.getInt(self, "Stats Params", "Number of Permutations:", 10000, 100, 500000)

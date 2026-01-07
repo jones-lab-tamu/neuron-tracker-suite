@@ -176,7 +176,14 @@ def run_interaction_test_from_df(
             })
             
     if len(valid_zones) < 2:
-        raise ValueError(f"Need at least 2 valid zones (>= {min_animals_zone} animals/group) for interaction test. Found {len(valid_zones)}.")
+        msg = [f"Need at least 2 valid zones (>= {min_animals_zone} animals/group) for interaction test. Found {len(valid_zones)}: {valid_zones}"]
+        if dropped_zones:
+            msg.append("Dropped Zones:")
+            for d in dropped_zones[:10]: # Limit to first 10 to avoid spam
+                msg.append(f"  - {d['Zone_Name']}: {d['reason']} (Counts: {d['counts']})")
+            if len(dropped_zones) > 10:
+                msg.append(f"  ... and {len(dropped_zones)-10} more.")
+        raise ValueError("\n".join(msg))
         
     # Filter DF to valid zones only
     df_params = df_params[df_params['Zone_Name'].isin(valid_zones)].copy()

@@ -579,10 +579,19 @@ class GroupViewPanel(QtWidgets.QWidget):
                     m_rad = circmean(rads, low=-np.pi, high=np.pi)
                     m_val = (m_rad / (2 * np.pi)) * 24.0
                     
+                    # Compute Resultant Vector Length R
+                    C = np.mean(np.cos(rads))
+                    S = np.mean(np.sin(rads))
+                    R = np.sqrt(C**2 + S**2)
+                    
                     zone_record['data'].append({
                         'animal': animal,
                         'group': subset['Group'].iloc[0],
                         'mean': m_val,
+                        'mean_h': m_val,          # Viewers expect this
+                        'mean_rad': m_rad,
+                        'mean_h_mod24': m_val % 24.0,
+                        'R': R,
                         'n_cells': len(valid_phases),
                         'raw_phases': valid_phases.tolist()
                     })
