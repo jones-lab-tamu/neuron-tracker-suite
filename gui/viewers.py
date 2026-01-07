@@ -2204,8 +2204,43 @@ class RegionResultViewer(QtWidgets.QWidget):
         }
         
         for s in self.zone_stats:
-            z_id = s['id']
-            z_name = s['name']
+            # Zone identity
+            # IMPORTANT: Different parts of the GUI may store the human-readable ROI name under different keys.
+            # We must not assume 'name' is populated.
+            z_id = s.get('id', None)
+            auto_named = False
+
+            # Robust label fallback order:
+            # 1) name
+            # 2) label
+            # 3) roi_name
+            # 4) title
+            # 5) str(id)
+            z_name = (
+                (s.get('name') or "").strip()
+                or (s.get('label') or "").strip()
+                or (s.get('roi_name') or "").strip()
+                or (s.get('title') or "").strip()
+            )
+
+            # Hard guarantee: Zone_Name cannot be empty, else all zones collapse to '' and stats fail.
+            if not z_name or not str(z_name).strip():
+                if z_id is None:
+                    z_name = "Zone_Unknown"
+                else:
+                    z_name = f"Zone_{z_id}"
+                auto_named = True
+
+            # Also guarantee Zone_ID exists and is stable
+            if z_id is None:
+                # If id is missing, use the resolved name as a stable identifier
+                z_id = z_name
+                auto_named = True
+
+            # Optional: warn once per run if we had to synthesize names
+            # (Do NOT spam per-row warnings)
+            if auto_named:
+                diag['skip_reasons']['auto_named_zone'] += 1
             
             # Check if 'data' is present
             if 'data' not in s: continue
