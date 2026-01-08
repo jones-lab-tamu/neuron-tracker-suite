@@ -99,6 +99,10 @@ class GroupViewPanel(QtWidgets.QWidget):
         self.grad_mode_combo.addItems(["DV (Y-normalized)", "Phase Axis (polyline)"])
         param_layout.addRow("Gradient Coordinate:", self.grad_mode_combo)
         
+        self.collapse_gradient_cb = QtWidgets.QCheckBox("Collapse bilateral axes (Left+Right)")
+        self.collapse_gradient_cb.setToolTip("If checked, bilateral gradients are also pooled into a single 'Collapsed' gradient (requires 2 Phase Axes).")
+        param_layout.addRow(self.collapse_gradient_cb)
+        
         b.addWidget(param_box)        
         
         region_box = QtWidgets.QGroupBox("Regional Analysis Setup")
@@ -824,6 +828,9 @@ class GroupViewPanel(QtWidgets.QWidget):
             axes_config = [] # List of filtering/config dicts
 
             if mode == "DV (Y-normalized)":
+                self.collapse_gradient_cb.setChecked(False)
+                self.collapse_gradient_cb.setEnabled(False)
+                
                 func, _ = setup_dv_func()
                 if not func: return
                 axes_config.append({
@@ -869,6 +876,9 @@ class GroupViewPanel(QtWidgets.QWidget):
 
                 if not parsed_axes:
                      self.mw.log_message("Warning: No valid Phase Axis found. Switching to DV mode.")
+                     self.collapse_gradient_cb.setChecked(False)
+                     self.collapse_gradient_cb.setEnabled(False)
+                     
                      func, _ = setup_dv_func()
                      if not func: return
                      axes_config.append({
@@ -880,6 +890,9 @@ class GroupViewPanel(QtWidgets.QWidget):
                 
                 elif len(parsed_axes) == 1:
                      # Single Axis
+                     self.collapse_gradient_cb.setChecked(False)
+                     self.collapse_gradient_cb.setEnabled(False)
+                     
                      poly = parsed_axes[0]['poly']
                      axes_config.append({
                          'id': 'Primary',
@@ -890,19 +903,36 @@ class GroupViewPanel(QtWidgets.QWidget):
 
                 elif len(parsed_axes) == 2:
                     # Bilateral
+                    self.collapse_gradient_cb.setEnabled(True)
+                    
                     # Sort axes by centroid X
                     parsed_axes.sort(key=lambda a: a['cx'])
                     left_axis = parsed_axes[0]
                     right_axis = parsed_axes[1]
                     
                     self.mw.log_message(f"Bilateral Axis Mode: Left Axis (cx={left_axis['cx']:.1f}), Right Axis (cx={right_axis['cx']:.1f})")
+                    
+                    # Pre-compute s-flips (Dorsal-to-Ventral normalization)
+                    # s=0 should be Dorsal (smaller Y). If start.y > end.y, start is Ventral -> flip.
+                    # Use tolerance to avoid unstable flipping on horizontal lines.
+                    flip_eps = 1e-6
+                    l_poly = left_axis['poly']
+                    l_flip = (l_poly[0, 1] - l_poly[-1, 1]) > flip_eps
+                    
+                    r_poly = right_axis['poly']
+                    r_flip = (r_poly[0, 1] - r_poly[-1, 1]) > flip_eps
+                    
+                    if self.collapse_gradient_cb.isChecked():
+                        self.mw.log_message(f"Collapsed Mode Active: S-Flip Flags -> Left: {l_flip}, Right: {r_flip} (Criteria: Start.Y > End.Y)")
 
                     axes_config.append({
                         'mode': 'Bilateral',
-                        'left_poly': left_axis['poly'],
-                        'right_poly': right_axis['poly'],
-                        'left_func': lambda pts, p=left_axis['poly']: project_points_to_polyline(pts, p),
-                        'right_func': lambda pts, p=right_axis['poly']: project_points_to_polyline(pts, p)
+                        'left_poly': l_poly,
+                        'right_poly': r_poly,
+                        'left_func': lambda pts, p=l_poly: project_points_to_polyline(pts, p),
+                        'right_func': lambda pts, p=r_poly: project_points_to_polyline(pts, p),
+                        'left_flip': l_flip,
+                        'right_flip': r_flip
                     })
 
                 else:
@@ -910,6 +940,9 @@ class GroupViewPanel(QtWidgets.QWidget):
                      msg = f"Found {n_valid_axes} valid Phase Axes (of {n_phase_axis_rois_total} Phase Axis ROIs).\nPlease use exactly 1 (unilateral) or 2 (bilateral) Phase Axes."
                      QtWidgets.QMessageBox.critical(self, "Gradient Analysis Error", msg)
                      self.mw.log_message(msg)
+                     
+                     self.collapse_gradient_cb.setChecked(False)
+                     self.collapse_gradient_cb.setEnabled(False)
                      return
 
             gradient_data = []
@@ -918,6 +951,7 @@ class GroupViewPanel(QtWidgets.QWidget):
             period_for_slope = 24.0
             
             ambiguous_total = 0
+            collapse_enabled = self.collapse_gradient_cb.isChecked()
             
             for animal in animals:
                 subset = df[df['Animal'] == animal]
@@ -943,21 +977,59 @@ class GroupViewPanel(QtWidgets.QWidget):
                              ambiguous_total += n_amb
                              self.mw.log_message(f"{animal}: dropped {n_amb} ambiguous points (equal distance to both axes).")
                          
-                         # Compute Left
-                         if np.sum(left_mask) > 0:
-                             res = compute_gradient_stats(
-                                 animal, points_all[left_mask], phases_all[left_mask],
-                                 cfg['left_func'], 'Left', group_name, mode, min_cells_bin, period_for_slope
-                             )
-                             gradient_data.append(res)
-                             
-                         # Compute Right
-                         if np.sum(right_mask) > 0:
-                             res = compute_gradient_stats(
-                                 animal, points_all[right_mask], phases_all[right_mask],
-                                 cfg['right_func'], 'Right', group_name, mode, min_cells_bin, period_for_slope
-                             )
-                             gradient_data.append(res)
+                          # Compute Left
+                          # Note: store points/phases/s for potential collapse
+                          pts_left = points_all[left_mask]
+                          phs_left = phases_all[left_mask]
+                          
+                          if np.sum(left_mask) > 0:
+                              res = compute_gradient_stats(
+                                  animal, pts_left, phs_left,
+                                  cfg['left_func'], 'Left', group_name, mode, min_cells_bin, period_for_slope
+                              )
+                              gradient_data.append(res)
+                              
+                          # Compute Right
+                          pts_right = points_all[right_mask]
+                          phs_right = phases_all[right_mask]
+
+                          if np.sum(right_mask) > 0:
+                              res = compute_gradient_stats(
+                                  animal, pts_right, phs_right,
+                                  cfg['right_func'], 'Right', group_name, mode, min_cells_bin, period_for_slope
+                              )
+                              gradient_data.append(res)
+                              
+                          # Compute Collapsed (Optional)
+                          if collapse_enabled and (len(pts_left) > 0 or len(pts_right) > 0):
+                              # 1. Compute Raw S
+                              s_left = cfg['left_func'](pts_left) if len(pts_left) > 0 else np.array([])
+                              s_right = cfg['right_func'](pts_right) if len(pts_right) > 0 else np.array([])
+                              s_left = np.clip(s_left, 0.0, 1.0)
+                              s_right = np.clip(s_right, 0.0, 1.0)
+                              
+                              # 2. Apply S-Flips (pre-calculated)
+                              if cfg['left_flip']:
+                                  s_left = 1.0 - s_left
+                              if cfg['right_flip']:
+                                  s_right = 1.0 - s_right
+                              
+                              # 3. Pool
+                              s_pooled = np.concatenate([s_left, s_right])
+                              pts_pooled = np.concatenate([pts_left, pts_right]) # Just for len/shape, func ignored
+                              phs_pooled = np.concatenate([phs_left, phs_right])
+                              
+                              # Defensive Check
+                              if len(s_pooled) != len(phs_pooled):
+                                  raise ValueError("Collapsed gradient internal error: len(s_pooled) != len(phs_pooled)")
+                              
+                              # 4. Compute Stats from Pooled Data
+                              # We pass a dummy identity func for s because we already computed s_pooled
+                              res_coll = compute_gradient_stats(
+                                  animal, pts_pooled, phs_pooled,
+                                  lambda p: s_pooled, 'Collapsed', group_name, mode, min_cells_bin, period_for_slope
+                              )
+                              gradient_data.append(res_coll)
                              
                     else:
                         # Single or DV
