@@ -1060,6 +1060,8 @@ class GroupViewPanel(QtWidgets.QWidget):
 
     def export_current_data(self):
         current_tab = self.mw.vis_tabs.currentWidget()
+        
+        # Branch 1: Region Stats Export
         if current_tab == getattr(self.mw, 'region_tab', None):
              viewer = current_tab.findChild(RegionResultViewer)
              if viewer:
@@ -1068,63 +1070,73 @@ class GroupViewPanel(QtWidgets.QWidget):
                  if path:
                      df.to_csv(path, index=False)
                      self.mw.log_message(f"Saved to {path}")
-                  
-                     # New Feature: Grid Bin Summary Export
-                     self.mw.log_message(f"Grid export columns: {list(df.columns)}")
-                     
-                     def _find_col(candidates):
-                         for c in candidates:
-                             if c in df.columns: return c
-                         return None
+             else:
+                 self.mw.log_message("Region Stats export unavailable: RegionResultViewer not found.")
+             return
 
-                     # Robust column mapping
-                     col_x = 'Grid_X_Index'
-                     col_y = 'Grid_Y_Index'
-                     col_grp = 'Group'
-                     
-                     # 1. Animal Column Candidates
-                     anim_cands = ['Source_Animal', 'Animal', 'Animal_ID', 'SourceAnimal']
-                     col_anim = _find_col(anim_cands)
-                     
-                     # 2. Phase Column Candidates
-                     # Note: Phase_CT is treated as hours here if present, assuming relative
-                     phase_cands = ['Relative_Phase_Hours', 'Rel_Phase_Animal', 'Rel_Phase_Control', 'Rel_Phase', 'Phase_CT']
-                     col_phase = _find_col(phase_cands)
-                     
-                     # Check requirements
-                     missing_cols = []
-                     if col_x not in df.columns: missing_cols.append(col_x)
-                     if col_y not in df.columns: missing_cols.append(col_y)
-                     if col_grp not in df.columns: missing_cols.append(col_grp)
-                     if not col_anim: missing_cols.append(f"Animal ({'|'.join(anim_cands)})")
-                     if not col_phase: missing_cols.append(f"Phase ({'|'.join(phase_cands)})")
-                     
-                     if not missing_cols:
-                         try:
-                             # Create normalized DF for summary
-                             norm_df = pd.DataFrame()
-                             norm_df['Grid_X_Index'] = df[col_x]
-                             norm_df['Grid_Y_Index'] = df[col_y]
-                             norm_df['Group'] = df[col_grp]
-                             norm_df['Source_Animal'] = df[col_anim]
-                             norm_df['Relative_Phase_Hours'] = df[col_phase]
-                             
-                             if 'Phase_Domain' in df.columns:
-                                 norm_df['Phase_Domain'] = df['Phase_Domain']
+        # Branch 2: General Visualization Export (e.g. Group Map, Grid Analysis)
+        viewer = self.mw.visualization_widgets.get(current_tab)
+        if viewer and hasattr(viewer, 'get_export_data'):
+             df, fname = viewer.get_export_data()
+             path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export", fname, "CSV (*.csv)")
+             if path:
+                 df.to_csv(path, index=False)
+                 self.mw.log_message(f"Saved to {path}")
 
-                             summary_df = self._compute_grid_bin_summary(norm_df)
-                             
-                             base_root, ext = os.path.splitext(path)
-                             summary_path = f"{base_root}_grid_bin_summary{ext}"
-                             summary_df.to_csv(summary_path, index=False)
-                             
-                             self.mw.log_message(f"Saved Grid Bin Summary to {summary_path} (shape: {summary_df.shape})")
-                         except Exception as e:
-                              self.mw.log_message(f"Error generating Grid Bin Summary: {e}")
-                              import traceback
-                              self.mw.log_message(traceback.format_exc())
-                     else:
-                         self.mw.log_message(f"Grid Bin Summary NOT generated, missing columns: {missing_cols}")
+                 # New Feature: Grid Bin Summary Export
+                 # Only trigger if the columns look like grid analysis
+                 # Silent detection first
+                 
+                 def _find_col(candidates):
+                     for c in candidates:
+                         if c in df.columns: return c
+                     return None
+
+                 col_x = 'Grid_X_Index'
+                 col_y = 'Grid_Y_Index'
+                 col_grp = 'Group'
+                 
+                 anim_cands = ['Source_Animal', 'Animal', 'Animal_ID', 'SourceAnimal']
+                 col_anim = _find_col(anim_cands)
+                 
+                 phase_cands = ['Relative_Phase_Hours', 'Rel_Phase_Animal', 'Rel_Phase_Control', 'Rel_Phase', 'Phase_CT']
+                 col_phase = _find_col(phase_cands)
+                 
+                 # Strict requirements for grid summary
+                 missing_cols = []
+                 if col_x not in df.columns: missing_cols.append(col_x)
+                 if col_y not in df.columns: missing_cols.append(col_y)
+                 if col_grp not in df.columns: missing_cols.append(col_grp)
+                 if not col_anim: missing_cols.append("Animal")
+                 if not col_phase: missing_cols.append("Phase")
+                 
+                 # If valid grid data, proceed to summary
+                 if not missing_cols:
+                     self.mw.log_message(f"Grid export detected, generating summary...")
+                     try:
+                         # Create normalized DF for summary
+                         norm_df = pd.DataFrame()
+                         norm_df['Grid_X_Index'] = df[col_x]
+                         norm_df['Grid_Y_Index'] = df[col_y]
+                         norm_df['Group'] = df[col_grp]
+                         norm_df['Source_Animal'] = df[col_anim]
+                         norm_df['Relative_Phase_Hours'] = df[col_phase]
+                         
+                         if 'Phase_Domain' in df.columns:
+                             norm_df['Phase_Domain'] = df['Phase_Domain']
+
+                         summary_df = self._compute_grid_bin_summary(norm_df)
+                         
+                         base_root, ext = os.path.splitext(path)
+                         summary_path = f"{base_root}_grid_bin_summary{ext}"
+                         summary_df.to_csv(summary_path, index=False)
+                         
+                         self.mw.log_message(f"Saved Grid Bin Summary to {summary_path} (shape: {summary_df.shape})")
+                     except Exception as e:
+                          self.mw.log_message(f"Error generating Grid Bin Summary: {e}")
+                          import traceback
+                          self.mw.log_message(traceback.format_exc())
+             return
 
     def _compute_grid_bin_summary(self, df):
         """
