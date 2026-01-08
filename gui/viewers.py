@@ -1514,9 +1514,17 @@ class PhaseGradientViewer:
             lw = 1.0
             
             # Label includes Animal ID and Slope
-            label = f"{d['animal']} ({grp})"
+            label_parts = [d['animal']]
+            axis_lbl = d.get('axis_label')
+            if axis_lbl and axis_lbl not in ['Primary', 'DV', 'DV (Y-normalized)']:
+                label_parts.append(f"({axis_lbl})")
+            
+            label_parts.append(f"({grp})")
+            
             if np.isfinite(d.get('slope_hours', np.nan)):
-                 label += f" [Slope: {d['slope_hours']:+.2f}h/u]"
+                 label_parts.append(f"[Slope: {d['slope_hours']:+.2f}h/u]")
+            
+            label = " ".join(label_parts)
             
             ax.plot(s, ph, marker='o', markersize=4, linestyle='-', color=color, alpha=alpha, linewidth=lw, label=label)
             
@@ -1578,7 +1586,9 @@ class PhaseGradientViewer:
 
                 rows.append({
                     'Animal_ID': animal,
+                    'Animal_ID': animal,
                     'Group': group,
+                    'Axis_Label': entry.get('axis_label', 'Primary'),
                     'Gradient_Mode': mode,
                     'Period_Hours_Used': period,
                     'Bin_Index': i,

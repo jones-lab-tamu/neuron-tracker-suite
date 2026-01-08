@@ -733,45 +733,34 @@ class GroupViewPanel(QtWidgets.QWidget):
                     return np.clip(s, 0.0, 1.0)
                 return f, (y_min, y_max)
 
-            if mode == "DV (Y-normalized)":
-                func, _ = setup_dv_func()
-                if not func: return
-                s_func = func
+            # Helpers
+            def get_polyline_dists(points, poly):
+                """Compute min distance from each point to the polyline."""
+                dists = np.full(len(points), np.inf)
+                if len(poly) < 2: return dists
                 
-            else:
-                # Phase Axis Mode
-                axis_rois = [r for r in atlas_data if r.get('mode') == 'Phase Axis']
-                
-                if not axis_rois:
-                     self.mw.log_message("Warning: No Phase Axis found. Switching to DV mode.")
-                     func, _ = setup_dv_func()
-                     if not func: return
-                     s_func = func
-                     mode = "DV (Y-normalized)"
-                
-                else:
-                    if len(axis_rois) > 1:
-                         self.mw.log_message("Warning: Multiple Phase Axes found. Using the first one.")
+                for i in range(len(poly) - 1):
+                    A = poly[i]
+                    B = poly[i+1]
+                    AB = B - A
+                    sq_len = np.dot(AB, AB)
+                    if sq_len == 0:
+                        d = np.linalg.norm(points - A, axis=1)
+                        dists = np.minimum(dists, d)
+                        continue
                     
-                    axis_poly = np.array(axis_rois[0]['path_vertices'])
-                    def get_s_axis(points):
-                        return project_points_to_polyline(points, axis_poly)
-                    s_func = get_s_axis
+                    AP = points - A
+                    t = np.sum(AP * AB, axis=1) / sq_len
+                    t = np.clip(t, 0.0, 1.0)
+                    C = A + np.outer(t, AB)
+                    d = np.linalg.norm(points - C, axis=1)
+                    dists = np.minimum(dists, d)
+                return dists
 
-            gradient_data = []
-            animals = df['Animal'].unique()
-            min_cells_bin = 5 
-            
-            # Period for slope calculation (24.0h fixed per requirements)
-            period_for_slope = 24.0
-            
-            for animal in animals:
-                subset = df[df['Animal'] == animal]
-                points = subset[['X', 'Y']].values
-                phases = subset['Rel_Phase'].values
-                group_name = subset['Group'].iloc[0] 
-                
+            def compute_gradient_stats(animal, points, phases, s_func, axis_label, group_name, mode, min_cells_bin, period_for_slope):
+                """Computes binned stats and slope for a subset of points/phases. Pure function."""
                 s_vals = s_func(points)
+                s_vals = np.clip(s_vals, 0.0, 1.0) # Ensure s is valid
                 
                 bins = np.linspace(0, 1, 11)
                 bin_centers = (bins[:-1] + bins[1:]) / 2
@@ -779,17 +768,9 @@ class GroupViewPanel(QtWidgets.QWidget):
                 binned_counts = []
                 valid_centers_for_slope = []
                 valid_phases_for_slope = [] # in hours
-                
-                # Careful binning to include s=1.0 in last bin
-                # digitize returns 1..N
-                # we want 0..N-1
-                # right=False (default): [bins[i], bins[i+1])
-                # Special handle 1.0
-                
-                # Simple loop is robust
+
                 for k in range(len(bins)-1):
                     low, high = bins[k], bins[k+1]
-                    # Inclusive for last bin
                     if k == len(bins)-2:
                         mask = (s_vals >= low) & (s_vals <= high)
                     else:
@@ -800,10 +781,9 @@ class GroupViewPanel(QtWidgets.QWidget):
                     
                     if n_cells >= min_cells_bin:
                         p_bin = phases[mask]
-                        # Circular Mean
-                        rads = (p_bin / 24.0) * 2 * np.pi
+                        rads = (p_bin / period_for_slope) * 2 * np.pi
                         m_rad = circmean(rads, low=-np.pi, high=np.pi)
-                        m_h = (m_rad / (2 * np.pi)) * 24.0
+                        m_h = (m_rad / (2 * np.pi)) * period_for_slope
                         binned_phases.append(m_h)
                         
                         valid_centers_for_slope.append(bin_centers[k])
@@ -811,13 +791,12 @@ class GroupViewPanel(QtWidgets.QWidget):
                     else:
                         binned_phases.append(np.nan)
                 
-                # Slope Calculation
                 slope_h = np.nan
                 slope_rad = np.nan
                 r_val = np.nan
                 
                 if len(valid_centers_for_slope) >= 3:
-                     # Unwrap
+                     # Unwrap for slope
                      v_phases = np.array(valid_phases_for_slope)
                      rads = (v_phases / period_for_slope) * 2 * np.pi
                      unwrapped_rads = np.unwrap(rads)
@@ -826,13 +805,12 @@ class GroupViewPanel(QtWidgets.QWidget):
                      res = linregress(x_s, unwrapped_rads)
                      slope_rad = res.slope
                      r_val = res.rvalue
-                     
-                     # Convert slope back to hours/unit
                      slope_h = slope_rad * (period_for_slope / (2 * np.pi))
                 
-                gradient_data.append({
+                return {
                     'animal': animal,
                     'group': group_name,
+                    'axis_label': axis_label,
                     's': bin_centers,
                     'phases': np.array(binned_phases),
                     'counts': np.array(binned_counts),
@@ -841,7 +819,157 @@ class GroupViewPanel(QtWidgets.QWidget):
                     'r_value': r_val,
                     'mode': mode,
                     'period': period_for_slope
+                }
+
+            axes_config = [] # List of filtering/config dicts
+
+            if mode == "DV (Y-normalized)":
+                func, _ = setup_dv_func()
+                if not func: return
+                axes_config.append({
+                    'id': 'DV',
+                    'func': func,
+                    'mode': 'DV'
                 })
+                
+            else:
+                # Phase Axis Mode
+                axis_rois = [r for r in atlas_data if r.get('mode') == 'Phase Axis']
+                n_phase_axis_rois_total = len(axis_rois)
+                
+                # Robust parsing
+                parsed_axes = []
+                for roi in axis_rois:
+                    verts = roi.get('path_vertices', None)
+                    if verts is None: continue
+                    
+                    try:
+                        poly = np.asarray(verts, dtype=float)
+                    except (ValueError, TypeError):
+                        continue
+                        
+                    if poly.ndim != 2 or poly.shape[0] < 2 or poly.shape[1] < 2:
+                        continue
+                        
+                    # Truncate to first 2 columns (X, Y) if needed
+                    if poly.shape[1] > 2:
+                        poly = poly[:, :2]
+                    
+                    if not np.all(np.isfinite(poly)):
+                        continue
+                        
+                    centroid_x = np.mean(poly[:, 0])
+                    parsed_axes.append({'poly': poly, 'cx': centroid_x})
+
+                n_valid_axes = len(parsed_axes)
+                n_invalid_axes = n_phase_axis_rois_total - n_valid_axes
+                
+                if n_invalid_axes > 0:
+                    self.mw.log_message(f"Gradient: ignored {n_invalid_axes}/{n_phase_axis_rois_total} Phase Axis ROIs (invalid path_vertices).")
+
+                if not parsed_axes:
+                     self.mw.log_message("Warning: No valid Phase Axis found. Switching to DV mode.")
+                     func, _ = setup_dv_func()
+                     if not func: return
+                     axes_config.append({
+                         'id': 'DV',
+                         'func': func,
+                         'mode': 'DV'
+                     })
+                     mode = "DV (Y-normalized)"
+                
+                elif len(parsed_axes) == 1:
+                     # Single Axis
+                     poly = parsed_axes[0]['poly']
+                     axes_config.append({
+                         'id': 'Primary',
+                         'func': lambda pts, p=poly: project_points_to_polyline(pts, p),
+                         'mode': 'Single',
+                         'poly': poly
+                     })
+
+                elif len(parsed_axes) == 2:
+                    # Bilateral
+                    # Sort axes by centroid X
+                    parsed_axes.sort(key=lambda a: a['cx'])
+                    left_axis = parsed_axes[0]
+                    right_axis = parsed_axes[1]
+                    
+                    self.mw.log_message(f"Bilateral Axis Mode: Left Axis (cx={left_axis['cx']:.1f}), Right Axis (cx={right_axis['cx']:.1f})")
+
+                    axes_config.append({
+                        'mode': 'Bilateral',
+                        'left_poly': left_axis['poly'],
+                        'right_poly': right_axis['poly'],
+                        'left_func': lambda pts, p=left_axis['poly']: project_points_to_polyline(pts, p),
+                        'right_func': lambda pts, p=right_axis['poly']: project_points_to_polyline(pts, p)
+                    })
+
+                else:
+                     # > 2 Axes
+                     msg = f"Found {n_valid_axes} valid Phase Axes (of {n_phase_axis_rois_total} Phase Axis ROIs).\nPlease use exactly 1 (unilateral) or 2 (bilateral) Phase Axes."
+                     QtWidgets.QMessageBox.critical(self, "Gradient Analysis Error", msg)
+                     self.mw.log_message(msg)
+                     return
+
+            gradient_data = []
+            animals = df['Animal'].unique()
+            min_cells_bin = 5
+            period_for_slope = 24.0
+            
+            ambiguous_total = 0
+            
+            for animal in animals:
+                subset = df[df['Animal'] == animal]
+                points_all = subset[['X', 'Y']].values
+                phases_all = subset['Rel_Phase'].values
+                group_name = subset['Group'].iloc[0] 
+                
+                # Execute Config
+                for cfg in axes_config:
+                    if cfg['mode'] == 'Bilateral':
+                         # Robust distance-based assignment
+                         d_left = get_polyline_dists(points_all, cfg['left_poly'])
+                         d_right = get_polyline_dists(points_all, cfg['right_poly'])
+                         
+                         eps = 1e-9
+                         # Assign to closer axis
+                         left_mask = (d_left + eps < d_right)
+                         right_mask = (d_right + eps < d_left)
+                         ambiguous_mask = ~(left_mask | right_mask)
+                         
+                         n_amb = int(np.sum(ambiguous_mask))
+                         if n_amb > 0:
+                             ambiguous_total += n_amb
+                             self.mw.log_message(f"{animal}: dropped {n_amb} ambiguous points (equal distance to both axes).")
+                         
+                         # Compute Left
+                         if np.sum(left_mask) > 0:
+                             res = compute_gradient_stats(
+                                 animal, points_all[left_mask], phases_all[left_mask],
+                                 cfg['left_func'], 'Left', group_name, mode, min_cells_bin, period_for_slope
+                             )
+                             gradient_data.append(res)
+                             
+                         # Compute Right
+                         if np.sum(right_mask) > 0:
+                             res = compute_gradient_stats(
+                                 animal, points_all[right_mask], phases_all[right_mask],
+                                 cfg['right_func'], 'Right', group_name, mode, min_cells_bin, period_for_slope
+                             )
+                             gradient_data.append(res)
+                             
+                    else:
+                        # Single or DV
+                        # Use all points
+                        res = compute_gradient_stats(
+                            animal, points_all, phases_all, cfg['func'], cfg['id'], group_name, mode, min_cells_bin, period_for_slope
+                        )
+                        gradient_data.append(res)
+            
+            if ambiguous_total > 0:
+                self.mw.log_message(f"Gradient analysis: dropped {ambiguous_total} ambiguous points total (equal distance to both axes).")
+
                 
             if not hasattr(self.mw, 'grad_tab'):
                 self.mw.grad_tab = QtWidgets.QWidget()
