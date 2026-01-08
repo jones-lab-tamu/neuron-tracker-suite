@@ -1068,12 +1068,188 @@ class GroupViewPanel(QtWidgets.QWidget):
                  if path:
                      df.to_csv(path, index=False)
                      self.mw.log_message(f"Saved to {path}")
-                 return
+                  
+                     # New Feature: Grid Bin Summary Export
+                     # Check if we exported grid analysis data (identified by column signature)
+                     required_cols = {'Grid_X_Index', 'Grid_Y_Index', 'Source_Animal', 'Relative_Phase_Hours', 'Group'}
+                     if required_cols.issubset(df.columns):
+                         try:
+                             summary_df = self._compute_grid_bin_summary(df)
+                             base_root, ext = os.path.splitext(path)
+                             summary_path = f"{base_root}_grid_bin_summary{ext}"
+                             summary_df.to_csv(summary_path, index=False)
+                             self.mw.log_message(f"Saved Grid Bin Summary to {summary_path}")
+                         except Exception as e:
+                              self.mw.log_message(f"Error generating Grid Bin Summary: {e}")
+                              import traceback
+                              self.mw.log_message(traceback.format_exc())
 
-        viewer = self.mw.visualization_widgets.get(current_tab)
-        if viewer and hasattr(viewer, 'get_export_data'):
-             df, fname = viewer.get_export_data()
-             path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export", fname, "CSV (*.csv)")
-             if path:
-                 df.to_csv(path, index=False)
-                 self.mw.log_message(f"Saved to {path}")
+    def _compute_grid_bin_summary(self, df):
+        """
+        Aggregates per-cell grid data into per-bin statistics (cell-pooled and animal-level).
+        Returns: pd.DataFrame with one row per (Group, Grid_X, Grid_Y).
+        """
+        # Ensure numeric type
+        df = df.copy()
+        df['Relative_Phase_Hours'] = pd.to_numeric(df['Relative_Phase_Hours'], errors='coerce')
+        
+        # Group extraction
+        groups = df.groupby(['Group', 'Grid_X_Index', 'Grid_Y_Index'], sort=True)
+        rows = []
+        
+        # Period is standard 24.0 for this app's "Hours" exports
+        period = 24.0
+        min_cells_per_animal = 5
+        
+        # Helper for domain inference
+        def _infer_and_convert(mean_h, domain):
+            """
+            Converts/wraps the raw circular mean (approx [-12, 12] from atan2)
+            into the target domain format.
+            """
+            if not np.isfinite(mean_h): return mean_h
+            if domain == 'abs_0_24':
+                return (mean_h + period) % period
+            if domain == 'rel_pm12':
+                # Wrap to [-12, +12)
+                return ((mean_h + period/2) % period) - period/2
+            return mean_h # 'unknown' -> leave as-is
+
+        for (grp_name, gx, gy), sub in groups:
+            # 1. Basic Counts (Metadata)
+            n_cells = len(sub)
+            source_counts = sub['Source_Animal'].value_counts()
+            n_animals = len(source_counts)
+            
+            # Form pipe-separated list of animals (sorted)
+            uniq_animals = sorted(source_counts.index.astype(str))
+            animals_str = "|".join(uniq_animals)
+            if len(animals_str) > 2000: animals_str = animals_str[:2000] + "..."
+            
+            # Cells Per Animal stats (Unfiltered, metadata)
+            med_cells = source_counts.median()
+            min_cells = source_counts.min() if len(source_counts) > 0 else 0
+            max_cells = source_counts.max() if len(source_counts) > 0 else 0
+            
+            # 2. Domain Inference per bin
+            # Identify valid phases (FINITE only) for the whole bin
+            # Robust extraction: coerce -> numpy -> filter finite
+            raw_vals = pd.to_numeric(sub['Relative_Phase_Hours'], errors='coerce').values
+            valid_phases_all = raw_vals[np.isfinite(raw_vals)]
+            
+            phase_domain = 'unknown'
+            
+            # (A) Explicit Phase_Domain column priority
+            if 'Phase_Domain' in sub.columns:
+                # Extract non-null, strip, lower
+                d_vals = sub['Phase_Domain'].dropna().astype(str).str.strip().str.lower()
+                # Filter to ONLY allowed domains
+                allowed = {'rel_pm12', 'abs_0_24'}
+                d_vals = d_vals[d_vals.isin(allowed)]
+                
+                if len(d_vals) > 0:
+                    # Pick most frequent allowed value
+                    phase_domain = d_vals.value_counts().idxmax()
+            
+            # (B) Heuristic fallback if still unknown
+            if phase_domain == 'unknown' and len(valid_phases_all) > 0:
+                # If we see ANY negative value (with tolerance), assume [-12, 12). Else assume [0, 24).
+                if np.min(valid_phases_all) < -1e-6:
+                    phase_domain = 'rel_pm12'
+                else:
+                    phase_domain = 'abs_0_24'
+            
+            # 3. Cell-Pooled Circular Stats
+            if len(valid_phases_all) > 0:
+                rads = (valid_phases_all / period) * (2 * np.pi)
+                S = np.mean(np.sin(rads))
+                C = np.mean(np.cos(rads))
+                pooled_R = np.sqrt(S**2 + C**2)
+                mean_rad = np.arctan2(S, C) # [-pi, pi]
+                # Convert back to hours, initially in [-12, 12] range approx
+                raw_mean_h = (mean_rad / (2 * np.pi)) * period
+                pooled_mean_h = _infer_and_convert(raw_mean_h, phase_domain)
+            else:
+                pooled_R = np.nan
+                pooled_mean_h = np.nan
+            
+            # 4. Animal-Level Circular Stats
+            # CRITICAL: Filter animals based on VALID FINITE PHASES, not raw counts.
+            # Collect means from valid animals.
+            animal_means_rad = []
+            
+            # Pass over all unique animals in this bin
+            for anim in source_counts.index:
+                # Extract phases for this animal, strictly finite
+                a_raw = pd.to_numeric(sub.loc[sub['Source_Animal'] == anim, 'Relative_Phase_Hours'], errors='coerce').values
+                a_phases = a_raw[np.isfinite(a_raw)]
+                
+                if len(a_phases) >= min_cells_per_animal:
+                    # Valid animal
+                    a_rads = (a_phases / period) * (2 * np.pi)
+                    aS = np.mean(np.sin(a_rads))
+                    aC = np.mean(np.cos(a_rads))
+                    a_mean_rad = np.arctan2(aS, aC)
+                    animal_means_rad.append(a_mean_rad)
+            
+            animal_level_n_used = len(animal_means_rad)
+            
+            animal_level_R = np.nan
+            animal_level_mean_h = np.nan
+            
+            if animal_level_n_used > 0:
+                am_arr = np.array(animal_means_rad)
+                S_am = np.mean(np.sin(am_arr))
+                C_am = np.mean(np.cos(am_arr))
+                animal_level_R = np.sqrt(S_am**2 + C_am**2)
+                mean_am_rad = np.arctan2(S_am, C_am)
+                raw_am_h = (mean_am_rad / (2 * np.pi)) * period
+                animal_level_mean_h = _infer_and_convert(raw_am_h, phase_domain)
+
+            rows.append({
+                'Group': grp_name,
+                'Grid_X_Index': gx,
+                'Grid_Y_Index': gy,
+                'Phase_Domain': phase_domain,
+                'N_Cells': n_cells,
+                'N_Animals': n_animals, # Unique source animals (unfiltered)
+                'Animals_List': animals_str,
+                'Cells_Per_Animal_Median': med_cells,
+                'Cells_Per_Animal_Min': min_cells,
+                'Cells_Per_Animal_Max': max_cells,
+                'CellPooled_CircMean_RelPhaseHours': pooled_mean_h,
+                'CellPooled_R': pooled_R,
+                'AnimalLevel_CircMean_RelPhaseHours': animal_level_mean_h,
+                'AnimalLevel_R': animal_level_R,
+                'AnimalLevel_N': animal_level_n_used, # Contributing animals
+                'AnimalLevel_N_Filtered': animal_level_n_used,
+                'Meets_MinAnimals_ForInference': (animal_level_n_used >= 2),
+                'Meets_MinCells_ForDisplay': (n_cells >= 10)
+            })
+            
+        res_df = pd.DataFrame(rows)
+        
+        # Diagnostic Safeguard (Self-Check)
+        # Random sample of 5 bins to verify aggregation counts
+        if len(rows) >= 5:
+            try:
+                indices = np.random.choice(len(rows), 5, replace=False)
+                for idx in indices:
+                    r = rows[idx]
+                    # query original df
+                    mask = (df['Group'] == r['Group']) & \
+                           (df['Grid_X_Index'] == r['Grid_X_Index']) & \
+                           (df['Grid_Y_Index'] == r['Grid_Y_Index'])
+                    sub_check = df[mask]
+                    
+                    real_n_cells = len(sub_check)
+                    real_n_animals = sub_check['Source_Animal'].nunique()
+                    
+                    if real_n_cells != r['N_Cells']:
+                        self.mw.log_message(f"Grid Export Diagnostic Error: Bin({r['Grid_X_Index']},{r['Grid_Y_Index']}) N_Cells mismatch: {real_n_cells} vs {r['N_Cells']}")
+                    if real_n_animals != r['N_Animals']:
+                        self.mw.log_message(f"Grid Export Diagnostic Error: Bin({r['Grid_X_Index']},{r['Grid_Y_Index']}) N_Animals mismatch: {real_n_animals} vs {r['N_Animals']}")
+            except Exception as e:
+                self.mw.log_message(f"Grid Export Diagnostic skipped due to error: {e}")
+                
+        return res_df
