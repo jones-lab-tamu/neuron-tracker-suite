@@ -962,75 +962,75 @@ class GroupViewPanel(QtWidgets.QWidget):
                 # Execute Config
                 for cfg in axes_config:
                     if cfg['mode'] == 'Bilateral':
-                         # Robust distance-based assignment
-                         d_left = get_polyline_dists(points_all, cfg['left_poly'])
-                         d_right = get_polyline_dists(points_all, cfg['right_poly'])
-                         
-                         eps = 1e-9
-                         # Assign to closer axis
-                         left_mask = (d_left + eps < d_right)
-                         right_mask = (d_right + eps < d_left)
-                         ambiguous_mask = ~(left_mask | right_mask)
-                         
-                         n_amb = int(np.sum(ambiguous_mask))
-                         if n_amb > 0:
-                             ambiguous_total += n_amb
-                             self.mw.log_message(f"{animal}: dropped {n_amb} ambiguous points (equal distance to both axes).")
-                         
-                          # Compute Left
-                          # Note: store points/phases/s for potential collapse
-                          pts_left = points_all[left_mask]
-                          phs_left = phases_all[left_mask]
-                          
-                          if np.sum(left_mask) > 0:
-                              res = compute_gradient_stats(
-                                  animal, pts_left, phs_left,
-                                  cfg['left_func'], 'Left', group_name, mode, min_cells_bin, period_for_slope
-                              )
-                              gradient_data.append(res)
-                              
-                          # Compute Right
-                          pts_right = points_all[right_mask]
-                          phs_right = phases_all[right_mask]
+                        # Robust distance-based assignment
+                        d_left = get_polyline_dists(points_all, cfg['left_poly'])
+                        d_right = get_polyline_dists(points_all, cfg['right_poly'])
+                        
+                        eps = 1e-9
+                        # Assign to closer axis
+                        left_mask = (d_left + eps < d_right)
+                        right_mask = (d_right + eps < d_left)
+                        ambiguous_mask = ~(left_mask | right_mask)
+                        
+                        n_amb = int(np.sum(ambiguous_mask))
+                        if n_amb > 0:
+                            ambiguous_total += n_amb
+                            self.mw.log_message(f"{animal}: dropped {n_amb} ambiguous points (equal distance to both axes).")
+                        
+                        # Compute Left
+                        # Note: store points/phases/s for potential collapse
+                        pts_left = points_all[left_mask]
+                        phs_left = phases_all[left_mask]
+                        
+                        if np.sum(left_mask) > 0:
+                            res = compute_gradient_stats(
+                                animal, pts_left, phs_left,
+                                cfg['left_func'], 'Left', group_name, mode, min_cells_bin, period_for_slope
+                            )
+                            gradient_data.append(res)
+                            
+                        # Compute Right
+                        pts_right = points_all[right_mask]
+                        phs_right = phases_all[right_mask]
 
-                          if np.sum(right_mask) > 0:
-                              res = compute_gradient_stats(
-                                  animal, pts_right, phs_right,
-                                  cfg['right_func'], 'Right', group_name, mode, min_cells_bin, period_for_slope
-                              )
-                              gradient_data.append(res)
-                              
-                          # Compute Collapsed (Optional)
-                          if collapse_enabled and (len(pts_left) > 0 or len(pts_right) > 0):
-                              # 1. Compute Raw S
-                              s_left = cfg['left_func'](pts_left) if len(pts_left) > 0 else np.array([])
-                              s_right = cfg['right_func'](pts_right) if len(pts_right) > 0 else np.array([])
-                              s_left = np.clip(s_left, 0.0, 1.0)
-                              s_right = np.clip(s_right, 0.0, 1.0)
-                              
-                              # 2. Apply S-Flips (pre-calculated)
-                              if cfg['left_flip']:
-                                  s_left = 1.0 - s_left
-                              if cfg['right_flip']:
-                                  s_right = 1.0 - s_right
-                              
-                              # 3. Pool
-                              s_pooled = np.concatenate([s_left, s_right])
-                              pts_pooled = np.concatenate([pts_left, pts_right]) # Just for len/shape, func ignored
-                              phs_pooled = np.concatenate([phs_left, phs_right])
-                              
-                              # Defensive Check
-                              if len(s_pooled) != len(phs_pooled):
-                                  raise ValueError("Collapsed gradient internal error: len(s_pooled) != len(phs_pooled)")
-                              
-                              # 4. Compute Stats from Pooled Data
-                              # We pass a dummy identity func for s because we already computed s_pooled
-                              res_coll = compute_gradient_stats(
-                                  animal, pts_pooled, phs_pooled,
-                                  lambda p: s_pooled, 'Collapsed', group_name, mode, min_cells_bin, period_for_slope
-                              )
-                              gradient_data.append(res_coll)
-                             
+                        if np.sum(right_mask) > 0:
+                            res = compute_gradient_stats(
+                                animal, pts_right, phs_right,
+                                cfg['right_func'], 'Right', group_name, mode, min_cells_bin, period_for_slope
+                            )
+                            gradient_data.append(res)
+                            
+                        # Compute Collapsed (Optional)
+                        if collapse_enabled and (len(pts_left) > 0 or len(pts_right) > 0):
+                            # 1. Compute Raw S
+                            s_left = cfg['left_func'](pts_left) if len(pts_left) > 0 else np.array([])
+                            s_right = cfg['right_func'](pts_right) if len(pts_right) > 0 else np.array([])
+                            s_left = np.clip(s_left, 0.0, 1.0)
+                            s_right = np.clip(s_right, 0.0, 1.0)
+                            
+                            # 2. Apply S-Flips (pre-calculated)
+                            if cfg['left_flip']:
+                                s_left = 1.0 - s_left
+                            if cfg['right_flip']:
+                                s_right = 1.0 - s_right
+                            
+                            # 3. Pool
+                            s_pooled = np.concatenate([s_left, s_right])
+                            pts_pooled = np.concatenate([pts_left, pts_right]) # Just for len/shape, func ignored
+                            phs_pooled = np.concatenate([phs_left, phs_right])
+                            
+                            # Defensive Check
+                            if len(s_pooled) != len(phs_pooled):
+                                raise ValueError("Collapsed gradient internal error: len(s_pooled) != len(phs_pooled)")
+                            
+                            # 4. Compute Stats from Pooled Data
+                            # We pass a dummy identity func for s because we already computed s_pooled
+                            res_coll = compute_gradient_stats(
+                                animal, pts_pooled, phs_pooled,
+                                lambda p: s_pooled, 'Collapsed', group_name, mode, min_cells_bin, period_for_slope
+                            )
+                            gradient_data.append(res_coll)
+                            
                     else:
                         # Single or DV
                         # Use all points
