@@ -121,15 +121,26 @@ def run_bin_cluster_analysis(
     min_n: int = 4,
     n_perm: int = 5000,
     seed: int = 42,
-    alpha: float = 0.05
+    alpha_forming: float = 0.05,
+    alpha_sig: float = 0.05,
+    alpha: float = None # Legacy compat
 ):
     """
     Main entry point for bin-level cluster analysis.
     """
+    # Legacy compatibility: if alpha passed but alpha_forming not explicitly set to new value,
+    # assume user meant alpha_forming.
+    if alpha is not None:
+        alpha_val = float(alpha)
+        alpha_forming = alpha_val
+        # Map to alpha_sig only if caller didn't explicitly override default (0.05)
+        # Logic: if alpha_sig is 0.05 (default) and alpha is different,
+        # assume legacy single-alpha mode where alpha controls both.
+        if alpha_sig == 0.05 and alpha_val != 0.05:
+            alpha_sig = alpha_val
+         
     rng = np.random.default_rng(seed)
     H, W = grid_shape
-    
-
     
     # 2. Materialize Bin Data (First Pass - Identify Valid Animals)
     temp_bin_data = [] # List of (r, c, c_dict, e_dict)
@@ -170,7 +181,9 @@ def run_bin_cluster_analysis(
             'T0': np.inf,
             'n_valid_perm_per_bin': np.zeros((H, W), dtype=int),
             'stability_mask': np.zeros((H, W), dtype=bool),
-            'alpha': float(alpha),
+            'alpha_forming': float(alpha_forming),
+            'alpha_sig': float(alpha_sig),
+            'alpha': float(alpha_sig),
             'seed': int(seed),
             'min_n': int(min_n),
             'n_perm': int(n_perm)
@@ -204,7 +217,7 @@ def run_bin_cluster_analysis(
     n_ctrl = len(used_animals_control)
     n_exp = len(used_animals_experiment)
     logging.info(f"Permutation Universe: n_total={n_total_animals}, n_ctrl={n_ctrl}, n_exp={n_exp}, "
-                 f"n_valid_bins={n_valid}, min_n={min_n}, n_perm={n_perm}, alpha={alpha}, seed={seed}")
+                 f"n_valid_bins={n_valid}, min_n={min_n}, n_perm={n_perm}, alpha_forming={alpha_forming}, alpha_sig={alpha_sig}, seed={seed}")
 
     # 4. Finalize Bin Data with Indices
     valid_bins_data = [] # List of dicts
@@ -340,7 +353,8 @@ def run_bin_cluster_analysis(
         # Failsafe if everything collapsed
         T0 = np.inf
     else:
-        T0 = np.percentile(pooled_null, 100 * (1.0 - alpha))
+        # Use alpha_forming for T0
+        T0 = np.percentile(pooled_null, 100 * (1.0 - alpha_forming))
                  
     # C. Max Cluster Mass Distribution (per lobe, per permutation)
     for k in range(n_perm):
@@ -423,7 +437,9 @@ def run_bin_cluster_analysis(
         'T0': float(T0),
         'n_valid_perm_per_bin': n_valid_perm_map,
         'stability_mask': stability_mask,
-        'alpha': float(alpha),
+        'alpha_forming': float(alpha_forming),
+        'alpha_sig': float(alpha_sig),
+        'alpha': float(alpha_sig),
         'seed': int(seed),
         'min_n': int(min_n),
         'n_perm': int(n_perm)

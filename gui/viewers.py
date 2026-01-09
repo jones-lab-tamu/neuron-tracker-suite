@@ -2665,8 +2665,9 @@ class ClusterResultViewerWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self.results = results
         self.clusters = results.get('clusters', [])
-        # Use user-selected alpha or default
-        self.alpha_thresh = results.get('alpha', 0.05)
+        # Use user-selected alpha_sig or default
+        self.alpha_sig = results.get('alpha_sig', results.get('alpha', 0.05))
+        self.alpha_forming = results.get('alpha_forming', None)
         
         self.layout = QtWidgets.QHBoxLayout(self)
         
@@ -2713,7 +2714,7 @@ class ClusterResultViewerWidget(QtWidgets.QWidget):
         cluster_map = self.results['cluster_map']
         
         # Background: Delta Mu
-        im = self.ax.imshow(dm, cmap='coolwarm', vmin=-np.pi, vmax=np.pi, origin='lower')
+        im = self.ax.imshow(dm, cmap='coolwarm', vmin=-np.pi, vmax=np.pi, origin='upper')
         self.figure.colorbar(im, ax=self.ax, label='Delta Mu (rad)')
         
         ids = np.unique(cluster_map)
@@ -2727,7 +2728,7 @@ class ClusterResultViewerWidget(QtWidgets.QWidget):
             if not match: continue
             
             p = match['p_corr']
-            is_sig = p < self.alpha_thresh
+            is_sig = p < self.alpha_sig
             is_selected = (self.selected_cid == cid)
             
             if is_sig: found_sig = True
@@ -2746,7 +2747,7 @@ class ClusterResultViewerWidget(QtWidgets.QWidget):
                 linewidth = 1
                 alpha = 0.5
             
-            self.ax.contour(mask, levels=[0.5], colors=[color], linewidths=[linewidth], alpha=alpha, origin='lower')
+            self.ax.contour(mask, levels=[0.5], colors=[color], linewidths=[linewidth], alpha=alpha, origin='upper')
             
             rows, cols = np.where(mask)
             if len(rows) == 0: continue
@@ -2762,7 +2763,14 @@ class ClusterResultViewerWidget(QtWidgets.QWidget):
         elif len(ids) == 0:
              self.ax.text(0.5, 0.5, "No Clusters Found", ha='center', va='center', transform=self.ax.transAxes, fontsize=12, color='gray')
             
-        self.ax.set_title(f"Cluster Analysis (T0={self.results.get('T0', 0):.3f}, α={self.alpha_thresh})")
+        t0_val = self.results.get('T0', 0)
+        if hasattr(t0_val, 'item'): t0_val = t0_val.item() # Handle numpy scalar
+        
+        title_str = f"Cluster Analysis (T0={t0_val:.3f}, α_sig={self.alpha_sig:.3f}"
+        if self.alpha_forming is not None:
+            title_str += f", α_form={self.alpha_forming:.3f}"
+        title_str += ")"
+        self.ax.set_title(title_str)
         self.canvas.draw()
         
     def populate_table(self):
@@ -2779,7 +2787,7 @@ class ClusterResultViewerWidget(QtWidgets.QWidget):
             
             p = c['p_corr']
             p_item = QtWidgets.QTableWidgetItem(f"{p:.4f}")
-            if p < self.alpha_thresh:
+            if p < self.alpha_sig:
                 p_item.setBackground(QtGui.QColor(200, 255, 200)) # Light Green
             self.table.setItem(i, 4, p_item)
 

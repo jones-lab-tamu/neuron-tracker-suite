@@ -1739,6 +1739,17 @@ class GroupViewPanel(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "No Lobes", "No zones with Lobe ID > 0 found. Please define Left (1) / Right (2) lobes in Region setup.")
             return
 
+        # Explicit Lobe Separation Check
+        unique_lobes_nonzero = sorted(set(int(x) for x in np.unique(lobe_mask) if int(x) != 0))
+        
+        counts = {lid: int(np.sum(lobe_mask == lid)) for lid in unique_lobes_nonzero}
+        self.mw.log_message(f"ClusterAnalysis: lobe IDs={unique_lobes_nonzero}, counts={counts}")
+        
+        if len(unique_lobes_nonzero) < 2:
+            msg = f"Cluster analysis requires BOTH lobes to be labeled (Left and Right).\nThe current lobe mask contains: {unique_lobes_nonzero}.\nFix region lobe assignments and try again."
+            QtWidgets.QMessageBox.critical(self, "Invalid Lobe Configuration", msg)
+            return
+
         # 4. Aggregate Phases & Prepare Stats
         grouped_phases_grid = {}
         bin_stats = [] # List of (n_c, n_e) for dialog
@@ -1785,7 +1796,7 @@ class GroupViewPanel(QtWidgets.QWidget):
             return
             
         # 6. Run Worker
-        self.mw.log_message(f"Starting Cluster Analysis: MinN={dlg.min_n}, Perms={dlg.n_perm}, Alpha={dlg.alpha}, Seed={dlg.seed}")
+        self.mw.log_message(f"Starting Cluster Analysis: MinN={dlg.min_n}, Perms={dlg.n_perm}, AlphaForming={dlg.alpha_forming}, AlphaSig={dlg.alpha_sig}, Seed={dlg.seed}")
         self.btn_cluster_stats.setEnabled(False)
         self.mw.set_status("Running Cluster Analysis...")
         
@@ -1798,7 +1809,7 @@ class GroupViewPanel(QtWidgets.QWidget):
 
         self.cluster_worker = ClusterWorker(
             grouped_phases_grid, (n_bins_y, n_bins_x), lobe_mask,
-            dlg.min_n, dlg.n_perm, dlg.seed, dlg.alpha, dlg.save_plot,
+            dlg.min_n, dlg.n_perm, dlg.seed, dlg.alpha_forming, dlg.alpha_sig, dlg.save_plot,
             s_dir
         )
         self.cluster_worker.finished.connect(self.on_cluster_finished)
@@ -1839,7 +1850,7 @@ class ClusterWorker(QtCore.QThread):
     finished = QtCore.pyqtSignal(object)
     error = QtCore.pyqtSignal(str)
     
-    def __init__(self, grouped_phases, grid_shape, mask, min_n, n_perm, seed, alpha, save_plot, session_dir):
+    def __init__(self, grouped_phases, grid_shape, mask, min_n, n_perm, seed, alpha_forming, alpha_sig, save_plot, session_dir):
         super().__init__()
         self.grouped_phases = grouped_phases
         self.grid_shape = grid_shape
@@ -1847,7 +1858,8 @@ class ClusterWorker(QtCore.QThread):
         self.min_n = min_n
         self.n_perm = n_perm
         self.seed = seed
-        self.alpha = alpha
+        self.alpha_forming = alpha_forming
+        self.alpha_sig = alpha_sig
         self.save_plot = save_plot
         self.session_dir = session_dir
         
@@ -1855,10 +1867,14 @@ class ClusterWorker(QtCore.QThread):
         try:
             results = cluster_stats.run_bin_cluster_analysis(
                 self.grouped_phases, self.grid_shape, self.mask,
-                min_n=self.min_n, n_perm=self.n_perm, seed=self.seed, alpha=self.alpha
+                min_n=self.min_n, n_perm=self.n_perm, seed=self.seed, 
+                alpha_forming=self.alpha_forming, alpha_sig=self.alpha_sig
             )
-            # Add alpha
-            results['alpha'] = self.alpha
+            # Add alphas to results
+            results['alpha_forming'] = float(self.alpha_forming)
+            results['alpha_sig'] = float(self.alpha_sig)
+            # Compat for old viewers
+            results['alpha'] = float(self.alpha_sig)
             
             # Save Results
             out_dir = os.path.join(self.session_dir, "cluster_stats")
