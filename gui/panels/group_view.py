@@ -744,16 +744,7 @@ class GroupViewPanel(QtWidgets.QWidget):
             'do_smooth': smooth_check
         }
         return df, info
-            'n_bins_x': n_bins_x, 'n_bins_y': n_bins_y,
-            'bin_size': bin_size,
-            'x_min': x_min, 'x_max': x_max,
-            'y_min': y_min, 'y_max': y_max,
-            'calc_x_bins': calc_x_bins, 'calc_y_bins': calc_y_bins,
-            'grid_x_bins': np.arange(start_x, end_x, bin_size), # For viewers usually
-            'grid_y_bins': np.arange(start_y, end_y, bin_size),
-            'do_smooth': smooth_check
-        }
-        return df, info
+
 
     def _generate_continuous_maps(self, df):
         single_animal_tabs = [self.mw.heatmap_tab, self.mw.com_tab, self.mw.traj_tab, self.mw.phase_tab, self.mw.interp_tab]
