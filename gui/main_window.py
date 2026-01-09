@@ -25,6 +25,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Centralized state object
         self.state = AnalysisState()
+        
+        # Initialize session directory (default to cwd/analysis_results until project loaded)
+        base = os.getcwd()
+        self.session_dir = os.path.join(base, "analysis_results")
+        os.makedirs(self.session_dir, exist_ok=True)
 
         self.visualization_widgets = {}
 
@@ -517,7 +522,13 @@ class MainWindow(QtWidgets.QMainWindow):
             
             self.log_message(f"Loaded project: {os.path.basename(path)}")
             self._update_ui_from_state()
+            self._update_ui_from_state()
             self.setWindowTitle(f"{os.path.basename(path)} - Neuron Analysis Workspace")
+
+            # Update session dir based on project path
+            base = os.path.dirname(path) if path else os.getcwd()
+            self.session_dir = os.path.join(base, "analysis_results")
+            os.makedirs(self.session_dir, exist_ok=True)
 
         except Exception as e:
             self.log_message(f"Error loading project: {e}")

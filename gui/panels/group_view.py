@@ -1789,10 +1789,17 @@ class GroupViewPanel(QtWidgets.QWidget):
         self.btn_cluster_stats.setEnabled(False)
         self.mw.set_status("Running Cluster Analysis...")
         
+        # Robustly get session dir
+        s_dir = getattr(self.mw, "session_dir", None)
+        if (not s_dir) or (not os.path.isdir(s_dir)):
+            s_dir = os.path.join(os.getcwd(), "analysis_results")
+            os.makedirs(s_dir, exist_ok=True)
+            self.mw.log_message(f"Warning: Session dir not found in MW. Saving to {s_dir}")
+
         self.cluster_worker = ClusterWorker(
             grouped_phases_grid, (n_bins_y, n_bins_x), lobe_mask,
             dlg.min_n, dlg.n_perm, dlg.seed, dlg.alpha, dlg.save_plot,
-            self.mw.session_dir
+            s_dir
         )
         self.cluster_worker.finished.connect(self.on_cluster_finished)
         self.cluster_worker.error.connect(self.on_cluster_error)
