@@ -346,6 +346,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log_text.verticalScrollBar().maximum()
         )
 
+    def set_status(self, text: str):
+        """
+        Safely set status message in status bar or fallback to log.
+        """
+        try:
+            sb = self.statusBar() if hasattr(self, "statusBar") else None
+            if sb is not None:
+                sb.showMessage(str(text))
+                return
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "log_message"):
+                self.log_message(str(text))
+                return
+        except Exception:
+            pass
+
     def _get_last_dir(self):
         settings = QtCore.QSettings()
         return settings.value("last_dir", "")
