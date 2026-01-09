@@ -1704,41 +1704,151 @@ class GroupViewPanel(QtWidgets.QWidget):
         gx, gy = np.meshgrid(cx_centers, cy_centers)
         centers = np.column_stack((gx.ravel(), gy.ravel()))
         
-        if not hasattr(self, 'zones') or not self.zones:
-             QtWidgets.QMessageBox.warning(self, "No Regions", "No regions/lobes defined. Cannot run cluster analysis.")
-             return
-             
-        # Rasterize zones
-        invalid_lobes = []
-        
-        for zid, zone_info in self.zones.items():
-            lobe_raw = zone_info.get('lobe', 0)
+        # Loader for Atlas Registration Polygons
+        atlas_path = self.mw.state.atlas_roi_path
+        if not atlas_path or not os.path.exists(atlas_path):
+            QtWidgets.QMessageBox.critical(self, "Atlas ROI Missing", 
+                "No Atlas Registration ROI file found.\nPlease run the Atlas Registration Tool first.")
+            return
+
+        try:
+            with open(atlas_path, "r") as f:
+                atlas_obj = json.load(f)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Atlas Load Error", f"Failed to load atlas ROIs: {e}")
+            return
             
-            lobe_int = self._normalize_lobe_id(lobe_raw)
-            if lobe_int is None:
-                s = str(lobe_raw)
-                trunc_s = s[:20] + ('...' if len(s) > 20 else '')
-                invalid_lobes.append(f"{zid}: {trunc_s}")
+        # Normalize to list
+        if isinstance(atlas_obj, dict):
+            if "rois" in atlas_obj and isinstance(atlas_obj["rois"], list):
+                atlas_rois = atlas_obj["rois"]
+            elif "items" in atlas_obj and isinstance(atlas_obj["items"], list):
+                atlas_rois = atlas_obj["items"]
+            else:
+                atlas_rois = []
+        elif isinstance(atlas_obj, list):
+            atlas_rois = atlas_obj
+        else:
+            atlas_rois = []
+            
+        if not atlas_rois:
+            QtWidgets.QMessageBox.critical(self, "Atlas Load Error", "Atlas ROI file has no ROI list (expected a list or dict with 'rois').")
+            return
+
+        # Filter for "Include" polygons (Robust)
+        def _get_vertices(r):
+            for k in ("path_vertices", "vertices", "points"):
+                v = r.get(k, None)
+                if v is not None:
+                    return v, k
+            return None, None
+
+        include_candidates = []
+        skipped = 0
+        
+        for r in atlas_rois:
+            if not isinstance(r, dict):
+                skipped += 1
+                continue
+            verts, key = _get_vertices(r)
+            if verts is None:
+                skipped += 1
+                continue
+            
+            # mode/type label
+            mode = str(r.get("mode", "") or r.get("type", "") or r.get("kind", "")).strip().lower()
+            
+            # Guard against Phase Axis arrows misclassified as polygons
+            label = str(r.get("label", "") or r.get("name", "") or r.get("title", "")).strip().lower()
+            if "phase" in label and "axis" in label:
+                skipped += 1
+                continue
+            
+            # Only accept explicit "include" OR blank (legacy/default polygons)
+            # Reject "exclude", "phase axis", etc.
+            if mode not in ("include", ""):
+                skipped += 1
                 continue
                 
-            polys = zone_info['polygons']
-            mask_in_zone = np.zeros(len(centers), dtype=bool)
-            for poly in polys:
-                mask_in_zone |= poly.contains_points(centers)
+            # Validate verts
+            try:
+                verts = np.array(verts, dtype=float)
+            except:
+                skipped += 1
+                continue
+                
+            if verts.ndim != 2 or verts.shape[0] < 3 or verts.shape[1] < 2:
+                skipped += 1
+                continue
             
-            mask_2d = mask_in_zone.reshape((n_bins_y, n_bins_x))
-            lobe_mask[mask_2d] = lobe_int
+            include_candidates.append((r, verts))
+
+        self.mw.log_message(f"Atlas ROI load: total={len(atlas_rois)}, include_candidates={len(include_candidates)}, skipped={skipped}")
+
+        if len(include_candidates) < 2:
+            QtWidgets.QMessageBox.critical(self, "Lobe Mask Missing",
+                "Cluster analysis requires TWO Include polygons from atlas registration (one per SCN lobe).\n"
+                "Open the atlas registration tool, draw left and right Include polygons, save, then rerun cluster analysis.")
+            return
             
-        if invalid_lobes:
-            msg = "Cluster analysis cannot run because some regions have invalid lobe values:\n" + "\n".join(invalid_lobes[:10])
-            if len(invalid_lobes) > 10: msg += "\n..."
-            QtWidgets.QMessageBox.critical(self, "Invalid Lobes", msg)
+        # Parse Polygons
+        parsed_polys = []
+        for r, verts in include_candidates:
+            try:
+                # Simple Area (Shoelace)
+                x, y = verts[:, 0], verts[:, 1]
+                # robust roll area calc
+                area = 0.5 * np.abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+                centroid_x = float(np.mean(x))
+                
+                parsed_polys.append({
+                    'path': Path(verts),
+                    'area': area,
+                    'cx': centroid_x
+                })
+            except Exception as e:
+                self.mw.log_message(f"Error parsing ROI polygon: {e}")
+                continue
+            
+        if len(parsed_polys) < 2:
+            QtWidgets.QMessageBox.critical(self, "Lobe Mask Error", "Could not parse two valid polygons from atlas ROIs.")
             return
-
-        if np.max(lobe_mask) == 0:
-            QtWidgets.QMessageBox.warning(self, "No Lobes", "No zones with Lobe ID > 0 found. Please define Left (1) / Right (2) lobes in Region setup.")
-            return
-
+            
+        # Select 2 Largest if > 2
+        if len(parsed_polys) > 2:
+            parsed_polys.sort(key=lambda x: x['area'], reverse=True)
+            self.mw.log_message(f"Warning: Found {len(parsed_polys)} Include polygons. Using 2 largest.")
+            parsed_polys = parsed_polys[:2]
+            
+        # Sort by Centroid X (Left vs Right)
+        parsed_polys.sort(key=lambda x: x['cx'])
+        left_poly = parsed_polys[0]
+        right_poly = parsed_polys[1]
+        
+        self.mw.log_message(f"ClusterAnalysis LobeMask: left_centroid_x={left_poly['cx']:.1f}, right_centroid_x={right_poly['cx']:.1f}")
+        
+        # Rasterize
+        # Left -> 1, Right -> 2
+        
+        # Detect Overlap
+        mask_l = left_poly['path'].contains_points(centers).reshape((n_bins_y, n_bins_x))
+        mask_r = right_poly['path'].contains_points(centers).reshape((n_bins_y, n_bins_x))
+        
+        overlap = mask_l & mask_r
+        if np.any(overlap):
+            QtWidgets.QMessageBox.warning(self, "Overlapping Lobes",
+                "Left and Right Include polygons overlap. Overlapping bins will be assigned to Right.\n"
+                "Please adjust polygons for a clean split.")
+        
+        # Assign (Left first, then Right overwrites if overlap per user spec/deterministic)
+        lobe_mask[mask_l] = 1
+        lobe_mask[mask_r] = 2
+        
+        # Verify counts
+        n_l = np.sum(lobe_mask == 1)
+        n_r = np.sum(lobe_mask == 2)
+        self.mw.log_message(f"Lobe Assignment: Left(1)={n_l} bins, Right(2)={n_r} bins")
+            
         # Explicit Lobe Separation Check
         unique_lobes_nonzero = sorted(set(int(x) for x in np.unique(lobe_mask) if int(x) != 0))
         
