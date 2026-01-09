@@ -45,6 +45,9 @@ def load_and_join_rhythm_and_coords(rhythm_csv_path: str, warped_ids_csv_path: s
     return merged, stats
 
 class GroupViewPanel(QtWidgets.QWidget):
+    ROLE_PATH = QtCore.Qt.UserRole
+    ROLE_GROUP = QtCore.Qt.UserRole + 1
+
     def __init__(self, main_window):
         super().__init__(main_window)
         self.mw = main_window
@@ -481,13 +484,19 @@ class GroupViewPanel(QtWidgets.QWidget):
         self._generate_gradient_analysis(df)
         self._generate_regional_stats(df)
     def assign_group(self, group_name: str):
-        selected_items = self.group_list.selectedItems()
+        selected_items = self.file_list.selectedItems()
         if not selected_items:
             QtWidgets.QMessageBox.information(self, "No Selection", "Please select one or more files to assign.")
             return
         for item in selected_items:
-            item.setText(1, group_name)
-            item.setForeground(1, QtGui.QColor('blue') if group_name == "Control" else QtGui.QColor('red'))
+            path = item.data(self.ROLE_PATH)
+            if not path: continue
+            
+            item.setData(self.ROLE_GROUP, group_name)
+            bn = os.path.basename(path)
+            item.setText(f"[{group_name}] {bn}")
+            color = QtGui.QColor('blue') if group_name == "Control" else QtGui.QColor('red')
+            item.setForeground(QtGui.QBrush(color))
     
     def define_regions(self):
         atlas_path = self.state.atlas_roi_path
@@ -568,27 +577,64 @@ class GroupViewPanel(QtWidgets.QWidget):
         )
         if not files: return
         self.mw._set_last_dir(files[0])
+        
+        # Get existing paths to prevent duplicates
+        existing_paths = set()
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            p = item.data(self.ROLE_PATH)
+            if p: existing_paths.add(p)
+        
         for f in files:
-            if f not in self.state.group_data_paths:
-                self.state.group_data_paths.append(f)
-                item = QtWidgets.QTreeWidgetItem(self.group_list)
-                item.setText(0, f)
-                item.setText(1, "Unassigned")
+            if f not in existing_paths:
+                item = QtWidgets.QListWidgetItem()
+                bn = os.path.basename(f)
+                item.setText(bn)
+                item.setData(self.ROLE_PATH, f)
+                item.setData(self.ROLE_GROUP, None)
+                item.setToolTip(f)
+                self.file_list.addItem(item)
+                existing_paths.add(f)
+        
+        self._sync_state_group_paths_from_ui()
         self._update_group_view_button()
 
     def remove_group_file(self):
-        selected_items = self.group_list.selectedItems()
+        selected_items = self.file_list.selectedItems()
         for item in selected_items:
-            path = item.text(0)
-            if path in self.state.group_data_paths:
-                self.state.group_data_paths.remove(path)
-            (item.parent() or self.group_list.invisibleRootItem()).removeChild(item)
+            self.file_list.takeItem(self.file_list.row(item))
+            
+        self._sync_state_group_paths_from_ui()
         self._update_group_view_button()
 
+    def _sync_state_group_paths_from_ui(self):
+        self.state.group_data_paths = []
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            p = item.data(self.ROLE_PATH)
+            if p:
+                self.state.group_data_paths.append(p)
+
+    def _get_assigned_group_entries(self):
+        entries = []
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            path = item.data(self.ROLE_PATH)
+            grp = item.data(self.ROLE_GROUP)
+            if not path or not grp: continue
+            if not os.path.exists(path): continue
+            if grp not in ("Control", "Experiment"): continue
+            entries.append((path, grp))
+        return entries
+
     def _update_group_view_button(self):
-        has_files = len(self.state.group_data_paths) > 0
-        self.btn_view_group.setEnabled(has_files)
-        self.btn_cluster_stats.setEnabled(has_files)
+        entries = self._get_assigned_group_entries()
+        has_control = any(g == 'Control' for _, g in entries)
+        has_exp = any(g == 'Experiment' for _, g in entries)
+        can_run = has_control and has_exp
+        
+        self.btn_view_group.setEnabled(can_run)
+        self.btn_cluster_stats.setEnabled(can_run)
 
     def generate_group_visualizations(self):
         self.mw.log_message("--- Starting Group Analysis ---")
@@ -631,16 +677,9 @@ class GroupViewPanel(QtWidgets.QWidget):
 
         all_dfs = []
         try:
-            group_map = {}
-            root = self.group_list.invisibleRootItem()
-            for i in range(root.childCount()):
-                item = root.child(i)
-                group_map[item.text(0)] = item.text(1)
-
-            for roi_path in self.state.group_data_paths:
+            # Iterate assigned entries from UI helper (Source of Truth)
+            for roi_path, group in self._get_assigned_group_entries():
                 base = os.path.basename(roi_path).replace('_roi_warped_with_ids.csv', '')
-                group = group_map.get(roi_path, "Unassigned")
-                if group not in ["Control", "Experiment"]: continue
                 
                 rhythm_path = roi_path.replace("_roi_warped_with_ids.csv", "_rhythm_results.csv")
                 if not os.path.exists(rhythm_path): 
