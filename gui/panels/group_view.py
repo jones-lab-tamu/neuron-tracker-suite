@@ -52,8 +52,117 @@ class GroupViewPanel(QtWidgets.QWidget):
         self.zones_polygons_map = {} 
         self.init_ui()
         self.connect_signals()
+        
+        # Defensive check
+        for w_name in ['group_grid_res_edit', 'group_smooth_check', 'btn_cluster_stats']:
+            if not hasattr(self, w_name):
+                 raise RuntimeError(f"UI Initialization Failed: Missing {w_name}")
 
-    # ... (init_ui and other methods omitted for brevity, focusing on changed methods) ...
+    def init_ui(self):
+        def safe_icon(k):
+            try: return get_icon(k)
+            except Exception: return QtGui.QIcon()
+
+        layout = QtWidgets.QHBoxLayout(self)
+        
+        # Left Control Panel
+        box = QtWidgets.QWidget() 
+        b = QtWidgets.QVBoxLayout(box)
+        
+        # 1. Group Files
+        group_box = QtWidgets.QGroupBox("Group Input Files")
+        gb_layout = QtWidgets.QVBoxLayout(group_box)
+        
+        self.file_list = QtWidgets.QListWidget()
+        gb_layout.addWidget(self.file_list)
+        
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_add_group = QtWidgets.QPushButton(safe_icon('fa5s.plus'), "Add Files")
+        self.btn_remove_group = QtWidgets.QPushButton(safe_icon('fa5s.minus'), "Remove")
+        btn_row.addWidget(self.btn_add_group)
+        btn_row.addWidget(self.btn_remove_group)
+        gb_layout.addLayout(btn_row)
+        
+        assign_row = QtWidgets.QHBoxLayout()
+        self.btn_assign_control = QtWidgets.QPushButton("Set Control")
+        self.btn_assign_exp = QtWidgets.QPushButton("Set Experiment")
+        assign_row.addWidget(self.btn_assign_control)
+        assign_row.addWidget(self.btn_assign_exp)
+        gb_layout.addLayout(assign_row)
+        
+        b.addWidget(group_box)
+        
+        # 2. Parameters
+        param_box = QtWidgets.QGroupBox("Analysis Parameters")
+        param_layout = QtWidgets.QFormLayout(param_box)
+        
+        self.norm_mode_combo = QtWidgets.QComboBox()
+        self.norm_mode_combo.addItems(["Normalize: Global Mean", "Normalize: Per-animal mean"])
+        param_layout.addRow("Normalization:", self.norm_mode_combo)
+        
+        self.group_grid_res_edit = QtWidgets.QLineEdit("50")
+        param_layout.addRow("Grid Res (bins):", self.group_grid_res_edit)
+        
+        self.group_smooth_check = QtWidgets.QCheckBox("Smooth Maps (Gaussian)")
+        param_layout.addRow(self.group_smooth_check)
+        
+        self.grad_mode_combo = QtWidgets.QComboBox()
+        self.grad_mode_combo.addItems(["DV (Y-normalized)", "Phase Axis (polyline)"])
+        param_layout.addRow("Gradient Coordinate:", self.grad_mode_combo)
+        
+        self.collapse_gradient_cb = QtWidgets.QCheckBox("Collapse bilateral axes (Left+Right)")
+        self.collapse_gradient_cb.setToolTip("If checked, bilateral gradients are also pooled into a single 'Collapsed' gradient (requires 2 Phase Axes).")
+        param_layout.addRow(self.collapse_gradient_cb)
+        
+        b.addWidget(param_box)        
+        
+        # 3. Regional Analysis
+        region_box = QtWidgets.QGroupBox("Regional Analysis Setup")
+        region_layout = QtWidgets.QFormLayout(region_box)
+        
+        atlas_box = QtWidgets.QWidget()
+        atlas_layout = QtWidgets.QHBoxLayout(atlas_box)
+        atlas_layout.setContentsMargins(0, 0, 0, 0)
+        self.btn_load_atlas = QtWidgets.QPushButton(safe_icon('fa5s.map'), "Load Atlas Template...")
+        self.atlas_path_label = QtWidgets.QLineEdit()
+        self.atlas_path_label.setPlaceholderText("No Atlas Loaded")
+        self.atlas_path_label.setReadOnly(True)
+        atlas_layout.addWidget(self.btn_load_atlas)
+        atlas_layout.addWidget(self.atlas_path_label)
+        region_layout.addRow("Atlas Template:", atlas_box)
+        
+        self.btn_define_regions = QtWidgets.QPushButton(safe_icon('fa5s.draw-polygon'), "Define Analysis Regions...")
+        self.region_status_label = QtWidgets.QLabel("No regions defined")
+        self.region_status_label.setStyleSheet("color: gray; font-style: italic;")
+        region_layout.addRow(self.btn_define_regions, self.region_status_label)
+
+        self.min_region_cells_spin = QtWidgets.QSpinBox()
+        self.min_region_cells_spin.setRange(1, 100)
+        self.min_region_cells_spin.setValue(10)
+        region_layout.addRow("Min Cells / Region / Animal:", self.min_region_cells_spin)
+
+        self.min_animals_spin = QtWidgets.QSpinBox()
+        self.min_animals_spin.setRange(2, 50)
+        self.min_animals_spin.setValue(3)
+        region_layout.addRow("Min Animals / Group (Stats):", self.min_animals_spin)
+
+        b.addWidget(region_box)
+        
+        # 4. Actions
+        self.btn_view_group = QtWidgets.QPushButton(safe_icon('fa5s.chart-pie'), "Generate Group Visualizations")
+        Tooltip.install(self.btn_view_group, "Runs Continuous Grid analysis, Gradient analysis (if axes present), and Regional Statistical analysis.")
+        self.btn_view_group.setEnabled(False)
+        b.addWidget(self.btn_view_group)
+        
+        self.btn_cluster_stats = QtWidgets.QPushButton(safe_icon('fa5s.microscope'), "Run Cluster Statistics...")
+        self.btn_cluster_stats.setEnabled(False) 
+        self.btn_cluster_stats.setToolTip("Run bin-level permutation cluster analysis (Control vs Experiment).")
+        b.addWidget(self.btn_cluster_stats)
+        
+        b.addStretch()
+        
+        layout.addWidget(box)
+        layout.addStretch(1)
 
     def _compute_grid_assignment(self, df, grid_res_str=None, smooth_check=False):
         """
@@ -285,59 +394,7 @@ class GroupViewPanel(QtWidgets.QWidget):
         self.mw.set_status("Cluster Analysis Failed.")
         self.mw.log_message(f"Cluster Analysis Error: {err_msg}")
         QtWidgets.QMessageBox.critical(self, "Analysis Failed", err_msg)
-        self.grad_mode_combo = QtWidgets.QComboBox()
-        self.grad_mode_combo.addItems(["DV (Y-normalized)", "Phase Axis (polyline)"])
-        param_layout.addRow("Gradient Coordinate:", self.grad_mode_combo)
-        
-        self.collapse_gradient_cb = QtWidgets.QCheckBox("Collapse bilateral axes (Left+Right)")
-        self.collapse_gradient_cb.setToolTip("If checked, bilateral gradients are also pooled into a single 'Collapsed' gradient (requires 2 Phase Axes).")
-        param_layout.addRow(self.collapse_gradient_cb)
-        
-        b.addWidget(param_box)        
-        
-        region_box = QtWidgets.QGroupBox("Regional Analysis Setup")
-        region_layout = QtWidgets.QFormLayout(region_box)
-        
-        atlas_box = QtWidgets.QWidget()
-        atlas_layout = QtWidgets.QHBoxLayout(atlas_box)
-        atlas_layout.setContentsMargins(0, 0, 0, 0)
-        self.btn_load_atlas = QtWidgets.QPushButton(get_icon('fa5s.map'), "Load Atlas Template...")
-        self.atlas_path_label = QtWidgets.QLineEdit()
-        self.atlas_path_label.setPlaceholderText("No Atlas Loaded")
-        self.atlas_path_label.setReadOnly(True)
-        atlas_layout.addWidget(self.btn_load_atlas)
-        atlas_layout.addWidget(self.atlas_path_label)
-        region_layout.addRow("Atlas Template:", atlas_box)
-        
-        self.btn_define_regions = QtWidgets.QPushButton(get_icon('fa5s.draw-polygon'), "Define Analysis Regions...")
-        self.region_status_label = QtWidgets.QLabel("No regions defined")
-        self.region_status_label.setStyleSheet("color: gray; font-style: italic;")
-        region_layout.addRow(self.btn_define_regions, self.region_status_label)
 
-        self.min_region_cells_spin = QtWidgets.QSpinBox()
-        self.min_region_cells_spin.setRange(1, 100)
-        self.min_region_cells_spin.setValue(10)
-        region_layout.addRow("Min Cells / Region / Animal:", self.min_region_cells_spin)
-
-        self.min_animals_spin = QtWidgets.QSpinBox()
-        self.min_animals_spin.setRange(2, 50)
-        self.min_animals_spin.setValue(3)
-        region_layout.addRow("Min Animals / Group (Stats):", self.min_animals_spin)
-
-        b.addWidget(region_box)
-        
-        self.btn_view_group = QtWidgets.QPushButton(get_icon('fa5s.chart-pie'), "Generate Group Visualizations")
-        Tooltip.install(self.btn_view_group, "Runs Continuous Grid analysis, Gradient analysis (if axes present), and Regional Statistical analysis.")
-        self.btn_view_group.setEnabled(False)
-        b.addWidget(self.btn_view_group)
-        
-        self.btn_cluster_stats = QtWidgets.QPushButton(get_icon('fa5s.microscope'), "Run Cluster Statistics...")
-        self.btn_cluster_stats.setEnabled(False) 
-        self.btn_cluster_stats.setToolTip("Run bin-level permutation cluster analysis (Control vs Experiment).")
-        b.addWidget(self.btn_cluster_stats)
-        
-        layout.addWidget(box)
-        layout.addStretch(1)
 
     def connect_signals(self):
         self.btn_add_group.clicked.connect(self.add_group_files)
