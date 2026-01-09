@@ -11,19 +11,15 @@ from skimage.draw import polygon as draw_polygon
 from typing import Tuple
 
 from gui.utils import Tooltip, add_mpl_to_tab, clear_layout, project_points_to_polyline
-from gui.viewers import GroupScatterViewer, GroupAverageMapViewer, PhaseGradientViewer, RegionResultViewer
+from gui.viewers import GroupScatterViewer, GroupAverageMapViewer, PhaseGradientViewer, RegionResultViewer, ClusterResultViewerWidget
 from gui.statistics import watson_williams_f
 from gui.dialogs.roi_drawer import ROIDrawerDialog
+from gui.dialogs.cluster_config_dialog import ClusterConfigDialog
+import analysis.cluster_stats as cluster_stats
 from gui.theme import get_icon
 
 def load_and_join_rhythm_and_coords(rhythm_csv_path: str, warped_ids_csv_path: str) -> "Tuple[pd.DataFrame, dict]":
-    """
-    Loads rhythm results and warped coordinates-with-IDs and returns:
-      - merged DataFrame (inner join on Original_ROI_Index)
-      - stats dict with keys: n_rhythm, n_warped, n_merged, drop_rhythm, drop_warped, dup_rhythm, dup_warped
-    Must not touch GUI state.
-    Must enforce the no-row-order rule.
-    """
+    # ... (function body unchanged) ...
     rhythm_df = pd.read_csv(rhythm_csv_path)
     warped_df = pd.read_csv(warped_ids_csv_path)
     
@@ -57,44 +53,238 @@ class GroupViewPanel(QtWidgets.QWidget):
         self.init_ui()
         self.connect_signals()
 
-    def init_ui(self):
-        layout = QtWidgets.QVBoxLayout(self)
-        box = QtWidgets.QGroupBox("Group Data Setup")
-        b = QtWidgets.QVBoxLayout(box)
+    # ... (init_ui and other methods omitted for brevity, focusing on changed methods) ...
+
+    def _compute_grid_assignment(self, df, grid_res_str=None, smooth_check=False):
+        """
+        Shared helper to compute grid bins and assign cells to them.
+        Returns:
+            df (pd.DataFrame): Copy of input with Grid_X_Index, Grid_Y_Index columns.
+            info (dict): dict containing grid geometry.
+        """
+        df = df.copy()
+        try:
+            val = grid_res_str if grid_res_str is not None else self.group_grid_res_edit.text()
+            grid_res = int(val)
+        except:
+            grid_res = 50
+            
+        x_min, x_max = df['X'].min(), df['X'].max()
+        y_min, y_max = df['Y'].min(), df['Y'].max()
+        width, height = x_max - x_min, y_max - y_min
         
-        self.group_list = QtWidgets.QTreeWidget()
-        self.group_list.setHeaderLabels(["File Path", "Group"])
-        self.group_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        b.addWidget(self.group_list)
+        if width >= height:
+            n_bins_x = grid_res
+            bin_size = width / n_bins_x
+            n_bins_y = max(1, int(round(height / bin_size)))
+        else:
+            n_bins_y = grid_res
+            bin_size = height / n_bins_y
+            n_bins_x = max(1, int(round(width / bin_size)))
+
+        start_x = x_min - bin_size; end_x = x_max + bin_size
+        start_y = y_min - bin_size; end_y = y_max + bin_size
         
-        row = QtWidgets.QHBoxLayout()
-        self.btn_add_group = QtWidgets.QPushButton(get_icon('fa5s.plus'), "Add Warped ROI File(s)...")
-        self.btn_remove_group = QtWidgets.QPushButton(get_icon('fa5s.minus'), "Remove Selected")
-        row.addWidget(self.btn_add_group)
-        row.addWidget(self.btn_remove_group)
-        b.addLayout(row)
+        # Proper edges for histogramming/cutting
+        # Note: pd.cut uses intervals. We define edges to align with bin size.
+        calc_x_bins = np.linspace(x_min, x_max, n_bins_x + 1)
+        calc_y_bins = np.linspace(y_min, y_max, n_bins_y + 1)
         
-        assign_row = QtWidgets.QHBoxLayout()
-        self.btn_assign_control = QtWidgets.QPushButton("Set Selected as Control")
-        self.btn_assign_exp = QtWidgets.QPushButton("Set Selected as Experiment")
-        assign_row.addWidget(self.btn_assign_control)
-        assign_row.addWidget(self.btn_assign_exp)
-        b.addLayout(assign_row)
+        # Assign
+        df['Grid_X_Index'] = pd.cut(df['X'], bins=calc_x_bins, labels=False, include_lowest=True)
+        df['Grid_Y_Index'] = pd.cut(df['Y'], bins=calc_y_bins, labels=False, include_lowest=True)
         
-        param_box = QtWidgets.QGroupBox("Continuous Map Parameters")
-        param_layout = QtWidgets.QFormLayout(param_box)
-        self.group_grid_res_edit = QtWidgets.QLineEdit("50")
-        self.group_smooth_check = QtWidgets.QCheckBox("Smooth to fill empty bins")
-        param_layout.addRow("Grid Resolution:", self.group_grid_res_edit)
-        param_layout.addRow(self.group_smooth_check)
+        info = {
+            'n_bins_x': n_bins_x, 'n_bins_y': n_bins_y,
+            'grid_shape': (n_bins_y, n_bins_x), # Consistently (H, W)
+            'bin_size': bin_size,
+            'x_min': x_min, 'x_max': x_max,
+            'y_min': y_min, 'y_max': y_max,
+            'calc_x_bins': calc_x_bins, 'calc_y_bins': calc_y_bins,
+            'do_smooth': smooth_check,
+             # Kept for viewers if needed, but not used for logic
+            'grid_x_bins': np.arange(start_x, end_x, bin_size), 
+            'grid_y_bins': np.arange(start_y, end_y, bin_size),
+        }
+        return df, info
+
+    def run_cluster_analysis(self):
+        if not hasattr(self, "_last_master_df") or self._last_master_df is None:
+            QtWidgets.QMessageBox.warning(self, "No Data", "Please generate group visualizations first to prepare data.")
+            return
+
+        df = self._last_master_df.copy()
         
-        self.norm_mode_combo = QtWidgets.QComboBox()
-        self.norm_mode_combo.addItems(["Normalize: Control mean", "Normalize: Per-animal mean"])
-        param_layout.addRow(self.norm_mode_combo)
-        self.norm_mode_combo.addItems(["Normalize: Control mean", "Normalize: Per-animal mean"])
-        param_layout.addRow(self.norm_mode_combo)
+        # D3. Group Consistency
+        group_counts = df.groupby('Animal')['Group'].nunique()
+        inconsistent = group_counts[group_counts > 1]
+        if not inconsistent.empty:
+            bad_animals = inconsistent.index.tolist()
+            QtWidgets.QMessageBox.critical(self, "Data Error", f"Found animals with multiple group labels: {bad_animals}. Fix input CSVs.")
+            return
+
+        # D4. Units Check
+        valid_phases = df['Rel_Phase'].dropna()
+        if not valid_phases.empty:
+             abs_max = valid_phases.abs().max()
+             if abs_max > 48.0:
+                  QtWidgets.QMessageBox.critical(self, "Units Error", f"Rel_Phase values > 48 hours found (max {abs_max:.1f}). Check normalization.")
+                  return
         
-        # Gradient Parameters
+        # Check Groups
+        unique_groups = df['Group'].unique()
+        if 'Control' not in unique_groups or 'Experiment' not in unique_groups:
+             QtWidgets.QMessageBox.warning(self, "Missing Groups", "Both 'Control' and 'Experiment' groups are required.")
+             return
+             
+        # B. Use Shared Grid Logic
+        try:
+             df_grid, info = self._compute_grid_assignment(df)
+        except Exception as e:
+             QtWidgets.QMessageBox.critical(self, "Grid Error", f"Failed to compute grid: {e}")
+             return
+             
+        n_bins_x, n_bins_y = info['n_bins_x'], info['n_bins_y']
+        
+        # 3. Create Lobe Mask
+        lobe_mask = np.zeros((n_bins_y, n_bins_x), dtype=int)
+        
+        # Center coordinates - using same calc_x_bins as cut
+        # Centers are (n_bins,) array
+        cx_centers = 0.5 * (info['calc_x_bins'][:-1] + info['calc_x_bins'][1:])
+        cy_centers = 0.5 * (info['calc_y_bins'][:-1] + info['calc_y_bins'][1:])
+        
+        # Meshgrid: gx corresponds to cols (x), gy to rows (y)
+        gx, gy = np.meshgrid(cx_centers, cy_centers) 
+        # Ravel order: varies by impl, but we need consistency with reshape((H,W))
+        # By default meshgrid 'xy' indexing: gx is (H,W), gy is (H,W)
+        centers = np.column_stack((gx.ravel(), gy.ravel()))
+        
+        if not hasattr(self, 'zones') or not self.zones:
+             QtWidgets.QMessageBox.warning(self, "No Regions", "No regions/lobes defined. Cannot run cluster analysis.")
+             return
+             
+        # Rasterize zones
+        found_any_lobe = False
+        for zid, zone_info in self.zones.items():
+            lobe_id = zone_info.get('lobe', 0)
+            if lobe_id == 0: continue
+            
+            polys = zone_info.get('polygons', [])
+            if not polys: continue
+            
+            mask_in_zone = np.zeros(len(centers), dtype=bool)
+            for poly in polys:
+                # poly.contains_points expects (x, y)
+                if len(poly.vertices) > 2:
+                    mask_in_zone |= poly.contains_points(centers)
+            
+            mask_2d = mask_in_zone.reshape((n_bins_y, n_bins_x))
+            lobe_mask[mask_2d] = int(lobe_id)
+            found_any_lobe = True
+            
+        if not found_any_lobe:
+            QtWidgets.QMessageBox.warning(self, "No Lobes", "No zones with Lobe ID > 0 found. Please define Left (1) / Right (2) lobes in Region setup.")
+            return
+
+        # 4. Aggregate Phases & Prepare Stats
+        grouped_phases_grid = {}
+        bin_stats = [] # List of (n_c, n_e) for dialog
+        
+        df_valid = df_grid.dropna(subset=['Grid_X_Index', 'Grid_Y_Index', 'Rel_Phase'])
+        
+        # Iterate all bins in grid
+        for (by, bx), bin_df in df_valid.groupby(['Grid_Y_Index', 'Grid_X_Index']): # Group by Row then Col
+            bx, by = int(bx), int(by)
+            if not (0 <= by < n_bins_y and 0 <= bx < n_bins_x): continue
+            
+            # Check Lobe: Only gather stats for lobe bins (Candidate Bins)
+            if lobe_mask[by, bx] == 0: continue
+            
+            c_dict = {}
+            e_dict = {}
+            
+            for animal_name, anim_df in bin_df.groupby('Animal'):
+                phases = anim_df['Rel_Phase'].values
+                if len(phases) == 0: continue
+                # Circular Mean
+                rads = (phases / 24.0) * (2*np.pi)
+                m_rad = circmean(rads, low=-np.pi, high=np.pi)
+                
+                group = anim_df['Group'].iloc[0]
+                if group == 'Control':
+                    c_dict[animal_name] = m_rad
+                elif group == 'Experiment':
+                    e_dict[animal_name] = m_rad
+            
+            n_c = len(c_dict)
+            n_e = len(e_dict)
+            
+            # Record stat for dialog: Include if EITHER group is present (Candidate)
+            # The dialog will filter strictly by MinN
+            if n_c > 0 or n_e > 0:
+                bin_stats.append((n_c, n_e))
+            
+            # Store in grid if candidate (has data)
+            # Logic: Cluster stats will filter strict Min N, but we pass data if it exists.
+            if n_c > 0 or n_e > 0:
+                 grouped_phases_grid[(by, bx)] = {'Control': c_dict, 'Experiment': e_dict} 
+        
+        # 5. Dialog with Dynamic updates
+        dlg = ClusterConfigDialog(self, (n_bins_y, n_bins_x), bin_stats)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+            
+        # 6. Run Worker
+        self.mw.log_message(f"Starting Cluster Analysis: MinN={dlg.min_n}, Perms={dlg.n_perm}, Alpha={dlg.alpha}, Seed={dlg.seed}")
+        self.btn_cluster_stats.setEnabled(False)
+        self.mw.set_status("Running Cluster Analysis...")
+        
+        # Ensure session dir is valid
+        s_dir = getattr(self.mw, 'session_dir', None)
+        if not s_dir or not os.path.isdir(s_dir):
+            s_dir = os.path.join(os.getcwd(), 'analysis_results')
+            os.makedirs(s_dir, exist_ok=True)
+            self.mw.log_message(f"Warning: Session dir not found. Saving to {s_dir}")
+        
+        self.cluster_worker = ClusterWorker(
+            grouped_phases_grid, (n_bins_y, n_bins_x), lobe_mask,
+            dlg.min_n, dlg.n_perm, dlg.seed, dlg.alpha, dlg.save_plot,
+            s_dir
+        )
+        self.cluster_worker.finished.connect(self.on_cluster_finished)
+        self.cluster_worker.error.connect(self.on_cluster_error)
+        self.cluster_worker.start()
+        
+    def on_cluster_finished(self, results):
+        self.btn_cluster_stats.setEnabled(True)
+        self.mw.set_status("Cluster Analysis Complete.")
+        self.mw.log_message(f"Cluster Analysis Done. T0={results.get('T0', 0):.4f}, Clusters={len(results.get('clusters', []))}")
+        
+        # Layout management: Reuse or Create Tab
+        if not hasattr(self.mw, 'cluster_tab'):
+             self.mw.cluster_tab = QtWidgets.QWidget()
+             self.mw.vis_tabs.addTab(self.mw.cluster_tab, "Cluster Stats")
+        
+        lay = self.mw.cluster_tab.layout()
+        if lay is None:
+            lay = QtWidgets.QVBoxLayout(self.mw.cluster_tab)
+            self.mw.cluster_tab.setLayout(lay)
+        else:
+            clear_layout(lay)
+            
+        viewer = ClusterResultViewerWidget(results, self.mw.cluster_tab)
+        lay.addWidget(viewer)
+        
+        self.mw.visualization_widgets[self.mw.cluster_tab] = viewer
+        self.mw.vis_tabs.setCurrentWidget(self.mw.cluster_tab)
+        self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.cluster_tab), True)
+
+    def on_cluster_error(self, err_msg):
+        self.btn_cluster_stats.setEnabled(True)
+        self.mw.set_status("Cluster Analysis Failed.")
+        self.mw.log_message(f"Cluster Analysis Error: {err_msg}")
+        QtWidgets.QMessageBox.critical(self, "Analysis Failed", err_msg)
         self.grad_mode_combo = QtWidgets.QComboBox()
         self.grad_mode_combo.addItems(["DV (Y-normalized)", "Phase Axis (polyline)"])
         param_layout.addRow("Gradient Coordinate:", self.grad_mode_combo)
@@ -141,6 +331,11 @@ class GroupViewPanel(QtWidgets.QWidget):
         self.btn_view_group.setEnabled(False)
         b.addWidget(self.btn_view_group)
         
+        self.btn_cluster_stats = QtWidgets.QPushButton(get_icon('fa5s.microscope'), "Run Cluster Statistics...")
+        self.btn_cluster_stats.setEnabled(False) 
+        self.btn_cluster_stats.setToolTip("Run bin-level permutation cluster analysis (Control vs Experiment).")
+        b.addWidget(self.btn_cluster_stats)
+        
         layout.addWidget(box)
         layout.addStretch(1)
 
@@ -154,6 +349,7 @@ class GroupViewPanel(QtWidgets.QWidget):
         self.btn_define_regions.clicked.connect(self.define_regions)
         self.mw.btn_export_data.clicked.connect(self.export_current_data)
         self.norm_mode_combo.currentIndexChanged.connect(self._on_norm_mode_changed)
+        self.btn_cluster_stats.clicked.connect(self.run_cluster_analysis)
     
     
     def _clear_tab_contents(self, tab_widget: QtWidgets.QWidget) -> None:
@@ -333,7 +529,9 @@ class GroupViewPanel(QtWidgets.QWidget):
         self._update_group_view_button()
 
     def _update_group_view_button(self):
-        self.btn_view_group.setEnabled(len(self.state.group_data_paths) > 0)
+        has_files = len(self.state.group_data_paths) > 0
+        self.btn_view_group.setEnabled(has_files)
+        self.btn_cluster_stats.setEnabled(has_files)
 
     def generate_group_visualizations(self):
         self.mw.log_message("--- Starting Group Analysis ---")
@@ -358,7 +556,11 @@ class GroupViewPanel(QtWidgets.QWidget):
                 if 'zone_id' not in r: continue
                 zid = r['zone_id']
                 if zid not in self.zones:
-                    self.zones[zid] = {'name': r.get('name', f"Zone {zid}"), 'polygons': []}
+                    self.zones[zid] = {
+                        'name': r.get('name', f"Zone {zid}"), 
+                        'polygons': [],
+                        'lobe': r.get('lobe', 0) # Capture lobe if present
+                    }
                     self.zones_polygons_map[zid] = []
                 
                 path_obj = Path(np.array(r['path_vertices']))
@@ -483,7 +685,6 @@ class GroupViewPanel(QtWidgets.QWidget):
             # Cache COPY to prevent mutation of stored state during view generation
             self._last_master_df = master_df.copy()
 
-
             self._generate_continuous_maps(master_df)
             self._generate_gradient_analysis(master_df)
             self._generate_regional_stats(master_df)
@@ -494,50 +695,82 @@ class GroupViewPanel(QtWidgets.QWidget):
             import traceback
             self.mw.log_message(traceback.format_exc())
 
+    def _compute_grid_assignment(self, df, grid_res_str=None, smooth_check=False):
+        """
+        Shared helper to compute grid bins and assign cells to them.
+        Returns:
+            df (pd.DataFrame): Copy of input with Grid_X_Index, Grid_Y_Index columns.
+            info (dict): dict containing grid geometry (n_bins_x, n_bins_y, bin_size, etc.)
+        """
+        df = df.copy()
+        try:
+            val = grid_res_str if grid_res_str is not None else self.group_grid_res_edit.text()
+            grid_res = int(val)
+        except:
+            grid_res = 50
+            
+        x_min, x_max = df['X'].min(), df['X'].max()
+        y_min, y_max = df['Y'].min(), df['Y'].max()
+        width, height = x_max - x_min, y_max - y_min
+        
+        if width >= height:
+            n_bins_x = grid_res
+            bin_size = width / n_bins_x
+            n_bins_y = max(1, int(round(height / bin_size)))
+        else:
+            n_bins_y = grid_res
+            bin_size = height / n_bins_y
+            n_bins_x = max(1, int(round(width / bin_size)))
+
+        start_x = x_min - bin_size; end_x = x_max + bin_size
+        start_y = y_min - bin_size; end_y = y_max + bin_size
+        
+        # Proper edges for histogramming/cutting
+        calc_x_bins = np.linspace(x_min, x_max, n_bins_x + 1)
+        calc_y_bins = np.linspace(y_min, y_max, n_bins_y + 1)
+        
+        # Assign
+        df['Grid_X_Index'] = pd.cut(df['X'], bins=calc_x_bins, labels=False, include_lowest=True)
+        df['Grid_Y_Index'] = pd.cut(df['Y'], bins=calc_y_bins, labels=False, include_lowest=True)
+        
+        info = {
+            'n_bins_x': n_bins_x, 'n_bins_y': n_bins_y,
+            'bin_size': bin_size,
+            'x_min': x_min, 'x_max': x_max,
+            'y_min': y_min, 'y_max': y_max,
+            'calc_x_bins': calc_x_bins, 'calc_y_bins': calc_y_bins,
+            'grid_x_bins': calc_x_bins, # Use exact edges for viewer consistency
+            'grid_y_bins': calc_y_bins,
+            'do_smooth': smooth_check
+        }
+        return df, info
+            'n_bins_x': n_bins_x, 'n_bins_y': n_bins_y,
+            'bin_size': bin_size,
+            'x_min': x_min, 'x_max': x_max,
+            'y_min': y_min, 'y_max': y_max,
+            'calc_x_bins': calc_x_bins, 'calc_y_bins': calc_y_bins,
+            'grid_x_bins': np.arange(start_x, end_x, bin_size), # For viewers usually
+            'grid_y_bins': np.arange(start_y, end_y, bin_size),
+            'do_smooth': smooth_check
+        }
+        return df, info
+
     def _generate_continuous_maps(self, df):
         single_animal_tabs = [self.mw.heatmap_tab, self.mw.com_tab, self.mw.traj_tab, self.mw.phase_tab, self.mw.interp_tab]
         for tab in single_animal_tabs: self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(tab), False)
         
         try:
-            grid_res = int(self.group_grid_res_edit.text())
-            do_smooth = self.group_smooth_check.isChecked()
+            # Use shared helper
+            df_grid, info = self._compute_grid_assignment(df, self.group_grid_res_edit.text(), self.group_smooth_check.isChecked())
             
-            x_min, x_max = df['X'].min(), df['X'].max()
-            y_min, y_max = df['Y'].min(), df['Y'].max()
-            width, height = x_max - x_min, y_max - y_min
+            # Map Rel_Phase for scatter viewer
+            scatter_df = df_grid.rename(columns={'Animal': 'Source_Animal', 'X': 'Warped_X', 'Y': 'Warped_Y', 'Rel_Phase': 'Relative_Phase_Hours'})
             
-            if width >= height:
-                n_bins_x = grid_res
-                bin_size = width / n_bins_x
-                n_bins_y = max(1, int(round(height / bin_size)))
-            else:
-                n_bins_y = grid_res
-                bin_size = height / n_bins_y
-                n_bins_x = max(1, int(round(width / bin_size)))
-
-            start_x = x_min - bin_size; end_x = x_max + bin_size
-            start_y = y_min - bin_size; end_y = y_max + bin_size
-            
-            grid_x_bins = np.arange(start_x, end_x, bin_size)
-            grid_y_bins = np.arange(start_y, end_y, bin_size)
-            calc_x_bins = np.linspace(x_min, x_max, n_bins_x + 1)
-            calc_y_bins = np.linspace(y_min, y_max, n_bins_y + 1)
-            
-
-            
-            # Select column based on combo box; logic moved to generate_group_visualizations but
-            # ensuring we use 'Rel_Phase' which is populated there.
-            # The prompt requested: "When generating scatter_df, set 'Relative_Phase_Hours' to..."
-            # Since 'Rel_Phase' in master_df is now context-sensitive (see below), we just map it.
-            
-            scatter_df = df.rename(columns={'Animal': 'Source_Animal', 'X': 'Warped_X', 'Y': 'Warped_Y', 'Rel_Phase': 'Relative_Phase_Hours'})
             fig_s, _ = add_mpl_to_tab(self.mw.group_scatter_tab)
-            viewer_s = GroupScatterViewer(fig_s, fig_s.add_subplot(111), scatter_df, grid_bins=(grid_x_bins, grid_y_bins))
+            viewer_s = GroupScatterViewer(fig_s, fig_s.add_subplot(111), scatter_df, grid_bins=(info['grid_x_bins'], info['grid_y_bins']))
             self.mw.visualization_widgets[self.mw.group_scatter_tab] = viewer_s
             
-            scatter_df['Grid_X_Index'] = pd.cut(scatter_df['Warped_X'], bins=calc_x_bins, labels=False, include_lowest=True)
-            scatter_df['Grid_Y_Index'] = pd.cut(scatter_df['Warped_Y'], bins=calc_y_bins, labels=False, include_lowest=True)
-            
+            # Group Average Map
             def circmean_phase(series):
                 rad = (series / 12.0) * np.pi 
                 mean_rad = circmean(rad, low=-np.pi, high=np.pi)
@@ -546,7 +779,7 @@ class GroupViewPanel(QtWidgets.QWidget):
             group_binned = scatter_df.groupby(['Grid_X_Index', 'Grid_Y_Index'])['Relative_Phase_Hours'].apply(circmean_phase).reset_index()
             
             fig_g, _ = add_mpl_to_tab(self.mw.group_avg_tab)
-            viewer_g = GroupAverageMapViewer(fig_g, fig_g.add_subplot(111), group_binned, scatter_df, (n_bins_x, n_bins_y), do_smooth)
+            viewer_g = GroupAverageMapViewer(fig_g, fig_g.add_subplot(111), group_binned, scatter_df, (info['n_bins_x'], info['n_bins_y']), info['do_smooth'])
             self.mw.visualization_widgets[self.mw.group_avg_tab] = viewer_g
             
             self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.group_scatter_tab), True)
@@ -1307,3 +1540,203 @@ class GroupViewPanel(QtWidgets.QWidget):
                 self.mw.log_message(f"Grid Export Diagnostic skipped due to error: {e}")
                 
         return res_df
+
+    def run_cluster_analysis(self):
+        if not hasattr(self, "_last_master_df") or self._last_master_df is None:
+            QtWidgets.QMessageBox.warning(self, "No Data", "Please generate group visualizations first to prepare data.")
+            return
+
+        df = self._last_master_df.copy()
+        
+        # D3. Group Consistency
+        group_counts = df.groupby('Animal')['Group'].nunique()
+        inconsistent = group_counts[group_counts > 1]
+        if not inconsistent.empty:
+            bad_animals = inconsistent.index.tolist()
+            QtWidgets.QMessageBox.critical(self, "Data Error", f"Found animals with multiple group labels: {bad_animals}. Fix input CSVs.")
+            return
+
+        # D4. Units Check
+        valid_phases = df['Rel_Phase'].dropna()
+        if not valid_phases.empty:
+             abs_max = valid_phases.abs().max()
+             if abs_max > 48.0:
+                  QtWidgets.QMessageBox.critical(self, "Units Error", f"Rel_Phase values > 48 hours found (max {abs_max:.1f}). Check normalization.")
+                  return
+        
+        # Check Groups
+        unique_groups = df['Group'].unique()
+        if 'Control' not in unique_groups or 'Experiment' not in unique_groups:
+             QtWidgets.QMessageBox.warning(self, "Missing Groups", "Both 'Control' and 'Experiment' groups are required.")
+             return
+             
+        # B. Use Shared Grid Logic
+        try:
+             df_grid, info = self._compute_grid_assignment(df)
+        except Exception as e:
+             QtWidgets.QMessageBox.critical(self, "Grid Error", f"Failed to compute grid: {e}")
+             return
+             
+        n_bins_x, n_bins_y = info['n_bins_x'], info['n_bins_y']
+        
+        # 3. Create Lobe Mask
+        lobe_mask = np.zeros((n_bins_y, n_bins_x), dtype=int)
+        
+        # Center coordinates
+        # Reconstruct centers from keys or bins
+        # info['calc_x_bins'] are edges.
+        cx_centers = 0.5 * (info['calc_x_bins'][:-1] + info['calc_x_bins'][1:])
+        cy_centers = 0.5 * (info['calc_y_bins'][:-1] + info['calc_y_bins'][1:])
+        gx, gy = np.meshgrid(cx_centers, cy_centers)
+        centers = np.column_stack((gx.ravel(), gy.ravel()))
+        
+        if not hasattr(self, 'zones') or not self.zones:
+             QtWidgets.QMessageBox.warning(self, "No Regions", "No regions/lobes defined. Cannot run cluster analysis.")
+             return
+             
+        # Rasterize zones
+        for zid, zone_info in self.zones.items():
+            lobe_id = zone_info.get('lobe', 0)
+            if lobe_id == 0: continue
+            
+            polys = zone_info['polygons']
+            mask_in_zone = np.zeros(len(centers), dtype=bool)
+            for poly in polys:
+                mask_in_zone |= poly.contains_points(centers)
+            
+            mask_2d = mask_in_zone.reshape((n_bins_y, n_bins_x))
+            lobe_mask[mask_2d] = int(lobe_id)
+            
+        if np.max(lobe_mask) == 0:
+            QtWidgets.QMessageBox.warning(self, "No Lobes", "No zones with Lobe ID > 0 found. Please define Left (1) / Right (2) lobes in Region setup.")
+            return
+
+        # 4. Aggregate Phases & Prepare Stats
+        grouped_phases_grid = {}
+        bin_stats = [] # List of (n_c, n_e) for dialog
+        
+        df_valid = df_grid.dropna(subset=['Grid_X_Index', 'Grid_Y_Index', 'Rel_Phase'])
+        
+        # Iterate all bins in grid
+        for (bx, by), bin_df in df_valid.groupby(['Grid_X_Index', 'Grid_Y_Index']):
+            bx, by = int(bx), int(by)
+            if not (0 <= by < n_bins_y and 0 <= bx < n_bins_x): continue
+            
+            # Check Lobe: Only gather stats for lobe bins (Candidate Bins)
+            if lobe_mask[by, bx] == 0: continue
+            
+            c_dict = {}
+            e_dict = {}
+            
+            for animal_name, anim_df in bin_df.groupby('Animal'):
+                phases = anim_df['Rel_Phase'].values
+                if len(phases) == 0: continue
+                # Circular Mean
+                rads = (phases / 24.0) * (2*np.pi)
+                m_rad = circmean(rads, low=-np.pi, high=np.pi)
+                
+                group = anim_df['Group'].iloc[0]
+                if group == 'Control':
+                    c_dict[animal_name] = m_rad
+                elif group == 'Experiment':
+                    e_dict[animal_name] = m_rad
+            
+            n_c = len(c_dict)
+            n_e = len(e_dict)
+            
+            # Record stat for dialog
+            if n_c > 0 or n_e > 0:
+                bin_stats.append((n_c, n_e))
+            
+            if n_c > 0 and n_e > 0:
+                 grouped_phases_grid[(by, bx)] = {'Control': c_dict, 'Experiment': e_dict} 
+        
+        # 5. Dialog with Dynamic updates
+        dlg = ClusterConfigDialog(self, (n_bins_y, n_bins_x), bin_stats)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+            
+        # 6. Run Worker
+        self.mw.log_message(f"Starting Cluster Analysis: MinN={dlg.min_n}, Perms={dlg.n_perm}, Alpha={dlg.alpha}, Seed={dlg.seed}")
+        self.btn_cluster_stats.setEnabled(False)
+        self.mw.set_status("Running Cluster Analysis...")
+        
+        self.cluster_worker = ClusterWorker(
+            grouped_phases_grid, (n_bins_y, n_bins_x), lobe_mask,
+            dlg.min_n, dlg.n_perm, dlg.seed, dlg.alpha, dlg.save_plot,
+            self.mw.session_dir
+        )
+        self.cluster_worker.finished.connect(self.on_cluster_finished)
+        self.cluster_worker.error.connect(self.on_cluster_error)
+        self.cluster_worker.start()
+        
+    def on_cluster_finished(self, results):
+        self.btn_cluster_stats.setEnabled(True)
+        self.mw.set_status("Cluster Analysis Complete.")
+        self.mw.log_message(f"Cluster Analysis Done. T0={results.get('T0', 0):.4f}, Clusters={len(results.get('clusters', []))}")
+        
+        if not hasattr(self.mw, 'cluster_tab'):
+             self.mw.cluster_tab = QtWidgets.QWidget()
+             self.mw.vis_tabs.addTab(self.mw.cluster_tab, "Cluster Stats")
+        
+        # Layout management
+        lay = self.mw.cluster_tab.layout()
+        if lay is None:
+            lay = QtWidgets.QVBoxLayout(self.mw.cluster_tab)
+            self.mw.cluster_tab.setLayout(lay)
+        else:
+            clear_layout(lay)
+            
+        viewer = ClusterResultViewerWidget(results, self.mw.cluster_tab)
+        lay.addWidget(viewer)
+        
+        self.mw.visualization_widgets[self.mw.cluster_tab] = viewer
+        self.mw.vis_tabs.setCurrentWidget(self.mw.cluster_tab)
+        self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.cluster_tab), True)
+
+    def on_cluster_error(self, err_msg):
+        self.btn_cluster_stats.setEnabled(True)
+        self.mw.set_status("Cluster Analysis Failed.")
+        self.mw.log_message(f"Cluster Analysis Error: {err_msg}")
+        QtWidgets.QMessageBox.critical(self, "Analysis Failed", err_msg)
+
+class ClusterWorker(QtCore.QThread):
+    finished = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str)
+    
+    def __init__(self, grouped_phases, grid_shape, mask, min_n, n_perm, seed, alpha, save_plot, session_dir):
+        super().__init__()
+        self.grouped_phases = grouped_phases
+        self.grid_shape = grid_shape
+        self.mask = mask
+        self.min_n = min_n
+        self.n_perm = n_perm
+        self.seed = seed
+        self.alpha = alpha
+        self.save_plot = save_plot
+        self.session_dir = session_dir
+        
+    def run(self):
+        try:
+            results = cluster_stats.run_bin_cluster_analysis(
+                self.grouped_phases, self.grid_shape, self.mask,
+                min_n=self.min_n, n_perm=self.n_perm, seed=self.seed, alpha=self.alpha
+            )
+            # Add alpha
+            results['alpha'] = self.alpha
+            
+            # Save Results
+            out_dir = os.path.join(self.session_dir, "cluster_stats")
+            cluster_stats.save_cluster_results(results, out_dir)
+            
+            if self.save_plot:
+                png_path = os.path.join(out_dir, "diagnostic_plot.png")
+                cluster_stats.plot_cluster_results(results, png_path)
+            
+            self.finished.emit(results)
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+

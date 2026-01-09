@@ -17,8 +17,6 @@ from matplotlib.backends.backend_qt5agg import (
     FigureCanvasQTAgg as FigureCanvas,
     NavigationToolbar2QT as NavigationToolbar,
 )
-import matplotlib.cm as cm
-import matplotlib.colors as mcolors
 
 import cosinor as csn
 from scipy.ndimage import label as nd_label, gaussian_laplace, gaussian_filter, binary_fill_holes
@@ -2641,3 +2639,136 @@ class StatsWorker(QtCore.QObject):
             self.error.emit(str(e))
 
 
+
+
+
+class ClusterResultViewerWidget(QtWidgets.QWidget):
+    def __init__(self, results, parent=None):
+        super().__init__(parent)
+        self.results = results
+        self.clusters = results.get('clusters', [])
+        # Use user-selected alpha or default
+        self.alpha_thresh = results.get('alpha', 0.05)
+        
+        self.layout = QtWidgets.QHBoxLayout(self)
+        
+        # 1. Plot Area
+        self.plot_widget = QtWidgets.QWidget()
+        self.plot_layout = QtWidgets.QVBoxLayout(self.plot_widget)
+        self.figure = Figure()
+        self.canvas = FigureCanvas(self.figure)
+        self.toolbar = NavigationToolbar(self.canvas, self.plot_widget)
+        self.plot_layout.addWidget(self.toolbar)
+        self.plot_layout.addWidget(self.canvas)
+        
+        self.ax = self.figure.add_subplot(111)
+        
+        # 2. Table Area
+        self.table = QtWidgets.QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["ID", "Lobe", "N Bins", "Mass", "p_corr"])
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.itemClicked.connect(self.on_table_click)
+        self.table.setFixedWidth(300)
+        
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.splitter.addWidget(self.plot_widget)
+        self.splitter.addWidget(self.table)
+        self.layout.addWidget(self.splitter)
+        
+        self.selected_cid = None
+        self.plot()
+        self.populate_table()
+        
+    def plot(self):
+        self.figure.clear()
+        self.ax = self.figure.add_subplot(111)
+        
+        dm = self.results.get('delta_mu_map', None)
+        # Handle empty case
+        if dm is None or np.all(np.isnan(dm)):
+             self.ax.text(0.5, 0.5, "No Valid Bin Data Found", ha='center', va='center', transform=self.ax.transAxes)
+             self.ax.set_title("Cluster Analysis (Empty)")
+             self.canvas.draw()
+             return
+
+        cluster_map = self.results['cluster_map']
+        
+        # Background: Delta Mu
+        im = self.ax.imshow(dm, cmap='coolwarm', vmin=-np.pi, vmax=np.pi, origin='lower')
+        self.figure.colorbar(im, ax=self.ax, label='Delta Mu (rad)')
+        
+        ids = np.unique(cluster_map)
+        ids = ids[ids > 0]
+        
+        found_sig = False
+        
+        for cid in ids:
+            mask = (cluster_map == cid).astype(int)
+            match = next((c for c in self.clusters if c['id'] == cid), None)
+            if not match: continue
+            
+            p = match['p_corr']
+            is_sig = p < self.alpha_thresh
+            is_selected = (self.selected_cid == cid)
+            
+            if is_sig: found_sig = True
+            
+            # Style logic
+            if is_selected:
+                color = 'magenta'
+                linewidth = 3
+                alpha = 1.0
+            elif is_sig:
+                color = 'lime'
+                linewidth = 2
+                alpha = 1.0
+            else:
+                color = 'black'
+                linewidth = 1
+                alpha = 0.5
+            
+            self.ax.contour(mask, levels=[0.5], colors=[color], linewidths=[linewidth], alpha=alpha, origin='lower')
+            
+            rows, cols = np.where(mask)
+            if len(rows) == 0: continue
+            cy, cx = np.mean(rows), np.mean(cols)
+            # Label sig or selected
+            if is_sig or is_selected:
+               gui_lbl = f"#{cid}"
+               if is_sig: gui_lbl += f"\np={p:.3f}"
+               self.ax.text(cx, cy, gui_lbl, color='white', fontsize=8, ha='center', va='center', fontweight='bold', bbox=dict(facecolor='black', alpha=0.5, ec='none'))
+        
+        if not found_sig and len(ids) > 0:
+             self.ax.text(0.5, 0.02, "No Significant Clusters", color='black', ha='center', transform=self.ax.transAxes, bbox=dict(facecolor='white', alpha=0.8))
+        elif len(ids) == 0:
+             self.ax.text(0.5, 0.5, "No Clusters Found", ha='center', va='center', transform=self.ax.transAxes, fontsize=12, color='gray')
+            
+        self.ax.set_title(f"Cluster Analysis (T0={self.results.get('T0', 0):.3f}, α={self.alpha_thresh})")
+        self.canvas.draw()
+        
+    def populate_table(self):
+        self.table.setRowCount(len(self.clusters))
+        for i, c in enumerate(self.clusters):
+            # ID
+            item = QtWidgets.QTableWidgetItem(str(c['id']))
+            item.setData(QtCore.Qt.UserRole, int(c['id']))
+            self.table.setItem(i, 0, item)
+            
+            self.table.setItem(i, 1, QtWidgets.QTableWidgetItem(str(c.get('lobe', '?'))))
+            self.table.setItem(i, 2, QtWidgets.QTableWidgetItem(str(c['n_bins'])))
+            self.table.setItem(i, 3, QtWidgets.QTableWidgetItem(f"{c['mass']:.2f}"))
+            
+            p = c['p_corr']
+            p_item = QtWidgets.QTableWidgetItem(f"{p:.4f}")
+            if p < self.alpha_thresh:
+                p_item.setBackground(QtGui.QColor(200, 255, 200)) # Light Green
+            self.table.setItem(i, 4, p_item)
+
+    def on_table_click(self, item):
+        row = item.row()
+        id_item = self.table.item(row, 0)
+        cid = int(id_item.data(QtCore.Qt.UserRole))
+        
+        self.selected_cid = cid
+        self.plot()
