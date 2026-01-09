@@ -243,8 +243,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         mode_key = item.data(QtCore.Qt.UserRole)
         
-        # Only Group Analysis uses generic viewer export for now
-        if mode_key == "group_view":
+        # Only Group Analysis and Single Animal Analysis use generic viewer export for now
+        if mode_key in ("group_view", "single"):
             current_tab = self.vis_tabs.currentWidget()
             exportable = False
             

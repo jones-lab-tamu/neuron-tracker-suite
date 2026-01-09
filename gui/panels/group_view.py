@@ -77,6 +77,7 @@ class GroupViewPanel(QtWidgets.QWidget):
         gb_layout = QtWidgets.QVBoxLayout(group_box)
         
         self.file_list = QtWidgets.QListWidget()
+        self.file_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         gb_layout.addWidget(self.file_list)
         
         btn_row = QtWidgets.QHBoxLayout()
@@ -497,6 +498,9 @@ class GroupViewPanel(QtWidgets.QWidget):
             item.setText(f"[{group_name}] {bn}")
             color = QtGui.QColor('blue') if group_name == "Control" else QtGui.QColor('red')
             item.setForeground(QtGui.QBrush(color))
+        
+        self._sync_state_group_paths_from_ui()
+        self._update_group_view_button()
     
     def define_regions(self):
         atlas_path = self.state.atlas_roi_path
@@ -622,7 +626,6 @@ class GroupViewPanel(QtWidgets.QWidget):
             path = item.data(self.ROLE_PATH)
             grp = item.data(self.ROLE_GROUP)
             if not path or not grp: continue
-            if not os.path.exists(path): continue
             if grp not in ("Control", "Experiment"): continue
             entries.append((path, grp))
         return entries

@@ -689,6 +689,8 @@ class SingleAnimalPanel(QtWidgets.QWidget):
                     clear_layout(tab.layout())
         except Exception:
             pass
+            
+        self.mw.update_export_buttons_state()
 
         self._update_workflow_status()
 
@@ -1263,6 +1265,7 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         self.mw.visualization_widgets[self.mw.traj_tab] = viewer_t
 
         self.regenerate_phase_maps()
+        self.mw.update_export_buttons_state()
 
     def _calculate_rhythms(self):
         method = self.analysis_method_combo.currentText()
@@ -1487,6 +1490,15 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             
         except Exception as e:
             self.mw.log_message(f"Plot Error: {e}")
+            # Defensive: clear heatmap export data on error so we don't export stale data
+            heatmap_viewer = self.mw.visualization_widgets.get(self.mw.heatmap_tab)
+            if heatmap_viewer and hasattr(heatmap_viewer, "clear_data"):
+                try:
+                    heatmap_viewer.clear_data()
+                except Exception:
+                    pass
+        
+        self.mw.update_export_buttons_state()
 
     def save_rhythm_results(self):
         """

@@ -259,6 +259,24 @@ class HeatmapViewer:
             
         self.fig.canvas.draw_idle()
 
+    def clear_data(self):
+        """Clear internal data to prevent stale exports."""
+        self.normalized_data = np.zeros((0, 0))
+        self.last_sort_indices = np.array([], dtype=int)
+        self.filtered_indices = None
+        
+        if hasattr(self, "image_artist") and self.image_artist is not None:
+            try:
+                self.image_artist.set_data(np.zeros((1, 1)))
+            except Exception:
+                pass
+
+        if hasattr(self, "fig") and self.fig is not None and hasattr(self.fig, "canvas") and self.fig.canvas is not None:
+            try:
+                self.fig.canvas.draw_idle()
+            except Exception:
+                pass
+
     def get_export_data(self):
         if self.normalized_data.size == 0: return None, ""
         sorted_data = self.normalized_data[:, self.last_sort_indices].T
