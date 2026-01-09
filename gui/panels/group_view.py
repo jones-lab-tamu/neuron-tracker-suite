@@ -1631,6 +1631,30 @@ class GroupViewPanel(QtWidgets.QWidget):
                 
         return res_df
 
+    def _normalize_lobe_id(self, lobe_id):
+        """
+        Robustly convert lobe_id to integer (or None if invalid/0).
+        Supports: int, numeric string, 'Left'/'L'->1, 'Right'/'R'->2.
+        Returns None for 0/unassigned to enforce explicit valid assignment.
+        """
+        if isinstance(lobe_id, (int, np.integer)):
+            val = int(lobe_id)
+            return val if val != 0 else None
+        
+        if isinstance(lobe_id, str):
+            s = lobe_id.strip().lower()
+            if not s: 
+                return None
+            if s.isdigit():
+                val = int(s)
+                return val if val != 0 else None
+            if s in ("left", "l"):
+                return 1
+            if s in ("right", "r"):
+                return 2
+                
+        return None
+
     def run_cluster_analysis(self):
         if not hasattr(self, "_last_master_df") or self._last_master_df is None:
             QtWidgets.QMessageBox.warning(self, "No Data", "Please generate group visualizations first to prepare data.")
@@ -1685,18 +1709,32 @@ class GroupViewPanel(QtWidgets.QWidget):
              return
              
         # Rasterize zones
+        invalid_lobes = []
+        
         for zid, zone_info in self.zones.items():
-            lobe_id = zone_info.get('lobe', 0)
-            if lobe_id == 0: continue
+            lobe_raw = zone_info.get('lobe', 0)
             
+            lobe_int = self._normalize_lobe_id(lobe_raw)
+            if lobe_int is None:
+                s = str(lobe_raw)
+                trunc_s = s[:20] + ('...' if len(s) > 20 else '')
+                invalid_lobes.append(f"{zid}: {trunc_s}")
+                continue
+                
             polys = zone_info['polygons']
             mask_in_zone = np.zeros(len(centers), dtype=bool)
             for poly in polys:
                 mask_in_zone |= poly.contains_points(centers)
             
             mask_2d = mask_in_zone.reshape((n_bins_y, n_bins_x))
-            lobe_mask[mask_2d] = int(lobe_id)
+            lobe_mask[mask_2d] = lobe_int
             
+        if invalid_lobes:
+            msg = "Cluster analysis cannot run because some regions have invalid lobe values:\n" + "\n".join(invalid_lobes[:10])
+            if len(invalid_lobes) > 10: msg += "\n..."
+            QtWidgets.QMessageBox.critical(self, "Invalid Lobes", msg)
+            return
+
         if np.max(lobe_mask) == 0:
             QtWidgets.QMessageBox.warning(self, "No Lobes", "No zones with Lobe ID > 0 found. Please define Left (1) / Right (2) lobes in Region setup.")
             return
