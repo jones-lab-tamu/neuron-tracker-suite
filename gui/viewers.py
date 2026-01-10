@@ -1,4 +1,5 @@
 import numpy as np
+import logging
 import pandas as pd
 import colorcet as cet
 from scipy.interpolate import RBFInterpolator
@@ -2786,7 +2787,15 @@ class ClusterResultViewerWidget(QtWidgets.QWidget):
                 linewidth = 1
                 alpha = 0.5
             
-            self.ax.contour(mask, levels=[0.5], colors=[color], linewidths=[linewidth], alpha=alpha, origin='upper')
+            shape_bad = (mask.shape != cluster_map.shape) or (dm is not None and mask.shape != dm.shape)
+            if shape_bad:
+                logging.warning(f"Contour shape mismatch: cid={cid}, mask={mask.shape}, cluster_map={cluster_map.shape}, dm={dm.shape if dm is not None else 'None'}")
+                continue
+
+            H, W = mask.shape
+            xs = np.arange(W)
+            ys = np.arange(H)
+            self.ax.contour(xs, ys, mask.astype(float), levels=[0.5], colors=[color], linewidths=[linewidth], alpha=alpha)
             
             rows, cols = np.where(mask)
             if len(rows) == 0: continue
