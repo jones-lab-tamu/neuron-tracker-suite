@@ -14,9 +14,20 @@ Logic:
 import numpy as np
 from scipy import stats, ndimage
 import pandas as pd
-from typing import Dict, List, Tuple, Optional, Any
 import logging
 import json
+from typing import Dict, List, Tuple, Optional, Any
+
+def _structure_from_connectivity(connectivity: int):
+    """Generates NDImage structure based on neighbor count."""
+    if connectivity == 4:
+        # Edge adjacent only (cross)
+        return ndimage.generate_binary_structure(2, 1)
+    elif connectivity == 8:
+        # Edges + Diagonals (square)
+        return ndimage.generate_binary_structure(2, 2)
+    else:
+        raise ValueError(f"Invalid connectivity: {connectivity} (must be 4 or 8)")
 
 def _wrap_to_pi(vals):
     """Wraps angles to [-pi, pi]."""
@@ -28,15 +39,20 @@ def _circ_mean(phases):
         return np.nan
     return stats.circmean(phases, high=np.pi, low=-np.pi)
 
-def _find_clusters(sig_mask: np.ndarray, abs_delta_mu: np.ndarray, lobe_mask: np.ndarray, connectivity=8, strict_mode=False):
+def _find_clusters(sig_mask: np.ndarray, abs_delta_mu: np.ndarray, lobe_mask: np.ndarray, connectivity: int = 8, strict_mode: bool = False):
     """
     Finds clusters of True values in sig_mask within each lobe.
     Returns:
        cluster_map: (H, W) int array of cluster IDs
        cluster_props: list of dicts (id, mass, lobe)
     """
-    # Create structure for 8-connectivity
-    structure = ndimage.generate_binary_structure(2, 2) # 8-neighbor
+    # Create connectivity structure
+    if isinstance(connectivity, (int, np.integer)):
+        connectivity = int(connectivity)
+        structure = _structure_from_connectivity(connectivity)
+    else:
+        # Fallback if structure passed directly (internal use case, defensive)
+        structure = connectivity
     
     # Process each lobe separately to enforce strict separation
     unique_lobes = np.unique(lobe_mask)
@@ -123,11 +139,16 @@ def run_bin_cluster_analysis(
     seed: int = 42,
     alpha_forming: float = 0.05,
     alpha_sig: float = 0.05,
+    connectivity: int = 4,
     alpha: float = None # Legacy compat
 ):
     """
     Main entry point for bin-level cluster analysis.
+    connectivity: 4 (edges) or 8 (edges+diagonals).
     """
+    if connectivity not in (4, 8):
+        raise ValueError(f"Connectivity must be 4 or 8, got {connectivity}")
+
     # Legacy compatibility: if alpha passed but alpha_forming not explicitly set to new value,
     # assume user meant alpha_forming.
     if alpha is not None:
@@ -186,7 +207,8 @@ def run_bin_cluster_analysis(
             'alpha': float(alpha_sig),
             'seed': int(seed),
             'min_n': int(min_n),
-            'n_perm': int(n_perm)
+            'n_perm': int(n_perm),
+            'connectivity': int(connectivity)
         }
 
     # 3. Construct Permutation Universe (Restricted)
@@ -379,8 +401,10 @@ def run_bin_cluster_analysis(
                 sig_perm_map[r, c] = True
                 mass_perm_map[r, c] = row_vals[i] # Mass is the permuted stat
         
+        
         # Clustering
-        _, props = _find_clusters(sig_perm_map, mass_perm_map, lobe_mask)
+        # Use consistent connectivity for null distribution
+        _, props = _find_clusters(sig_perm_map, mass_perm_map, lobe_mask, connectivity=connectivity)
         
         # Max mass logic
         current_maxes = {l: 0.0 for l in unique_lobes}
@@ -407,6 +431,9 @@ def run_bin_cluster_analysis(
         stability_mask[r, c] = is_stable_bin[i]
         
     # Observed Forming Mask: Stable AND > T0
+    # OPTION 1: Apply all masks BEFORE labeling
+    # We construct 'final_inclusion' and 'valid_obs_mask' and 'T0' check combined.
+    # This forms the 'sig_mask_obs' which is the SINGLE source of truth for labeling.
     final_inclusion = (inclusion_mask & stability_mask)
     valid_obs_mask = np.isfinite(delta_mu_map)
     
@@ -414,8 +441,21 @@ def run_bin_cluster_analysis(
     with np.errstate(invalid='ignore'):
          sig_mask_obs = (final_inclusion & valid_obs_mask) & (np.abs(delta_mu_map) > T0)
     
+    # Debug Logging (Part C)
+    unique_lobes_log = sorted(set(int(x) for x in np.unique(lobe_mask) if int(x) != 0))
+    for l_id in unique_lobes_log:
+        # Check eligibility for this lobe
+        eligible = sig_mask_obs & (lobe_mask == l_id)
+        # Check components
+        structure_check = _structure_from_connectivity(connectivity)
+        _, n_cc_log = ndimage.label(eligible, structure=structure_check)
+        logging.info(f"ClusterLabeling: lobe={l_id}, eligible_bins={int(eligible.sum())}, n_components={n_cc_log}, connectivity={connectivity}")
+
     # Find Clusters (Mass using abs delta mu)
-    cluster_map_obs, cluster_props_obs = _find_clusters(sig_mask_obs, np.abs(delta_mu_map), lobe_mask)
+    # The _find_clusters function applies (sig_mask_obs & lobe_mask) then labels.
+    # This aligns with Option 1: Mask then Label. 
+    # No further masking is applied to the map.
+    cluster_map_obs, cluster_props_obs = _find_clusters(sig_mask_obs, np.abs(delta_mu_map), lobe_mask, connectivity=connectivity, strict_mode=True)
     
     final_clusters = []
     for p in cluster_props_obs:
@@ -427,6 +467,24 @@ def run_bin_cluster_analysis(
         p.update({'p_corr': p_corr})
         final_clusters.append(p)
         
+    # Part A: Hard Diagnostic Assertion
+    # Check that each cluster ID in result corresponds to exactly 1 connected component
+    structure_check = _structure_from_connectivity(connectivity)
+    for clust in final_clusters:
+        cid = clust["id"]
+        lobe = clust["lobe"]
+        # Extract binary mask for this cluster
+        mask_c = (cluster_map_obs == cid)
+        
+        # Count connected components
+        _, n_cc_check = ndimage.label(mask_c, structure=structure_check)
+        
+        if n_cc_check != 1:
+            msg = f"Cluster integrity failure: cid={cid}, lobe={lobe}, n_cc={n_cc_check}, n_bins={int(mask_c.sum())} (conn={connectivity})"
+            # Log it first just in case
+            logging.error(msg)
+            raise ValueError(msg)
+
     return {
         'delta_mu_map': delta_mu_map, 
         'p_unc_map': p_unc_map,
@@ -442,7 +500,8 @@ def run_bin_cluster_analysis(
         'alpha': float(alpha_sig),
         'seed': int(seed),
         'min_n': int(min_n),
-        'n_perm': int(n_perm)
+        'n_perm': int(n_perm),
+        'connectivity': int(connectivity)
     }
 
 def save_cluster_results(results: Dict[str, Any], output_dir: str):

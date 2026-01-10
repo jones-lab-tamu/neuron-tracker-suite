@@ -72,6 +72,13 @@ class ClusterConfigDialog(QtWidgets.QDialog):
         self.spin_seed.setValue(self.seed)
         p_layout.addRow("Random Seed:", self.spin_seed)
         
+        # Connectivity
+        self.combo_connectivity = QtWidgets.QComboBox()
+        self.combo_connectivity.addItem("4-neighbor (edges only) [Default]", 4)
+        self.combo_connectivity.addItem("8-neighbor (edges + diagonals)", 8)
+        self.combo_connectivity.setCurrentIndex(0) # Default to 4
+        p_layout.addRow("Connectivity:", self.combo_connectivity)
+        
         self.check_plot = QtWidgets.QCheckBox("Save diagnostic plot (PNG)")
         p_layout.addRow(self.check_plot)
         
@@ -109,11 +116,12 @@ class ClusterConfigDialog(QtWidgets.QDialog):
             af = asig
             self.spin_alpha_forming.setValue(af)
             # DO NOT return; continue to save corrected value
-
+ 
         self.min_n = self.spin_min_n.value()
         self.n_perm = self.spin_n_perm.value()
         self.alpha_forming = af
         self.alpha_sig = asig
         self.seed = self.spin_seed.value()
         self.save_plot = self.check_plot.isChecked()
+        self.connectivity = self.combo_connectivity.currentData()
         super().accept()

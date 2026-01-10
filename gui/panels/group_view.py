@@ -1920,7 +1920,7 @@ class GroupViewPanel(QtWidgets.QWidget):
         self.cluster_worker = ClusterWorker(
             grouped_phases_grid, (n_bins_y, n_bins_x), lobe_mask,
             dlg.min_n, dlg.n_perm, dlg.seed, dlg.alpha_forming, dlg.alpha_sig, dlg.save_plot,
-            s_dir
+            s_dir, getattr(dlg, 'connectivity', 4)
         )
         self.cluster_worker.finished.connect(self.on_cluster_finished)
         self.cluster_worker.error.connect(self.on_cluster_error)
@@ -1960,7 +1960,7 @@ class ClusterWorker(QtCore.QThread):
     finished = QtCore.pyqtSignal(object)
     error = QtCore.pyqtSignal(str)
     
-    def __init__(self, grouped_phases, grid_shape, mask, min_n, n_perm, seed, alpha_forming, alpha_sig, save_plot, session_dir):
+    def __init__(self, grouped_phases, grid_shape, mask, min_n, n_perm, seed, alpha_forming, alpha_sig, save_plot, session_dir, connectivity=4):
         super().__init__()
         self.grouped_phases = grouped_phases
         self.grid_shape = grid_shape
@@ -1972,13 +1972,15 @@ class ClusterWorker(QtCore.QThread):
         self.alpha_sig = alpha_sig
         self.save_plot = save_plot
         self.session_dir = session_dir
+        self.connectivity = connectivity
         
     def run(self):
         try:
             results = cluster_stats.run_bin_cluster_analysis(
                 self.grouped_phases, self.grid_shape, self.mask,
                 min_n=self.min_n, n_perm=self.n_perm, seed=self.seed, 
-                alpha_forming=self.alpha_forming, alpha_sig=self.alpha_sig
+                alpha_forming=self.alpha_forming, alpha_sig=self.alpha_sig,
+                connectivity=self.connectivity
             )
             # Add alphas to results
             results['alpha_forming'] = float(self.alpha_forming)
