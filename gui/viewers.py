@@ -2690,14 +2690,32 @@ class ClusterResultViewerWidget(QtWidgets.QWidget):
         self.table.itemClicked.connect(self.on_table_click)
         self.table.setFixedWidth(300)
         
+        # Right Side Container
+        self.right_widget = QtWidgets.QWidget()
+        self.right_layout = QtWidgets.QVBoxLayout(self.right_widget)
+        
+        # Cluster overlay toggle
+        self.show_cluster_pixels = False
+        self.chk_pixels = QtWidgets.QCheckBox("Show cluster pixels")
+        self.chk_pixels.setChecked(False)
+        self.chk_pixels.stateChanged.connect(self._on_toggle_cluster_pixels)
+        self.right_layout.addWidget(self.chk_pixels)
+        
+        self.right_layout.addWidget(self.table)
+        
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.splitter.addWidget(self.plot_widget)
-        self.splitter.addWidget(self.table)
+        self.splitter.addWidget(self.right_widget)
         self.layout.addWidget(self.splitter)
         
         self.selected_cid = None
         self.plot()
         self.populate_table()
+        
+    def _on_toggle_cluster_pixels(self, state):
+        self.show_cluster_pixels = (state == QtCore.Qt.Checked)
+        # Force redraw but keep selection
+        self.plot()
         
     def plot(self):
         self.figure.clear()
@@ -2710,12 +2728,33 @@ class ClusterResultViewerWidget(QtWidgets.QWidget):
              self.ax.set_title("Cluster Analysis (Empty)")
              self.canvas.draw()
              return
-
-        cluster_map = self.results['cluster_map']
+ 
+        cluster_map = self.results.get('cluster_map', None)
         
+        if (cluster_map is None) or (not hasattr(cluster_map, "size")) or (cluster_map.size == 0):
+             self.ax.text(0.5, 0.5, "No Clusters Found", ha='center', va='center', transform=self.ax.transAxes, fontsize=12, color='gray')
+             self.canvas.draw()
+             return
+             
         # Background: Delta Mu
         im = self.ax.imshow(dm, cmap='coolwarm', vmin=-np.pi, vmax=np.pi, origin='upper')
         self.figure.colorbar(im, ax=self.ax, label='Delta Mu (rad)')
+        
+        # Pixel Overlay (diagnostic)
+        if self.show_cluster_pixels and (self.selected_cid is not None):
+            mask = (cluster_map == self.selected_cid)
+            if np.any(mask):
+                overlay = np.zeros_like(dm, dtype=float)
+                overlay[mask] = 1.0
+                self.ax.imshow(
+                    overlay,
+                    interpolation="nearest",
+                    alpha=0.3,
+                    origin='upper',
+                    vmin=0.0,
+                    vmax=1.0,
+                    cmap='gray'
+                )
         
         ids = np.unique(cluster_map)
         ids = ids[ids > 0]
