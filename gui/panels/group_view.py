@@ -1924,7 +1924,15 @@ class GroupViewPanel(QtWidgets.QWidget):
         )
         self.cluster_worker.finished.connect(self.on_cluster_finished)
         self.cluster_worker.error.connect(self.on_cluster_error)
+        self.cluster_worker.progress.connect(self.on_cluster_progress)
         self.cluster_worker.start()
+
+    def on_cluster_progress(self, k, n, msg):
+        try:
+            pct = 100.0 * (k / max(n, 1))
+            self.mw.set_status(f"Cluster Analysis: {pct:.1f}% ({k}/{n}) | {msg}")
+        except Exception:
+            pass
         
     def on_cluster_finished(self, results):
         self.btn_cluster_stats.setEnabled(True)
@@ -1959,6 +1967,7 @@ class GroupViewPanel(QtWidgets.QWidget):
 class ClusterWorker(QtCore.QThread):
     finished = QtCore.pyqtSignal(object)
     error = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(int, int, str)
     
     def __init__(self, grouped_phases, grid_shape, mask, min_n, n_perm, seed, alpha_forming, alpha_sig, save_plot, session_dir, connectivity=4, allow_cross_lobe=False):
         super().__init__()
@@ -1977,11 +1986,16 @@ class ClusterWorker(QtCore.QThread):
         
     def run(self):
         try:
+            def cb(stage, k, n, extra=""):
+                msg = f"{stage}: {extra}" if extra else stage
+                self.progress.emit(int(k), int(n), msg)
+        
             results = cluster_stats.run_bin_cluster_analysis(
                 self.grouped_phases, self.grid_shape, self.mask,
                 min_n=self.min_n, n_perm=self.n_perm, seed=self.seed, 
                 alpha_forming=self.alpha_forming, alpha_sig=self.alpha_sig,
-                connectivity=self.connectivity, allow_cross_lobe=self.allow_cross_lobe
+                connectivity=self.connectivity, allow_cross_lobe=self.allow_cross_lobe,
+                progress_cb=cb
             )
             # Add alphas to results
             results['alpha_forming'] = float(self.alpha_forming)
@@ -1990,8 +2004,10 @@ class ClusterWorker(QtCore.QThread):
             results['alpha'] = float(self.alpha_sig)
             
             # Save Results
+            self.progress.emit(self.n_perm, self.n_perm, "Saving results...")
             out_dir = os.path.join(self.session_dir, "cluster_stats")
             cluster_stats.save_cluster_results(results, out_dir)
+            self.progress.emit(self.n_perm, self.n_perm, "Saving results...done")
             
             if self.save_plot:
                 png_path = os.path.join(out_dir, "diagnostic_plot.png")

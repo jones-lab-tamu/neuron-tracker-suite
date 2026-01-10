@@ -16,7 +16,8 @@ from scipy import stats, ndimage
 import pandas as pd
 import logging
 import json
-from typing import Dict, List, Tuple, Optional, Any
+import time
+from typing import Dict, List, Tuple, Optional, Any, Callable
 
 def _structure_from_connectivity(connectivity: int):
     """Generates NDImage structure based on neighbor count."""
@@ -186,6 +187,7 @@ def run_bin_cluster_analysis(
     alpha_sig: float = 0.05,
     connectivity: int = 4,
     allow_cross_lobe: bool = False,
+    progress_cb: Optional[Callable[[str, int, int, str], None]] = None,
     alpha: float = None # Legacy compat
 ):
     """
@@ -208,6 +210,9 @@ def run_bin_cluster_analysis(
          
     rng = np.random.default_rng(seed)
     H, W = grid_shape
+    
+    t0_start = time.perf_counter()
+    if progress_cb: progress_cb("Init", 0, 1, "setup")
     
     # 2. Materialize Bin Data (First Pass - Identify Valid Animals)
     temp_bin_data = [] # List of (r, c, c_dict, e_dict)
@@ -290,6 +295,8 @@ def run_bin_cluster_analysis(
     logging.info(f"ClusterStats: allow_cross_lobe={allow_cross_lobe}, connectivity={connectivity}, alpha_forming={alpha_forming}, alpha_sig={alpha_sig}, n_perm={n_perm}")
 
     # 4. Finalize Bin Data with Indices
+    t1_obs = time.perf_counter()
+    if progress_cb: progress_cb("Compute observed maps", 0, 1, "processing bins")
     valid_bins_data = [] # List of dicts
     obs_delta_mu_linear = []
     
@@ -323,6 +330,8 @@ def run_bin_cluster_analysis(
     obs_delta_mu_linear = np.array(obs_delta_mu_linear)
     obs_abs_delta_mu_linear = np.abs(obs_delta_mu_linear)
     
+    t2_perm = time.perf_counter()
+    
     # 3. Permutation Loop (Global)
     # Initialize with NaNs to mask invalid perms
     perms_linear = np.full((n_perm, n_valid), np.nan, dtype=np.float32)
@@ -338,7 +347,15 @@ def run_bin_cluster_analysis(
         for lobe in unique_lobes:
             max_mass_dist[int(lobe)] = np.zeros(n_perm)
     
+    REPORT_EVERY = max(10, n_perm // 100)
+    if progress_cb: progress_cb("Permutations", 0, n_perm, "starting")
+
     for k in range(n_perm):
+        if progress_cb and (k % REPORT_EVERY == 0):
+            elapsed = time.perf_counter() - t2_perm
+            rate = (k + 1) / max(elapsed, 1e-9)
+            eta = (n_perm - (k + 1)) / max(rate, 1e-9)
+            progress_cb("Permutations", k + 1, n_perm, f"elapsed={elapsed:.1f}s, ETA={eta:.1f}s")
         # Global Shuffle
         shuffled_labels = rng.permutation(original_labels)
         
@@ -363,6 +380,9 @@ def run_bin_cluster_analysis(
             
             dm = _wrap_to_pi(_circ_mean(pe) - _circ_mean(pc))
             perms_linear[k, i] = abs(dm)
+            
+    if progress_cb: progress_cb("Permutations", n_perm, n_perm, "done")
+    t3_stats = time.perf_counter()
             
     # 4. Statistics & Clustering
     
@@ -569,6 +589,17 @@ def run_bin_cluster_analysis(
             # Log it first just in case
             logging.error(msg)
             raise ValueError(msg)
+            
+    t4_end = time.perf_counter()
+    
+    dt_init = t1_obs - t0_start
+    dt_obs = t2_perm - t1_obs
+    dt_perm = t3_stats - t2_perm
+    dt_stats = t4_end - t3_stats
+    
+    logging.info(f"ClusterStats Timing (sec): Init={dt_init:.3f}, Obs={dt_obs:.3f}, Perms={dt_perm:.3f}, Stats={dt_stats:.3f}")
+    
+    if progress_cb: progress_cb("Finalize observed clusters", n_perm, n_perm, "complete")
 
     return {
         'delta_mu_map': delta_mu_map, 
