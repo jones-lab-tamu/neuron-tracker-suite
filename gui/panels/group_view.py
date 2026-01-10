@@ -2017,6 +2017,16 @@ class ClusterWorker(QtCore.QThread):
             
         except Exception as e:
             import traceback
-            traceback.print_exc()
-            self.error.emit(str(e))
+            tb = traceback.format_exc()
+            
+            mw = getattr(self, "mw", None)
+            if mw is not None and hasattr(mw, "log_message"):
+                try:
+                    mw.log_message(tb)
+                except Exception:
+                    print(tb)
+            else:
+                print(tb)
+                
+            self.error.emit(f"{repr(e)} (see log for traceback)")
 

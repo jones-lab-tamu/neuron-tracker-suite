@@ -323,6 +323,7 @@ def run_bin_cluster_analysis(
             bin_phases.append(ph)
             
         valid_bins_data.append({
+            'r': r,
             'c': c,
             # Store flattened index into matrices for reference if needed
             'flat_idx': len(valid_bins_data)
@@ -330,6 +331,27 @@ def run_bin_cluster_analysis(
         
         valid_bin_ctrl_dicts.append(c_dict)
         valid_bin_exp_dicts.append(e_dict)
+        
+    # VALIDATION: Check for data integrity (Part A)
+    # VALIDATION: Check for data integrity (Part A)
+    invalid_entries = []
+    for i, d in enumerate(valid_bins_data):
+        if not isinstance(d, dict) or 'r' not in d or 'c' not in d:
+            invalid_entries.append((i, d))
+            
+    if invalid_entries:
+        msg = f"valid_bins_data integrity failure: {len(invalid_entries)} invalid entries found.\n"
+        msg += f"Invalid examples: {[ (i, repr(d)) for i, d in invalid_entries[:3] ]}\n"
+        # Gather samples of valid ones for contrast
+        valid_samples = []
+        for i, d in enumerate(valid_bins_data):
+            if not isinstance(d, dict) or 'r' not in d or 'c' not in d:
+                continue
+            valid_samples.append((i, repr(d)))
+            if len(valid_samples) >= 3:
+                break
+        msg += f"Valid examples: {valid_samples}"
+        raise ValueError(msg)
         
     # Vectorization Setup: Build (N_animals_total, n_valid) matrices
     # Initialize with 0.0
