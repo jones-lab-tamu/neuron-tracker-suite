@@ -39,7 +39,7 @@ def _circ_mean(phases):
         return np.nan
     return stats.circmean(phases, high=np.pi, low=-np.pi)
 
-def _find_clusters(sig_mask: np.ndarray, abs_delta_mu: np.ndarray, lobe_mask: np.ndarray, connectivity: int = 8, strict_mode: bool = False):
+def _find_clusters(sig_mask: np.ndarray, abs_delta_mu: np.ndarray, lobe_mask: np.ndarray, connectivity: int = 8, strict_mode: bool = False, allow_cross_lobe: bool = False):
     """
     Finds clusters of True values in sig_mask within each lobe.
     Returns:
@@ -64,69 +64,114 @@ def _find_clusters(sig_mask: np.ndarray, abs_delta_mu: np.ndarray, lobe_mask: np
     current_max_id = 0
     cluster_props = []
     
-    for lobe_id in unique_lobes:
-        # Mask for this lobe AND significant bins
-        valid_mask = (sig_mask) & (lobe_mask == lobe_id)
+    
+    if allow_cross_lobe:
+        # MODE 2: Global clustering across lobes
+        # Mask: Significant AND in any valid lobe (non-zero)
+        valid_mask = sig_mask & (lobe_mask > 0)
         
-        # Label connected components
         labeled_array, num_features = ndimage.label(valid_mask, structure=structure)
+        full_label_map = labeled_array # In this mode, no need to offset per lobe
         
         if num_features > 0:
-            # Shift IDs to be unique across lobes
-            labeled_array[labeled_array > 0] += current_max_id
-             
-            # Calculate properties
-            for local_id in range(1, num_features + 1):
-                global_id = local_id + current_max_id
-                
-                # Get indices for this cluster
+            for global_id in range(1, num_features + 1):
+                # Get indices
                 cluster_bool = (labeled_array == global_id)
                 n_bins = np.sum(cluster_bool)
                 
-                # Calculate mass
-                # Check for NaNs in abs_delta_mu just in case, though they shouldn't be in sig_mask
+                # Mass
                 mass_vals = abs_delta_mu[cluster_bool]
                 total_mass = np.sum(mass_vals[np.isfinite(mass_vals)])
                 
-                # Get coords
+                # Lobes present in this cluster
+                cluster_lobes = np.unique(lobe_mask[cluster_bool])
+                cluster_lobes = sorted([int(l) for l in cluster_lobes if l > 0])
+                
+                # Primary lobe assignment for backward compat:
+                # If spans multiple, use 0. If single, use that ID.
+                if len(cluster_lobes) == 1:
+                    primary_lobe = cluster_lobes[0]
+                else:
+                    primary_lobe = 0
+                
+                # Coords
                 rows, cols = np.where(cluster_bool)
-                # Store as list of [r, c] for JSON serialization
                 members = [[int(r), int(c)] for r, c in zip(rows, cols)]
                 
                 cluster_props.append({
                     'id': int(global_id),
-                    'lobe': int(lobe_id),
+                    'lobe': int(primary_lobe),
+                    'lobes': cluster_lobes,
                     'n_bins': int(n_bins),
                     'mass': float(total_mass),
                     'members': json.dumps(members)
                 })
+    else:
+        # MODE 1: Per-lobe separation (Original)
+        for lobe_id in unique_lobes:
+            # Mask for this lobe AND significant bins
+            valid_mask = (sig_mask) & (lobe_mask == lobe_id)
             
-            # Add to full map with overlap check
-            mask = labeled_array > 0
+            # Label connected components
+            labeled_array, num_features = ndimage.label(valid_mask, structure=structure)
             
-            # Defensive check for overlap
-            overlap_mask = (full_label_map > 0) & mask
-            if np.any(overlap_mask):
-                overlap_count = np.sum(overlap_mask)
+            if num_features > 0:
+                # Shift IDs to be unique across lobes
+                labeled_array[labeled_array > 0] += current_max_id
+                 
+                # Calculate properties
+                for local_id in range(1, num_features + 1):
+                    global_id = local_id + current_max_id
+                    
+                    # Get indices for this cluster
+                    cluster_bool = (labeled_array == global_id)
+                    n_bins = np.sum(cluster_bool)
+                    
+                    # Calculate mass
+                    # Check for NaNs in abs_delta_mu just in case, though they shouldn't be in sig_mask
+                    mass_vals = abs_delta_mu[cluster_bool]
+                    total_mass = np.sum(mass_vals[np.isfinite(mass_vals)])
+                    
+                    # Get coords
+                    rows, cols = np.where(cluster_bool)
+                    # Store as list of [r, c] for JSON serialization
+                    members = [[int(r), int(c)] for r, c in zip(rows, cols)]
+                    
+                    cluster_props.append({
+                        'id': int(global_id),
+                        'lobe': int(lobe_id),
+                        'lobes': [int(lobe_id)],
+                        'n_bins': int(n_bins),
+                        'mass': float(total_mass),
+                        'members': json.dumps(members)
+                    })
                 
-                # Sample overlap coordinates for logging
-                rows, cols = np.where(overlap_mask)
-                coords = list(zip(rows, cols))[:10]
-                coord_str = ", ".join([f"({r},{c})" for r, c in coords])
-                if len(rows) > 10: coord_str += "..."
+                # Add to full map with overlap check
+                mask = labeled_array > 0
                 
-                msg = (f"Cluster overlap detected at {overlap_count} bins during Lobe {lobe_id} processing. "
-                       f"Overlap Coords: {coord_str}. Previous Max ID: {current_max_id}.")
-                
-                if strict_mode:
-                    raise ValueError(f"Strict Mode Violation: {msg}")
-                else:
-                    logging.warning(msg)
-                
-            # Merge with assignment, but DO NOT overwrite existing labels
-            write_mask = mask & (~overlap_mask)
-            full_label_map[write_mask] = labeled_array[write_mask]
-            current_max_id += num_features
+                # Defensive check for overlap
+                overlap_mask = (full_label_map > 0) & mask
+                if np.any(overlap_mask):
+                    overlap_count = np.sum(overlap_mask)
+                    
+                    # Sample overlap coordinates for logging
+                    rows, cols = np.where(overlap_mask)
+                    coords = list(zip(rows, cols))[:10]
+                    coord_str = ", ".join([f"({r},{c})" for r, c in coords])
+                    if len(rows) > 10: coord_str += "..."
+                    
+                    msg = (f"Cluster overlap detected at {overlap_count} bins during Lobe {lobe_id} processing. "
+                           f"Overlap Coords: {coord_str}. Previous Max ID: {current_max_id}.")
+                    
+                    if strict_mode:
+                        raise ValueError(f"Strict Mode Violation: {msg}")
+                    else:
+                        logging.warning(msg)
+                    
+                # Merge with assignment, but DO NOT overwrite existing labels
+                write_mask = mask & (~overlap_mask)
+                full_label_map[write_mask] = labeled_array[write_mask]
+                current_max_id += num_features
             
     return full_label_map, cluster_props
 
@@ -140,6 +185,7 @@ def run_bin_cluster_analysis(
     alpha_forming: float = 0.05,
     alpha_sig: float = 0.05,
     connectivity: int = 4,
+    allow_cross_lobe: bool = False,
     alpha: float = None # Legacy compat
 ):
     """
@@ -208,7 +254,8 @@ def run_bin_cluster_analysis(
             'seed': int(seed),
             'min_n': int(min_n),
             'n_perm': int(n_perm),
-            'connectivity': int(connectivity)
+            'connectivity': int(connectivity),
+            'allow_cross_lobe': bool(allow_cross_lobe)
         }
 
     # 3. Construct Permutation Universe (Restricted)
@@ -240,6 +287,7 @@ def run_bin_cluster_analysis(
     n_exp = len(used_animals_experiment)
     logging.info(f"Permutation Universe: n_total={n_total_animals}, n_ctrl={n_ctrl}, n_exp={n_exp}, "
                  f"n_valid_bins={n_valid}, min_n={min_n}, n_perm={n_perm}, alpha_forming={alpha_forming}, alpha_sig={alpha_sig}, seed={seed}")
+    logging.info(f"ClusterStats: allow_cross_lobe={allow_cross_lobe}, connectivity={connectivity}, alpha_forming={alpha_forming}, alpha_sig={alpha_sig}, n_perm={n_perm}")
 
     # 4. Finalize Bin Data with Indices
     valid_bins_data = [] # List of dicts
@@ -279,8 +327,16 @@ def run_bin_cluster_analysis(
     # Initialize with NaNs to mask invalid perms
     perms_linear = np.full((n_perm, n_valid), np.nan, dtype=np.float32)
     
-    unique_lobes = np.unique(lobe_mask[lobe_mask > 0])
-    max_mass_dist = {lobe: np.zeros(n_perm) for lobe in unique_lobes}
+    unique_lobes = sorted(set(int(x) for x in np.unique(lobe_mask) if int(x) != 0))
+    # Stats storage:
+    # If cross-lobe OFF: key=lobe_id, val=array of max masses
+    # If cross-lobe ON: key='global', val=array of max masses (single null distribution)
+    max_mass_dist = {}
+    if allow_cross_lobe:
+        max_mass_dist['global'] = np.zeros(n_perm)
+    else:
+        for lobe in unique_lobes:
+            max_mass_dist[int(lobe)] = np.zeros(n_perm)
     
     for k in range(n_perm):
         # Global Shuffle
@@ -404,17 +460,26 @@ def run_bin_cluster_analysis(
         
         # Clustering
         # Use consistent connectivity for null distribution
-        _, props = _find_clusters(sig_perm_map, mass_perm_map, lobe_mask, connectivity=connectivity)
+        _, props = _find_clusters(sig_perm_map, mass_perm_map, lobe_mask, connectivity=connectivity, allow_cross_lobe=allow_cross_lobe)
         
         # Max mass logic
-        current_maxes = {l: 0.0 for l in unique_lobes}
-        for p in props:
-            l = p['lobe']
-            m = p['mass']
-            if m > current_maxes.get(l, 0):
-                current_maxes[l] = m
-        for l in unique_lobes:
-            max_mass_dist[l][k] = current_maxes[l]
+        if allow_cross_lobe:
+            # Global Null
+            cur_max = 0.0
+            for p in props:
+                if p['mass'] > cur_max:
+                    cur_max = p['mass']
+            max_mass_dist['global'][k] = cur_max
+        else:
+            # Per-Lobe Null
+            current_maxes = {int(l): 0.0 for l in unique_lobes}
+            for p in props:
+                l = int(p['lobe'])
+                m = p['mass']
+                if m > current_maxes.get(l, 0):
+                    current_maxes[l] = m
+            for l in unique_lobes:
+                max_mass_dist[int(l)][k] = current_maxes[int(l)]
             
     # 5. Observed Clusters
     # Reconstruct Maps
@@ -455,16 +520,36 @@ def run_bin_cluster_analysis(
     # The _find_clusters function applies (sig_mask_obs & lobe_mask) then labels.
     # This aligns with Option 1: Mask then Label. 
     # No further masking is applied to the map.
-    cluster_map_obs, cluster_props_obs = _find_clusters(sig_mask_obs, np.abs(delta_mu_map), lobe_mask, connectivity=connectivity, strict_mode=True)
+    cluster_map_obs, cluster_props_obs = _find_clusters(sig_mask_obs, np.abs(delta_mu_map), lobe_mask, connectivity=connectivity, strict_mode=True, allow_cross_lobe=allow_cross_lobe)
     
     final_clusters = []
     for p in cluster_props_obs:
         obs_mass = p['mass']
-        lobe = p['lobe']
-        null_dist = max_mass_dist[lobe]
-        n_beats = np.sum(null_dist >= obs_mass)
-        p_corr = (1.0 + n_beats) / (1.0 + n_perm)
-        p.update({'p_corr': p_corr})
+        
+        if allow_cross_lobe:
+            # Correct against Global Null
+            null_dist = max_mass_dist['global']
+            lobe = p['lobe'] # might be 0
+        else:
+            # Correct against Specific Lobe Null
+            lobe = int(p['lobe'])
+            if lobe not in max_mass_dist:
+                raise KeyError(f"Lobe ID {lobe} not found in max_mass_dist keys: {list(max_mass_dist.keys())}")
+            null_dist = max_mass_dist[lobe]
+            
+        if len(null_dist) == 0:
+            key_str = "global" if allow_cross_lobe else f"lobe={lobe}"
+            raise ValueError(
+                f"Empty null distribution for {key_str}. "
+                f"n_perm={n_perm}, allow_cross_lobe={allow_cross_lobe}, connectivity={connectivity}, "
+                f"alpha_forming={alpha_forming}, alpha_sig={alpha_sig}."
+            )
+        else:
+            # P-value = (1 + sum(null >= obs)) / (1 + K)
+            n_greater = np.sum(null_dist >= obs_mass)
+            p_corr = (1.0 + n_greater) / (1.0 + len(null_dist))
+            
+        p['p_corr'] = float(p_corr)
         final_clusters.append(p)
         
     # Part A: Hard Diagnostic Assertion
@@ -501,7 +586,8 @@ def run_bin_cluster_analysis(
         'seed': int(seed),
         'min_n': int(min_n),
         'n_perm': int(n_perm),
-        'connectivity': int(connectivity)
+        'connectivity': int(connectivity),
+        'allow_cross_lobe': bool(allow_cross_lobe)
     }
 
 def save_cluster_results(results: Dict[str, Any], output_dir: str):

@@ -79,6 +79,10 @@ class ClusterConfigDialog(QtWidgets.QDialog):
         self.combo_connectivity.setCurrentIndex(0) # Default to 4
         p_layout.addRow("Connectivity:", self.combo_connectivity)
         
+        self.chk_cross_lobe = QtWidgets.QCheckBox("Allow clusters across lobes")
+        self.chk_cross_lobe.setChecked(False) # Off by default
+        p_layout.addRow(self.chk_cross_lobe)
+        
         self.check_plot = QtWidgets.QCheckBox("Save diagnostic plot (PNG)")
         p_layout.addRow(self.check_plot)
         
@@ -124,4 +128,5 @@ class ClusterConfigDialog(QtWidgets.QDialog):
         self.seed = self.spin_seed.value()
         self.save_plot = self.check_plot.isChecked()
         self.connectivity = self.combo_connectivity.currentData()
+        self.allow_cross_lobe = self.chk_cross_lobe.isChecked()
         super().accept()
