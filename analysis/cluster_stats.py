@@ -298,6 +298,8 @@ def run_bin_cluster_analysis(
     t1_obs = time.perf_counter()
     if progress_cb: progress_cb("Compute observed maps", 0, 1, "processing bins")
     valid_bins_data = [] # List of dicts
+    valid_bin_ctrl_dicts = [] # Helper for matrix fill
+    valid_bin_exp_dicts = [] # Helper for matrix fill
     obs_delta_mu_linear = []
     
     for (r, c, c_dict, e_dict) in temp_bin_data:
@@ -321,11 +323,47 @@ def run_bin_cluster_analysis(
             bin_phases.append(ph)
             
         valid_bins_data.append({
-            'r': r,
             'c': c,
-            'indices': np.array(bin_indices, dtype=int),
-            'phases': np.array(bin_phases, dtype=float)
+            # Store flattened index into matrices for reference if needed
+            'flat_idx': len(valid_bins_data)
         })
+        
+        valid_bin_ctrl_dicts.append(c_dict)
+        valid_bin_exp_dicts.append(e_dict)
+        
+    # Vectorization Setup: Build (N_animals_total, n_valid) matrices
+    # Initialize with 0.0
+    matrices_sin = np.zeros((n_total_animals, n_valid), dtype=np.float32)
+    matrices_cos = np.zeros((n_total_animals, n_valid), dtype=np.float32)
+    # VALID matrix: 1 if animal has data for bin, 0 otherwise. Used for Min-N counts.
+    matrices_valid = np.zeros((n_total_animals, n_valid), dtype=np.uint8)
+    
+    # Defensive checks (Runtime integrity)
+    if len(valid_bin_ctrl_dicts) != n_valid or len(valid_bin_exp_dicts) != n_valid:
+        raise ValueError(f"Logic Error: Valid bin dicts count mismatch. n_valid={n_valid}, ctrl={len(valid_bin_ctrl_dicts)}, exp={len(valid_bin_exp_dicts)}, bins={len(valid_bins_data)}")
+        
+    # Check shape integrity strictly
+    if matrices_sin.shape[1] != n_valid or matrices_cos.shape[1] != n_valid or matrices_valid.shape[1] != n_valid:
+        raise ValueError(f"Logic Error: Matrix shape mismatch. Expected width {n_valid}, got sin={matrices_sin.shape}, cos={matrices_cos.shape}, valid={matrices_valid.shape}")
+    
+    # Fill matrices using ONLY valid-bin index j
+    for j in range(n_valid):
+        c_dict = valid_bin_ctrl_dicts[j]
+        e_dict = valid_bin_exp_dicts[j]
+        
+        # Control animals in this bin
+        for anim, ph in c_dict.items():
+            idx = animal_to_idx[anim]
+            matrices_sin[idx, j] = np.sin(ph)
+            matrices_cos[idx, j] = np.cos(ph)
+            matrices_valid[idx, j] = 1
+            
+        # Experiment animals in this bin
+        for anim, ph in e_dict.items():
+            idx = animal_to_idx[anim]
+            matrices_sin[idx, j] = np.sin(ph)
+            matrices_cos[idx, j] = np.cos(ph)
+            matrices_valid[idx, j] = 1
     
     obs_delta_mu_linear = np.array(obs_delta_mu_linear)
     obs_abs_delta_mu_linear = np.abs(obs_delta_mu_linear)
@@ -356,30 +394,40 @@ def run_bin_cluster_analysis(
             rate = (k + 1) / max(elapsed, 1e-9)
             eta = (n_perm - (k + 1)) / max(rate, 1e-9)
             progress_cb("Permutations", k + 1, n_perm, f"elapsed={elapsed:.1f}s, ETA={eta:.1f}s")
-        # Global Shuffle
+            
+        # Global Shuffle of labels (0=Control, 1=Experiment)
         shuffled_labels = rng.permutation(original_labels)
         
-        # Compute for all valid bins using THESE labels
-        for i, bdata in enumerate(valid_bins_data):
-            # Extract labels for animals in this bin
-            bin_anim_indices = bdata['indices']
-            bin_labs = shuffled_labels[bin_anim_indices]
-            bin_phs = bdata['phases']
-            
-            # Split
-            mask_c = (bin_labs == 0)
-            mask_e = (bin_labs == 1)
-            
-            # Strict Min N check for VALIDITY
-            if np.sum(mask_c) < min_n or np.sum(mask_e) < min_n:
-                # Leave as NaN
-                continue
-                
-            pc = bin_phs[mask_c]
-            pe = bin_phs[mask_e]
-            
-            dm = _wrap_to_pi(_circ_mean(pe) - _circ_mean(pc))
-            perms_linear[k, i] = abs(dm)
+        # Create masks for groups (n_total_animals,)
+        mask_c = (shuffled_labels == 0)
+        mask_e = (shuffled_labels == 1)
+        
+        # Vectorized Summation: (n_valid_bins,)
+        # Sum Sin/Cos for Control
+        sin_sum_c = np.sum(matrices_sin[mask_c, :], axis=0)
+        cos_sum_c = np.sum(matrices_cos[mask_c, :], axis=0)
+        n_c = np.sum(matrices_valid[mask_c, :], axis=0)
+        
+        # Sum Sin/Cos for Experiment
+        sin_sum_e = np.sum(matrices_sin[mask_e, :], axis=0)
+        cos_sum_e = np.sum(matrices_cos[mask_e, :], axis=0)
+        n_e = np.sum(matrices_valid[mask_e, :], axis=0)
+        
+        # Validity Mask for this Permutation (Vectorized Min-N)
+        valid_perm_mask = (n_c >= min_n) & (n_e >= min_n)
+        
+        # Compute Circular Means (where valid)
+        # arctan2 handles (y, x) -> (sin, cos)
+        mu_c = np.arctan2(sin_sum_c, cos_sum_c)
+        mu_e = np.arctan2(sin_sum_e, cos_sum_e)
+        
+        # Delta & Wrap
+        dm = _wrap_to_pi(mu_e - mu_c)
+        
+        # Store absolute delta mu, or NaN where invalid
+        # Note: We use np.where to safely handle potential invalid arithmetics in invalid bins
+        # though arctan2 is generally robust (0,0 gives 0).
+        perms_linear[k, :] = np.where(valid_perm_mask, np.abs(dm), np.nan)
             
     if progress_cb: progress_cb("Permutations", n_perm, n_perm, "done")
     t3_stats = time.perf_counter()
