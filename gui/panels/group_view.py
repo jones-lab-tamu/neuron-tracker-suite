@@ -62,6 +62,7 @@ class GroupViewPanel(QtWidgets.QWidget):
         for w_name in ['group_grid_res_edit', 'group_smooth_check', 'btn_cluster_stats']:
             if not hasattr(self, w_name):
                  raise RuntimeError(f"UI Initialization Failed: Missing {w_name}")
+        self.warped_heatmap_export_payload = None
 
     def init_ui(self):
         def safe_icon(k):
@@ -473,6 +474,18 @@ class GroupViewPanel(QtWidgets.QWidget):
         if is_indiv:
             self._refresh_animal_list()
 
+        # Export is available only for Individual mode.
+        # Reset payload/button whenever mode changes to prevent stale export.
+        self.warped_heatmap_export_payload = None
+        if hasattr(self.mw, "btn_export_data"):
+            self.mw.btn_export_data.setEnabled(False)
+
+        # Export is available only for Individual mode.
+        # Reset payload/button whenever mode changes to prevent stale export.
+        self.warped_heatmap_export_payload = None
+        if hasattr(self.mw, "btn_export_data"):
+            self.mw.btn_export_data.setEnabled(False)
+
     def _derive_base_path(self, p: str) -> str:
         """
         Derive the base dataset path by stripping known suffixes or extensions.
@@ -550,6 +563,11 @@ class GroupViewPanel(QtWidgets.QWidget):
 
     def _render_warped_heatmap(self):
         self._ensure_warped_heatmap_canvas()
+        
+        # Reset export state at start
+        self.warped_heatmap_export_payload = None
+        if hasattr(self.mw, "btn_export_data"):
+            self.mw.btn_export_data.setEnabled(False)
         
         # 1. Validate Atlas & Parse Phase Axes (Bilateral Support)
         atlas_path = self.state.atlas_roi_path
@@ -850,6 +868,55 @@ class GroupViewPanel(QtWidgets.QWidget):
                 
                 all_traces.append(selected_traces)
                 all_s.extend(s_vals)
+
+                # EXPORT CAPTURE: Individual Mode Only
+                # Capture the exact data used for this animal, right here.
+                if mode == "Individual":
+                    # Robust Base Name
+                    # Use warped file basename without extension.
+                    # Strip suffix "_roi_warped_with_ids" only if present.
+                    bn_warp = os.path.splitext(os.path.basename(warp_path))[0]
+                    suffix_strip = "_roi_warped_with_ids"
+                    if bn_warp.endswith(suffix_strip):
+                        animal_base = bn_warp[:-len(suffix_strip)]
+                    else:
+                        animal_base = bn_warp
+                    
+                    # Meta
+                    # Columns: Animal, Source_Warped_File, Source_Traces_File, Original_ROI_Index, S_DorsalVentral, Is_Rhythmic
+                    df_meta = pd.DataFrame({
+                        'Animal': [animal_base] * len(indices),
+                        'Source_Warped_File': [os.path.basename(warp_path)] * len(indices),
+                        'Source_Traces_File': [os.path.basename(traces_path)] * len(indices),
+                        'Original_ROI_Index': indices,
+                        'S_DorsalVentral': s_vals,
+                        'Is_Rhythmic': [True] * len(indices)
+                    })
+
+                    # Traces (Wide)
+                    # Per spec: Original_ROI_Index, S_DorsalVentral, Frame_0000...
+                    df_traces_cols = pd.DataFrame({
+                        'Original_ROI_Index': indices,
+                        'S_DorsalVentral': s_vals
+                    })
+                    # traces is [n_cells, n_timepoints]
+                    frame_cols = [f"Frame_{k:04d}" for k in range(selected_traces.shape[1])]
+                    df_frames = pd.DataFrame(selected_traces, columns=frame_cols)
+                    df_traces = pd.concat([df_traces_cols, df_frames], axis=1)
+                    
+                    # Time
+                    time_vec = traces_df.iloc[:, 0].to_numpy()
+                    df_time = pd.DataFrame({
+                        'Frame_Index': np.arange(len(time_vec)),
+                        'Time': time_vec
+                    })
+                    
+                    captured_export_payload = {
+                        "meta": df_meta,
+                        "traces": df_traces,
+                        "time": df_time,
+                        "base_name": animal_base
+                    }
                 
             except Exception as e:
                 bn = os.path.basename(os.path.normpath(p)) if os.path.isdir(p) else os.path.basename(p)
@@ -877,6 +944,60 @@ class GroupViewPanel(QtWidgets.QWidget):
         viewer = WarpedHeatmapViewer(self._warped_heatmap_fig, final_traces, final_s, title)
         self.mw.visualization_widgets[self.mw.warped_tab] = viewer
         self._warped_heatmap_canvas.draw_idle()
+
+        # Final Export Enable Check
+        # Only enable if we have payload AND the viewer successfully computed sorting indices.
+        if mode == "Individual" and captured_export_payload is not None:
+            if hasattr(viewer, 'render_indices') and viewer.render_indices is not None:
+                try:
+                    # Explicit Validation of Render Indices
+                    sort_idx = np.asarray(viewer.render_indices)
+                    
+                    if sort_idx.ndim != 1:
+                        raise ValueError(f"Render indices must be 1D, got shape {sort_idx.shape}")
+                    
+                    # Check integer type (safe cast if numeric/finite but strictly integer-valued)
+                    if not np.issubdtype(sort_idx.dtype, np.integer):
+                        if not np.issubdtype(sort_idx.dtype, np.number):
+                             raise ValueError(f"Render indices non-numeric type {sort_idx.dtype}")
+                        if not np.all(np.isfinite(sort_idx)):
+                             raise ValueError("Render indices contain non-finite values")
+                        
+                        # Strict integer-value check
+                        if not np.all(sort_idx == np.round(sort_idx)):
+                             raise ValueError("Render indices contain non-integer numeric values")
+                             
+                        sort_idx = sort_idx.astype(int)
+
+                    n_meta = len(captured_export_payload['meta'])
+                    
+                    # Permutation Validation
+                    if len(sort_idx) != n_meta:
+                         raise ValueError(f"Sort index length {len(sort_idx)} != Metadata rows {n_meta}")
+                    
+                    if not np.array_equal(np.sort(sort_idx), np.arange(n_meta)):
+                         raise ValueError("Render indices are not a valid permutation of input rows")
+
+                    # Apply strict viewer order
+                    df_mt = captured_export_payload['meta']
+                    df_mt = df_mt.iloc[sort_idx].reset_index(drop=True)
+                    captured_export_payload['meta'] = df_mt
+                    
+                    df_tr = captured_export_payload['traces']
+                    df_tr = df_tr.iloc[sort_idx].reset_index(drop=True)
+                    captured_export_payload['traces'] = df_tr
+                    
+                    self.warped_heatmap_export_payload = captured_export_payload
+                    if hasattr(self.mw, "btn_export_data"):
+                        self.mw.btn_export_data.setEnabled(True)
+                        
+                except Exception as e:
+                    self.mw.log_message(f"Export disabled due to sort validation error: {e}")
+                    # Do not enable
+            else:
+                 # Logic: If viewer didn't produce indices (e.g. no data rendered or filter failure), 
+                 # we do not enable export.
+                 pass
     
     
     def _clear_tab_contents(self, tab_widget: QtWidgets.QWidget) -> None:

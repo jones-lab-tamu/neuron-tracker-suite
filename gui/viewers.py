@@ -64,6 +64,7 @@ class WarpedHeatmapViewer:
         self.traces_2d = traces_2d
         self.sort_s = sort_s
         self.title = title
+        self.render_indices = None # Store indices of originally passed data that are rendered
         
         # Idempotency: Clear figure to remove old axes/colorbars
         self.fig.clf()
@@ -98,12 +99,15 @@ class WarpedHeatmapViewer:
 
         # 0. Filter Non-Finite S (Robustness)
         mask_valid = np.isfinite(s_arr)
-        if not np.any(mask_valid):
+        valid_indices_original = np.where(mask_valid)[0]
+        
+        if len(valid_indices_original) == 0:
             self.ax.text(0.5, 0.5, "No Data (non-finite axis projections)", ha='center', va='center')
             self.ax.axis('off')
             return
             
         # Filter both traces and s
+        # NOTE: valid_traces corresponds to valid_indices_original
         valid_traces = self.traces_2d[mask_valid, :]
         valid_s = s_arr[mask_valid]
 
@@ -124,6 +128,9 @@ class WarpedHeatmapViewer:
         # Index 0 (Bottom) = Ventral. Index N (Top) = Dorsal.
         sort_idx = np.argsort(valid_s)[::-1]
         sorted_data = normalized[sort_idx, :]
+        
+        # Capture the final mapping from original input to sorted rows
+        self.render_indices = valid_indices_original[sort_idx]
 
         # 3. Render
         im = self.ax.imshow(sorted_data, aspect='auto', interpolation='nearest', 
