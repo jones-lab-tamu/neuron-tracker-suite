@@ -480,12 +480,6 @@ class GroupViewPanel(QtWidgets.QWidget):
         if hasattr(self.mw, "btn_export_data"):
             self.mw.btn_export_data.setEnabled(False)
 
-        # Export is available only for Individual mode.
-        # Reset payload/button whenever mode changes to prevent stale export.
-        self.warped_heatmap_export_payload = None
-        if hasattr(self.mw, "btn_export_data"):
-            self.mw.btn_export_data.setEnabled(False)
-
     def _derive_base_path(self, p: str) -> str:
         """
         Derive the base dataset path by stripping known suffixes or extensions.
@@ -1985,7 +1979,46 @@ class GroupViewPanel(QtWidgets.QWidget):
                  self.mw.log_message("Region Stats export unavailable: RegionResultViewer not found.")
              return
 
-        # Branch 2: General Visualization Export (e.g. Group Map, Grid Analysis)
+        # Branch 2: Warped Heatmap Export
+        warped_tab = getattr(self.mw, 'warped_tab', None)
+        if current_tab is not None and warped_tab is not None and (current_tab == warped_tab):
+            payload = getattr(self, 'warped_heatmap_export_payload', None)
+            if payload is None:
+                QtWidgets.QMessageBox.information(
+                    self, "Export Unavailable",
+                    "No export data available. Please render an Individual Warped Heatmap first.\n"
+                    "(Export is disabled for Pooled/Control modes)."
+                )
+                self.mw.log_message("Export failed: warped_heatmap_export_payload is None.")
+                return
+
+            # Directory Selection
+            start_dir = ""
+            if hasattr(self.mw, "_get_last_dir"):
+                start_dir = self.mw._get_last_dir()
+            out_dir = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Directory", start_dir)
+            if not out_dir: return
+            
+            base_name = payload.get("base_name", "warped_heatmap")
+            
+            try:
+                f_meta = os.path.join(out_dir, f"{base_name}_warped_heatmap_meta.csv")
+                f_tr = os.path.join(out_dir, f"{base_name}_warped_heatmap_traces.csv")
+                f_ti = os.path.join(out_dir, f"{base_name}_warped_heatmap_time.csv")
+                
+                payload['meta'].to_csv(f_meta, index=False)
+                payload['traces'].to_csv(f_tr, index=False)
+                payload['time'].to_csv(f_ti, index=False)
+                
+                self.mw.log_message(f"Exported Warped Heatmap data to {out_dir}")
+            except Exception as e:
+                self.mw.log_message(f"Export Exception: {e}")
+                import traceback
+                self.mw.log_message(traceback.format_exc())
+                QtWidgets.QMessageBox.critical(self, "Export Failed", f"Error writing files:\n{e}")
+            return
+
+        # Branch 3: General Visualization Export (e.g. Group Map, Grid Analysis)
         viewer = self.mw.visualization_widgets.get(current_tab)
         if viewer and hasattr(viewer, 'get_export_data'):
              df, fname = viewer.get_export_data()
