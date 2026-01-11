@@ -11,4 +11,6 @@ env/
 *.egg-info/
 
 # Debugging
+
+# Manual patches
 *.patch

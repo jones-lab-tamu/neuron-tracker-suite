@@ -2624,6 +2624,9 @@ class ClusterWorker(QtCore.QThread):
             # Compat for old viewers
             results['alpha'] = float(self.alpha_sig)
             
+            # Attach source data for exports (dot plots)
+            results['grouped_phases_grid'] = self.grouped_phases
+            
             # Save Results
             self.progress.emit(self.n_perm, self.n_perm, "Saving results...")
             out_dir = os.path.join(self.session_dir, "cluster_stats")
