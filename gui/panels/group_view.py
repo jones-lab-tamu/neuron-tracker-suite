@@ -792,9 +792,44 @@ class GroupViewPanel(QtWidgets.QWidget):
                 
                 indices = merged['Original_ROI_Index'].values.astype(int)
                 
-                # Validate Indices
-                if np.any(indices >= traces_mat.shape[1]):
-                    raise ValueError(f"Trace index OOB: {indices.max()} >= {traces_mat.shape[1]}")
+                n_cols = traces_mat.shape[1]
+                if n_cols <= 0:
+                    raise ValueError(f"No trace columns found in {os.path.basename(traces_path)}")
+
+                if len(indices) > 0:
+                    idx_min = int(indices.min())
+                    idx_max = int(indices.max())
+
+                    # Fix B: Proven 1-based indexing (max == n_cols is impossible in 0-based)
+                    if (idx_max == n_cols) and (idx_min >= 1):
+                        logging.warning(
+                            "WarpedHeatmap: Detected 1-based Original_ROI_Index in %s, converting to 0-based.",
+                            os.path.basename(warp_path),
+                        )
+                        indices = indices - 1
+
+                    # Suspicious case: looks 1-based but cannot be proven (avoid silent misalignment)
+                    idx_min2 = int(indices.min())
+                    idx_max2 = int(indices.max())
+                    # Check suspicious: starts at 1, fits in range, but doesn't hit max limit
+                    if (idx_min2 >= 1) and (idx_max2 <= (n_cols - 1)) and (not np.any(indices == 0)):
+                        logging.warning(
+                            "WarpedHeatmap: Original_ROI_Index starts at >=1 and contains no 0 in %s. "
+                            "This may indicate 1-based indexing, but it cannot be proven because max < n_cols. "
+                            "No conversion applied.",
+                            os.path.basename(warp_path),
+                        )
+
+                # Validate Indices (post-normalization)
+                if np.any(indices < 0) or np.any(indices >= n_cols):
+                    bad_min = int(indices.min()) if len(indices) else 0
+                    bad_max = int(indices.max()) if len(indices) else 0
+                    bn_trace = os.path.basename(traces_path)
+                    bn_warp = os.path.basename(warp_path)
+                    raise ValueError(
+                        f"Trace index OOB after normalization: min={bad_min}, max={bad_max}, n_cols={n_cols}. "
+                        f"File: {bn_trace} (paired with {bn_warp})"
+                    )
                 
                 # Check C: Invariant
                 if len(indices) != len(s_vals):
