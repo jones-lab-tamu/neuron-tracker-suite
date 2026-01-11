@@ -58,6 +58,84 @@ normalize_hours = _normalize_hours_impl
 # Visualization Viewers
 # ------------------------------------------------------------
 
+class WarpedHeatmapViewer:
+    def __init__(self, fig, traces_2d, sort_s, title):
+        self.fig = fig
+        self.traces_2d = traces_2d
+        self.sort_s = sort_s
+        self.title = title
+        
+        # Idempotency: Clear figure to remove old axes/colorbars
+        self.fig.clf()
+        
+        # Setup Axes
+        gs = self.fig.add_gridspec(1, 2, width_ratios=[20, 1], wspace=0.05)
+        self.ax = self.fig.add_subplot(gs[0])
+        self.cax = self.fig.add_subplot(gs[1])
+        
+        self._plot()
+
+    def _plot(self):
+        if self.traces_2d is None or self.traces_2d.size == 0:
+            self.ax.text(0.5, 0.5, "No Data", ha='center', va='center')
+            self.ax.axis('off')
+            return
+
+        # Check A: Length Guard (Robust)
+        s_arr = np.asarray(self.sort_s)
+        if s_arr.ndim != 1:
+            self.ax.text(0.5, 0.5, "No Data (invalid axis projection shape)", ha='center', va='center')
+            self.ax.axis('off')
+            return
+
+        n_rows = self.traces_2d.shape[0]
+        n_s = s_arr.shape[0]
+        
+        if n_s != n_rows:
+            self.ax.text(0.5, 0.5, f"No Data (length mismatch: traces={n_rows}, s={n_s})", ha='center', va='center')
+            self.ax.axis('off')
+            return
+
+        # 0. Filter Non-Finite S (Robustness)
+        mask_valid = np.isfinite(s_arr)
+        if not np.any(mask_valid):
+            self.ax.text(0.5, 0.5, "No Data (non-finite axis projections)", ha='center', va='center')
+            self.ax.axis('off')
+            return
+            
+        # Filter both traces and s
+        valid_traces = self.traces_2d[mask_valid, :]
+        valid_s = s_arr[mask_valid]
+
+        # 1. Normalize (Per Cell / Row)
+        mins = valid_traces.min(axis=1, keepdims=True)
+        maxs = valid_traces.max(axis=1, keepdims=True)
+        denom = maxs - mins
+        denom[denom == 0] = 1.0
+        normalized = (valid_traces - mins) / denom
+
+        # 2. Sort (Dorsal/Higher-S at Top)
+        # S is normalized such that 0=Dorsal, 1=Ventral.
+        # We want Dorsal at Top.
+        # origin='lower' puts Index 0 at Bottom.
+        # We want Dorsal (0) at Top (Index N).
+        # We want Ventral (1) at Bottom (Index 0).
+        # So we want Descending sort: [1.0 ... 0.0] -> [Ventral ... Dorsal]
+        # Index 0 (Bottom) = Ventral. Index N (Top) = Dorsal.
+        sort_idx = np.argsort(valid_s)[::-1]
+        sorted_data = normalized[sort_idx, :]
+
+        # 3. Render
+        im = self.ax.imshow(sorted_data, aspect='auto', interpolation='nearest', 
+                            origin='lower', cmap='viridis')
+        
+        self.ax.set_title(self.title)
+        self.ax.set_xlabel("Time (frames)")
+        # Label direction correctly
+        self.ax.set_ylabel("ROIs (Dorsal (Top) -> Ventral (Bottom))")
+        
+        self.fig.colorbar(im, cax=self.cax, label="Normalized Intensity")
+
 class HeatmapViewer:
     def __init__(self, fig, loaded_data, filtered_indices, phases, rhythm_scores, is_emphasized, rhythm_sort_desc, 
                  period=None, minutes_per_frame=None, reference_phase=None, trend_window_hours=None):

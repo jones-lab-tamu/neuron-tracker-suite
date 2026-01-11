@@ -1,5 +1,7 @@
 import os
 import json
+import logging
+import glob
 import numpy as np
 import pandas as pd
 from PyQt5 import QtWidgets, QtCore, QtGui
@@ -11,7 +13,7 @@ from skimage.draw import polygon as draw_polygon
 from typing import Tuple
 
 from gui.utils import Tooltip, add_mpl_to_tab, clear_layout, project_points_to_polyline
-from gui.viewers import GroupScatterViewer, GroupAverageMapViewer, PhaseGradientViewer, RegionResultViewer, ClusterResultViewerWidget
+from gui.viewers import GroupScatterViewer, GroupAverageMapViewer, PhaseGradientViewer, RegionResultViewer, ClusterResultViewerWidget, WarpedHeatmapViewer
 from gui.statistics import watson_williams_f
 from gui.dialogs.roi_drawer import ROIDrawerDialog
 from gui.dialogs.cluster_config_dialog import ClusterConfigDialog
@@ -152,6 +154,22 @@ class GroupViewPanel(QtWidgets.QWidget):
 
         b.addWidget(region_box)
         
+        # 4. Warped Heatmap Setup
+        warped_box = QtWidgets.QGroupBox("Warped Heatmap")
+        warped_layout = QtWidgets.QFormLayout(warped_box)
+        
+        self.warped_mode_combo = QtWidgets.QComboBox()
+        self.warped_mode_combo.addItems(["Individual", "Control pooled", "Experiment pooled"])
+        warped_layout.addRow("Mode:", self.warped_mode_combo)
+        
+        self.warped_animal_combo = QtWidgets.QComboBox()
+        warped_layout.addRow("Animal (Indiv):", self.warped_animal_combo)
+        
+        self.btn_render_warped_heatmap = QtWidgets.QPushButton(safe_icon('fa5s.fire'), "Render Heatmap")
+        warped_layout.addRow(self.btn_render_warped_heatmap)
+        
+        b.addWidget(warped_box)
+        
         # 4. Actions
         self.btn_view_group = QtWidgets.QPushButton(safe_icon('fa5s.chart-pie'), "Generate Group Visualizations")
         Tooltip.install(self.btn_view_group, "Runs Continuous Grid analysis, Gradient analysis (if axes present), and Regional Statistical analysis.")
@@ -165,8 +183,27 @@ class GroupViewPanel(QtWidgets.QWidget):
         
         b.addStretch()
         
+        b.addStretch()
+        
         layout.addWidget(box)
         layout.addStretch(1)
+
+        # 5. Register Warped Heatmap Tab immediately
+        self._ensure_warped_heatmap_canvas()
+
+    def _ensure_warped_heatmap_canvas(self):
+        # 1. Ensure Tab
+        if not hasattr(self.mw, 'warped_tab'):
+             self.mw.warped_tab = QtWidgets.QWidget()
+             self.mw.vis_tabs.addTab(self.mw.warped_tab, "Warped Heatmap")
+        
+        # 2. Ensure Canvas
+        # Check for fig/canvas existence. If broken or missing, recreate.
+        missing_fig = not hasattr(self, '_warped_heatmap_fig') or self._warped_heatmap_fig is None
+        missing_canvas = not hasattr(self, '_warped_heatmap_canvas') or self._warped_heatmap_canvas is None
+        
+        if missing_fig or missing_canvas:
+             self._warped_heatmap_fig, self._warped_heatmap_canvas = add_mpl_to_tab(self.mw.warped_tab)
 
     def _compute_grid_assignment(self, df, grid_res_str=None, smooth_check=False):
         """
@@ -411,6 +448,400 @@ class GroupViewPanel(QtWidgets.QWidget):
         self.mw.btn_export_data.clicked.connect(self.export_current_data)
         self.norm_mode_combo.currentIndexChanged.connect(self._on_norm_mode_changed)
         self.btn_cluster_stats.clicked.connect(self.run_cluster_analysis)
+        
+        # Warped Heatmap Signals
+        self.warped_mode_combo.currentIndexChanged.connect(self._on_warped_mode_changed)
+        self.btn_render_warped_heatmap.clicked.connect(self._render_warped_heatmap)
+        
+        # Init animal list state
+        self._refresh_animal_list()
+        self._on_warped_mode_changed()
+
+    def _refresh_animal_list(self):
+        self.warped_animal_combo.clear()
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            path = item.data(self.ROLE_PATH)
+            if path:
+                bn = os.path.basename(path)
+                self.warped_animal_combo.addItem(bn, path)
+        
+    def _on_warped_mode_changed(self):
+        mode = self.warped_mode_combo.currentText()
+        is_indiv = (mode == "Individual")
+        self.warped_animal_combo.setEnabled(is_indiv)
+        if is_indiv:
+            self._refresh_animal_list()
+
+    def _derive_base_path(self, p: str) -> str:
+        """
+        Derive the base dataset path by stripping known suffixes or extensions.
+        Robustly handles cases where p is already a base, or points to one of the generated files.
+        """
+        base_p = p
+        suffixes = ["_roi_warped_with_ids.csv", "_rhythm_results.csv", "_traces.csv"]
+        
+        found_suffix = False
+        for s in suffixes:
+            if base_p.endswith(s):
+                base_p = base_p[:-len(s)]
+                found_suffix = True
+                break
+        
+        # If no known suffix, try stripping extension (e.g. .csv) if deemed an artifact
+        # We strip ONE extension level if it's not a directory, ONLY for .csv
+        if not found_suffix and not os.path.isdir(base_p):
+             root, ext = os.path.splitext(base_p)
+             if ext.lower() == ".csv":
+                 base_p = root
+             
+        return base_p
+
+    def _axis_flip_from_poly(self, poly: np.ndarray) -> bool:
+        """
+        Determine if axis should be flipped so that Dorsal (Min Y) -> s=0.
+        Helper verifies image-coordinate dorsal (min Y) projects to s=0.
+        """
+        if len(poly) < 2: return False
+        
+        # Dorsal = Min Y, Ventral = Max Y
+        dorsal_idx = int(np.argmin(poly[:, 1]))
+        ventral_idx = int(np.argmax(poly[:, 1]))
+        
+        dorsal_pt = poly[dorsal_idx]
+        ventral_pt = poly[ventral_idx]
+        
+        # Project using the util
+        s_dorsal_raw = project_points_to_polyline(np.array([dorsal_pt]), poly)[0]
+        s_ventral_raw = project_points_to_polyline(np.array([ventral_pt]), poly)[0]
+        
+        # Data guard
+        if not np.isfinite(s_dorsal_raw) or not np.isfinite(s_ventral_raw):
+            # Fallback to endpoints: StartY > EndY means flipped (assuming typical)
+            return (poly[0, 1] > poly[-1, 1])
+
+        # If dorsal is at high 's', we need to flip
+        return (s_dorsal_raw > s_ventral_raw)
+
+    def _compute_polyline_dists(self, points, poly):
+        """Vectorized distance from points (N,2) to polyline (M,2)"""
+        dists = np.full(len(points), np.inf)
+        if len(poly) < 2: return dists
+        
+        for i in range(len(poly) - 1):
+            A = poly[i]
+            B = poly[i+1]
+            AB = B - A
+            sq_len = np.dot(AB, AB)
+            
+            if sq_len == 0:
+                d = np.linalg.norm(points - A, axis=1)
+                dists = np.minimum(dists, d)
+                continue
+                
+            AP = points - A
+            t = np.sum(AP * AB, axis=1) / sq_len
+            t = np.clip(t, 0.0, 1.0)
+            C = A + np.outer(t, AB)
+            d = np.linalg.norm(points - C, axis=1)
+            dists = np.minimum(dists, d)
+            
+        return dists
+
+    def _render_warped_heatmap(self):
+        self._ensure_warped_heatmap_canvas()
+        
+        # 1. Validate Atlas & Parse Phase Axes (Bilateral Support)
+        atlas_path = self.state.atlas_roi_path
+        if not atlas_path or not os.path.exists(atlas_path):
+             QtWidgets.QMessageBox.warning(self, "Missing Atlas", "No atlas loaded. Cannot define phase axis.")
+             return
+             
+        phase_axes = []
+        try:
+            with open(atlas_path, 'r') as f:
+                rois = json.load(f)
+            
+            for r in rois:
+                if r.get("mode") == "Phase Axis":
+                    pts = r.get("path_vertices")
+                    # Handle flat or pairs robustly
+                    arr = np.array(pts)
+                    if arr.ndim == 1:
+                        if len(arr) % 2 != 0: continue
+                        arr = arr.reshape(-1, 2)
+                    
+                    if arr.shape[0] >= 2 and arr.shape[1] >= 2:
+                         # Calculate length for sorting/selection
+                         # Euclidean length of segments
+                         diffs = np.diff(arr, axis=0)
+                         length = np.sum(np.sqrt(np.sum(diffs**2, axis=1)))
+                         phase_axes.append({'poly': arr, 'len': length})
+                         
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Atlas Error", f"Failed to read atlas: {e}")
+            return
+
+        if not phase_axes:
+            QtWidgets.QMessageBox.warning(self, "No Axis", "No phase axis found in atlas anatomical ROI file. Define a Phase Axis in ROI tools first.")
+            return
+
+        # Select top 2 axes by length if > 2
+        phase_axes.sort(key=lambda x: x['len'], reverse=True)
+        # Keep poly only
+        active_axes = [x['poly'] for x in phase_axes[:2]]
+        
+        # Pre-calc flip logic for each active axis
+        # Rule: If start_y - end_y > eps, then flip (start is closer to Ventral/BottomMaxY).
+        # Normalized S: 0=Dorsal (Top/MinY), 1=Ventral (Bottom/MaxY).
+        axes_info = []
+        for i, poly in enumerate(active_axes):
+            # 1. Decide Flip using Helper (Handles NaN/Inf internally with fallback)
+            should_flip = self._axis_flip_from_poly(poly)
+            
+            # 2. Re-compute values for detailed Logging & Verification
+            dorsal_idx = int(np.argmin(poly[:, 1]))
+            ventral_idx = int(np.argmax(poly[:, 1]))
+            dorsal_pt = poly[dorsal_idx]
+            ventral_pt = poly[ventral_idx]
+            
+            s_dorsal_raw = project_points_to_polyline(np.array([dorsal_pt]), poly)[0]
+            s_ventral_raw = project_points_to_polyline(np.array([ventral_pt]), poly)[0]
+            
+            # 3. Guarded Post-Flip & Invariant Check
+            s_dorsal_post = np.nan
+            s_ventral_post = np.nan
+            
+            if np.isfinite(s_dorsal_raw) and np.isfinite(s_ventral_raw):
+                s_dorsal_post = s_dorsal_raw if not should_flip else (1.0 - s_dorsal_raw)
+                s_ventral_post = s_ventral_raw if not should_flip else (1.0 - s_ventral_raw)
+                
+                # 4. Verify Invariant (Dorsal -> 0)
+                if s_dorsal_post > s_ventral_post + 1e-6:
+                    logging.warning("WarpedHeatmap axis=%d invariant violated after flip: s_dorsal=%.4f s_ventral=%.4f", i, s_dorsal_post, s_ventral_post)
+            else:
+                logging.warning(f"WarpedHeatmap axis={i} has non-finite projections. s_dorsal_raw={s_dorsal_raw}, s_ventral_raw={s_ventral_raw}. Using fallback flip={should_flip}.")
+
+            axes_info.append({
+                'poly': poly, 
+                'flip': should_flip,
+                's_dorsal_post': s_dorsal_post,
+                'dorsal_y': dorsal_pt[1],
+                'ventral_y': ventral_pt[1]
+            })
+            
+            # 5. Log
+            logging.info(f"WarpedHeatmap axis={i} d_idx={dorsal_idx} v_idx={ventral_idx} d_y={dorsal_pt[1]:.1f} v_y={ventral_pt[1]:.1f} flip={should_flip} s_d_raw={s_dorsal_raw:.3f} s_v_raw={s_ventral_raw:.3f} s_d_post={s_dorsal_post:.3f} s_v_post={s_ventral_post:.3f}")
+
+        # Bilateral Equivalence Check
+        if len(axes_info) == 2:
+            a0 = axes_info[0]
+            a1 = axes_info[1]
+            logging.info(f"Bilateral Check: Axis0_Flip={a0['flip']} Axis1_Flip={a1['flip']} | A0_DorsalY={a0['dorsal_y']:.2f} A1_DorsalY={a1['dorsal_y']:.2f}")
+            
+            # Only compare if both are finite
+            if np.isfinite(a0['s_dorsal_post']) and np.isfinite(a1['s_dorsal_post']):
+                diff = abs(a0['s_dorsal_post'] - a1['s_dorsal_post'])
+                logging.info(f"Bilateral Dorsal Diff: {diff:.4f} (A0={a0['s_dorsal_post']:.4f}, A1={a1['s_dorsal_post']:.4f})")
+                if diff > 0.1:
+                    logging.warning("Bilateral dorsal mismatch, check axis definitions.")
+            else:
+                logging.warning("Bilateral dorsal equivalence check skipped due to non-finite s values.")
+
+        # 2. Determine Included Files
+        mode = self.warped_mode_combo.currentText()
+        included_paths = []
+        
+        if mode == "Individual":
+            path = self.warped_animal_combo.currentData()
+            # If data missing (e.g. strict clear), try match or fallback
+            if not path:
+                wanted = self.warped_animal_combo.currentText()
+                for i in range(self.file_list.count()):
+                    item = self.file_list.item(i)
+                    p = item.data(self.ROLE_PATH)
+                    if p and os.path.basename(p) == wanted:
+                        path = p
+                        break
+            
+            if not path:
+                QtWidgets.QMessageBox.warning(self, "Selection Error", "No animal selected.")
+                return
+            included_paths.append(path)
+        else:
+            target_group = "Control" if "Control" in mode else "Experiment"
+            for i in range(self.file_list.count()):
+                item = self.file_list.item(i)
+                grp = item.data(self.ROLE_GROUP)
+                if grp == target_group:
+                    p = item.data(self.ROLE_PATH)
+                    if p: included_paths.append(p)
+            
+            if not included_paths:
+                QtWidgets.QMessageBox.warning(self, "Selection Error", f"No files assigned to {target_group}.")
+                return
+
+        # 3. Load Data & Compute S
+        all_traces = []
+        all_s = []
+        
+        for p in included_paths:
+            # logic: If directory, find files inside. If file, derive base.
+            warp_path = None
+            rhythm_path = None
+            traces_path = None
+            
+            if os.path.isdir(p):
+                # Directory mode (recursive scan)
+                try:
+                    w_cands = glob.glob(os.path.join(p, "**", "*_roi_warped_with_ids.csv"), recursive=True)
+                    r_cands = glob.glob(os.path.join(p, "**", "*_rhythm_results.csv"), recursive=True)
+                    t_cands = glob.glob(os.path.join(p, "**", "*_traces.csv"), recursive=True)
+                    
+                    # Validate uniqueness
+                    if len(w_cands) == 1 and len(r_cands) == 1 and len(t_cands) == 1:
+                        warp_path = w_cands[0]
+                        rhythm_path = r_cands[0]
+                        traces_path = t_cands[0]
+                    else:
+                        w_names = [os.path.basename(x) for x in w_cands[:10]]
+                        r_names = [os.path.basename(x) for x in r_cands[:10]]
+                        t_names = [os.path.basename(x) for x in t_cands[:10]]
+                        bn_dir = os.path.basename(os.path.normpath(p))
+                        logging.warning(f"Skipping directory {bn_dir}: Found Warped={len(w_cands)} {w_names}, Rhythm={len(r_cands)} {r_names}, Traces={len(t_cands)} {t_names}. Unique match required.")
+                        continue
+                except Exception as e:
+                    # Keep UX consistent: avoid full paths in warnings
+                    bn_dir = os.path.basename(os.path.normpath(p))
+                    logging.warning(f"Error scanning directory {bn_dir}: {e}")
+                    continue
+            else:
+                # File mode - use robust base derivation
+                base_p = self._derive_base_path(p)
+                warp_path = base_p + "_roi_warped_with_ids.csv"
+                rhythm_path = base_p + "_rhythm_results.csv"
+                traces_path = base_p + "_traces.csv"
+                
+                # Check existence
+                if not os.path.exists(warp_path):
+                     logging.warning(f"Skipping {os.path.basename(p)}: Missing warped file {warp_path}")
+                     continue
+                if not os.path.exists(rhythm_path):
+                     logging.warning(f"Skipping {os.path.basename(p)}: Missing rhythm file {rhythm_path}")
+                     continue
+                if not os.path.exists(traces_path):
+                     logging.warning(f"Skipping {os.path.basename(p)}: Missing traces file {traces_path}")
+                     continue
+
+            try:
+                # Use helper for loading/joining
+                merged, _ = load_and_join_rhythm_and_coords(rhythm_path, warp_path)
+                
+                if 'Is_Rhythmic' not in merged.columns:
+                     raise ValueError("Rhythm file missing Is_Rhythmic.")
+                
+                # Filter Rhythmic
+                merged = merged[merged['Is_Rhythmic'] == True]
+                
+                if merged.empty: continue
+                
+                # Get coords
+                pts = merged[['X_Warped', 'Y_Warped']].values
+                
+                # Assign to Axis and Compute S
+                if len(active_axes) == 1:
+                    info = axes_info[0]
+                    s_vals = project_points_to_polyline(pts, info['poly'])
+                    s_vals = np.clip(s_vals, 0.0, 1.0)
+                    if info['flip']:
+                        s_vals = 1.0 - s_vals
+                    
+                    s_vals = np.asarray(s_vals, dtype=float)
+                else:
+                    # Bilateral
+                    info0 = axes_info[0]
+                    info1 = axes_info[1]
+                    
+                    d0 = self._compute_polyline_dists(pts, info0['poly'])
+                    d1 = self._compute_polyline_dists(pts, info1['poly'])
+                    
+                    # Assign to closest
+                    mask_0 = (d0 <= d1)
+                    s_vals = np.zeros(len(pts))
+                    
+                    # Axis 0
+                    if np.any(mask_0):
+                        s0 = project_points_to_polyline(pts[mask_0], info0['poly'])
+                        s0 = np.clip(s0, 0.0, 1.0)
+                        if info0['flip']: s0 = 1.0 - s0
+                        s_vals[mask_0] = s0
+                        
+                    # Axis 1
+                    mask_1 = ~mask_0
+                    if np.any(mask_1):
+                        s1 = project_points_to_polyline(pts[mask_1], info1['poly'])
+                        s1 = np.clip(s1, 0.0, 1.0)
+                        if info1['flip']: s1 = 1.0 - s1
+                        s_vals[mask_1] = s1
+                        
+                    s_vals = np.asarray(s_vals, dtype=float)
+                
+                # Load Traces
+                traces_df = pd.read_csv(traces_path)
+                traces_mat = traces_df.values[:, 1:] # Skip time
+                
+                indices = merged['Original_ROI_Index'].values.astype(int)
+                
+                # Validate Indices
+                if np.any(indices >= traces_mat.shape[1]):
+                    raise ValueError(f"Trace index OOB: {indices.max()} >= {traces_mat.shape[1]}")
+                
+                # Check C: Invariant
+                if len(indices) != len(s_vals):
+                    raise ValueError(f"Merged Length Mismatch in {os.path.basename(warp_path)}: Indices={len(indices)}, S-Vals={len(s_vals)}")
+
+                # Filter Non-Finite S-values BEFORE accessing traces
+                finite_mask = np.isfinite(s_vals)
+                if not np.all(finite_mask):
+                    logging.info(f"Filtering {np.sum(~finite_mask)} non-finite S-values in {os.path.basename(warp_path)}")
+                    s_vals = s_vals[finite_mask]
+                    indices = indices[finite_mask]
+                
+                if len(indices) == 0:
+                    logging.info(f"Skipping {os.path.basename(warp_path)}: No valid rhythmic ROIs with finite grid positions.")
+                    continue
+                    
+                selected_traces = traces_mat[:, indices].T 
+                
+                all_traces.append(selected_traces)
+                all_s.extend(s_vals)
+                
+            except Exception as e:
+                bn = os.path.basename(os.path.normpath(p)) if os.path.isdir(p) else os.path.basename(p)
+                QtWidgets.QMessageBox.critical(self, "Data Error", f"Error processing {bn}: {e}")
+                return
+
+        if not all_traces:
+            QtWidgets.QMessageBox.information(self, "No Data", "No valid warped+rhythm+traces inputs found, see log messages.")
+            return
+
+        final_traces = np.vstack(all_traces)
+        final_s = np.array(all_s)
+        
+        # 4. Render
+        
+        self.mw.vis_tabs.setCurrentWidget(self.mw.warped_tab)
+        self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.warped_tab), True)
+        
+        # REUSE Figure/Canvas
+        
+        title = f"Warped Heatmap: {mode}"
+        if mode == "Individual":
+            title += f" ({self.warped_animal_combo.currentText()})"
+            
+        viewer = WarpedHeatmapViewer(self._warped_heatmap_fig, final_traces, final_s, title)
+        self.mw.visualization_widgets[self.mw.warped_tab] = viewer
+        self._warped_heatmap_canvas.draw_idle()
     
     
     def _clear_tab_contents(self, tab_widget: QtWidgets.QWidget) -> None:
@@ -600,14 +1031,15 @@ class GroupViewPanel(QtWidgets.QWidget):
                 self.file_list.addItem(item)
                 existing_paths.add(f)
         
+        self._refresh_animal_list()
         self._sync_state_group_paths_from_ui()
         self._update_group_view_button()
 
     def remove_group_file(self):
-        selected_items = self.file_list.selectedItems()
-        for item in selected_items:
+        for item in self.file_list.selectedItems():
             self.file_list.takeItem(self.file_list.row(item))
-            
+        
+        self._refresh_animal_list()
         self._sync_state_group_paths_from_ui()
         self._update_group_view_button()
 
