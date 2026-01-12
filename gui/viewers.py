@@ -5583,6 +5583,14 @@ class ClusterResultViewerWidget(QtWidgets.QWidget):
         self.btn_export_dot.clicked.connect(self._on_export_dot_plot)
 
         self.right_layout.addWidget(self.btn_export_dot)
+        # New Export Bin Map Button
+
+        self.btn_export_bin = QtWidgets.QPushButton("Export Bin Map Data")
+
+        self.btn_export_bin.clicked.connect(self._on_export_bin_map_data)
+
+        self.right_layout.addWidget(self.btn_export_bin)
+
 
         
 
@@ -5952,6 +5960,86 @@ class ClusterResultViewerWidget(QtWidgets.QWidget):
 
 
 
+    def _on_export_bin_map_data(self):
+
+        import numpy as np
+
+    
+
+        # Alpha Sig Priority: self -> results.get('alpha_sig') -> results.get('alpha') -> 0.05
+
+        alpha_sig = getattr(self, 'alpha_sig', None)
+
+        if alpha_sig is None:
+
+             alpha_sig = self.results.get('alpha_sig', self.results.get('alpha', 0.05))
+
+        try:
+
+            alpha_sig = float(alpha_sig)
+
+        except:
+
+            alpha_sig = 0.05
+
+            
+
+        if not np.isfinite(alpha_sig):
+
+            alpha_sig = 0.05
+
+    
+
+        try:
+
+            df = compute_cluster_bin_map_table(self.results, alpha_sig=alpha_sig)
+
+        except Exception as e:
+
+            QtWidgets.QMessageBox.critical(self, "Export Error", str(e))
+
+            return
+
+    
+
+        if df.empty:
+
+            QtWidgets.QMessageBox.information(self, "Export Info", "No eligible bins to export (inclusion_mask is empty).")
+
+            return
+
+    
+
+        # Determine base name
+
+        base_name = self.results.get("base_name") or self.results.get("session_name") or self.results.get("dataset_name") or "cluster_results"
+
+        fname = f"{base_name}_cluster_bin_map.csv"
+
+        
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export Bin Map Data", fname, "CSV (*.csv)")
+
+        
+
+        if not path:
+
+            QtWidgets.QMessageBox.information(self, "Export Info", "Export canceled.")
+
+            return
+
+        
+
+        try:
+
+            df.to_csv(path, index=False)
+
+            QtWidgets.QMessageBox.information(self, "Success", f"Exported {len(df)} rows to:\n{path}")
+
+        except Exception as e:
+
+            QtWidgets.QMessageBox.critical(self, "Save Error", str(e))
+
     def populate_table(self):
 
         self.table.setRowCount(len(self.clusters))
@@ -6010,6 +6098,218 @@ class ClusterResultViewerWidget(QtWidgets.QWidget):
 
 
 
+
+def compute_cluster_bin_map_table(cluster_results: dict, alpha_sig: float):
+
+    """
+
+    Exports binwise cluster data for all bins in inclusion_mask.
+
+    Returns DataFrame with columns: 
+
+    [row, col, delta_mu_rad, abs_delta_mu_rad, p_unc, inclusion, cluster_id, cluster_p_corr, is_sig_cluster_bin, T0]
+
+    """
+
+    import numpy as np
+
+    import pandas as pd
+
+    
+
+    # 1. Validate Keys
+
+    required = ['delta_mu_map', 'p_unc_map', 'cluster_map', 'inclusion_mask', 'clusters']
+
+    missing = [k for k in required if k not in cluster_results]
+
+    if missing:
+
+        raise ValueError(f"Missing required results keys: {missing}")
+
+        
+
+    delta_mu = cluster_results['delta_mu_map']
+
+    p_unc = cluster_results['p_unc_map']
+
+    cluster_map = cluster_results['cluster_map']
+
+    inclusion = cluster_results['inclusion_mask']
+
+    
+
+    # 2. Validate Shapes
+
+    shape = delta_mu.shape
+
+    if not (p_unc.shape == shape and cluster_map.shape == shape and shape == inclusion.shape):
+
+        raise ValueError(f"Shape mismatch: dm={shape}, p={p_unc.shape}, cmap={cluster_map.shape}, inc={inclusion.shape}")
+
+        
+
+    # 3. Sig Clusters
+
+    clusters = cluster_results['clusters'] # list of dicts
+
+    
+
+    cid_to_p = {}
+
+    sig_ids = set()
+
+    
+
+    for c in clusters:
+
+        # Robust access
+
+        cid_raw = c.get('id', None)
+
+        p_raw = c.get('p_corr', None)
+
+        
+
+        if cid_raw is None or p_raw is None:
+
+            continue
+
+            
+
+        try:
+
+            cid = int(cid_raw)
+
+            p = float(p_raw)
+
+        except Exception:
+
+            continue
+
+            
+
+        cid_to_p[cid] = p
+
+        if p < alpha_sig:
+
+            sig_ids.add(cid)
+
+            
+
+    # 4. Build Table
+
+    rows_idx, cols_idx = np.where(inclusion)
+
+    
+
+    t0 = cluster_results.get('T0', np.nan)
+
+    if hasattr(t0, 'item'): t0 = t0.item()
+
+    
+
+    data = []
+
+    
+
+    for r, c in zip(rows_idx, cols_idx):
+
+        dm = delta_mu[r,c]
+
+        pu = p_unc[r,c]
+
+        
+
+        # Robust ID casting
+
+        cid_raw = cluster_map[r,c]
+
+        cid_int = int(cid_raw)
+
+        
+
+        # Robust scalars
+
+        dm_val = float(dm) if np.isfinite(dm) else np.nan
+
+        abs_dm_val = float(np.abs(dm)) if np.isfinite(dm) else np.nan
+
+        pu_val = float(pu) if np.isfinite(pu) else np.nan
+
+        
+
+        # cluster logic
+
+        cp = np.nan
+
+        is_sig = False
+
+        
+
+        if cid_int > 0:
+
+            if cid_int in cid_to_p:
+
+                cp = cid_to_p[cid_int]
+
+                if cid_int in sig_ids:
+
+                    is_sig = True
+
+            else:
+
+                # cid > 0 but not in list? Treat as non-sig, p=nan
+
+                pass
+
+                
+
+        data.append({
+
+            'row': int(r),
+
+            'col': int(c),
+
+            'delta_mu_rad': dm_val,
+
+            'abs_delta_mu_rad': abs_dm_val,
+
+            'p_unc': pu_val,
+
+            'inclusion': bool(inclusion[r, c]),
+
+            'cluster_id': int(cid_int),
+
+            'cluster_p_corr': float(cp),
+
+            'is_sig_cluster_bin': bool(is_sig),
+
+            'T0': float(t0)
+
+        })
+
+        
+
+    df = pd.DataFrame(data)
+
+    # Enforce column order
+
+    cols = ['row', 'col', 'delta_mu_rad', 'abs_delta_mu_rad', 'p_unc', 'inclusion', 
+
+            'cluster_id', 'cluster_p_corr', 'is_sig_cluster_bin', 'T0']
+
+    
+
+    # If empty, return empty with cols
+
+    if df.empty:
+
+        return pd.DataFrame(columns=cols)
+
+        
+
+    return df[cols]
 
 def compute_across_animal_cluster_metrics(cluster_results: dict, per_animal_phase_grids: dict, cluster_id: int):
     """
