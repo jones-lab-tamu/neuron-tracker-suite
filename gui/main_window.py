@@ -41,6 +41,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "has_group_data": False,
         }
 
+        # Core UI Setup
+        self.setStatusBar(QtWidgets.QStatusBar())
+
         self._build_ui()
         self._build_menu()
         self._build_toolbar()
@@ -72,6 +75,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left_layout = QtWidgets.QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
         self.splitter.addWidget(left_widget)
+        left_widget.setMinimumWidth(340)
         
         # 1. Navigation List (Replaces Workflow & Active Panel)
         self._build_navigation_section(left_layout)
@@ -148,10 +152,42 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout.addWidget(bottom_widget, 0)
         
         # Splitter Ratios
-        self.splitter.setStretchFactor(0, 1) # Left
-        self.splitter.setStretchFactor(1, 3) # Right
+        if self.splitter.count() >= 2:
+            self.splitter.setCollapsible(0, False)
+            self.splitter.setCollapsible(1, False)
+            self.splitter.setStretchFactor(0, 1) # Left
+            self.splitter.setStretchFactor(1, 3) # Right
         
+
         self._build_vis_tabs()
+        
+        # Schedule initial splitter sizing after layout
+        QtCore.QTimer.singleShot(0, self._apply_initial_splitter_sizes)
+
+
+    def _apply_initial_splitter_sizes(self):
+        if getattr(self, "_initial_splitter_sizes_applied", False):
+            return
+        self._initial_splitter_sizes_applied = True
+
+        # HARD GUARD: ensure both splitter widgets exist
+        if self.splitter.count() < 2:
+            return
+
+        # total available width in the splitter
+        total = self.splitter.width()
+        if total <= 0:
+            total = self.width()
+        if total <= 0:
+            return
+
+        # target left width: 30% of total, but not below minimum
+        left_min = self.splitter.widget(0).minimumWidth() or 340
+        left = max(left_min, int(total * 0.30))
+
+        # ensure the right side still has space
+        right = max(600, total - left)
+        self.splitter.setSizes([left, right])
 
     def _build_toolbar(self):
         toolbar = QtWidgets.QToolBar("Main Toolbar")
@@ -160,11 +196,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addToolBar(toolbar)
         
         open_act = QtWidgets.QAction(get_icon('fa5s.folder-open'), "Open Project", self)
-        open_act.triggered.connect(self.load_project)
+        open_act.triggered.connect(self.safe_load_project)
         toolbar.addAction(open_act)
         
         save_act = QtWidgets.QAction(get_icon('fa5s.save'), "Save Project", self)
-        save_act.triggered.connect(self.save_project)
+        save_act.triggered.connect(self.safe_save_project)
         toolbar.addAction(save_act)
 
     def _build_vis_tabs(self):
@@ -203,23 +239,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_navigation_section(self, parent_layout):
         """Builds the navigation list acting as both workflow guide and panel switcher."""
         self.nav_list = QtWidgets.QListWidget()
-        self.nav_list.setFixedHeight(120) # Compact fixed height
+        self.nav_list.setFixedHeight(160) # Fixed height for 4 items
         self.nav_list.setIconSize(QtCore.QSize(24, 24))
-        self.nav_list.setStyleSheet("""
-            QListWidget {
-                background-color: #f0f0f0;
-                border: 1px solid #d0d0d0;
-                border-radius: 4px;
-            }
-            QListWidget::item {
-                padding: 5px;
-            }
-            QListWidget::item:selected {
-                background-color: #ffffff;
-                color: #007acc;
-                border-left: 4px solid #007acc;
-            }
-        """)
+        # Styles handled by global stylesheet in theme.py
         
         items = [
             ("single", "1. Single Animal Analysis", "fa5s.paw"),
@@ -296,15 +318,15 @@ class MainWindow(QtWidgets.QMainWindow):
         file_menu = menu_bar.addMenu("&File")
 
         open_action = QtWidgets.QAction("&Open Project...", self)
-        open_action.triggered.connect(self.load_project)
+        open_action.triggered.connect(self.safe_load_project)
         file_menu.addAction(open_action)
 
         save_action = QtWidgets.QAction("&Save Project", self)
-        save_action.triggered.connect(self.save_project)
+        save_action.triggered.connect(self.safe_save_project)
         file_menu.addAction(save_action)
 
         save_as_action = QtWidgets.QAction("Save Project &As...", self)
-        save_as_action.triggered.connect(lambda: self.save_project(save_as=True))
+        save_as_action.triggered.connect(lambda: self.safe_save_project(save_as=True))
         file_menu.addAction(save_as_action)
 
     def _switch_mode(self, mode_name: str):
@@ -351,14 +373,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log_text.verticalScrollBar().maximum()
         )
 
-    def set_status(self, text: str):
+    def set_status(self, text: str, timeout: int = 4000):
         """
         Safely set status message in status bar or fallback to log.
         """
         try:
-            sb = self.statusBar() if hasattr(self, "statusBar") else None
-            if sb is not None:
-                sb.showMessage(str(text))
+            if self.statusBar():
+                self.statusBar().showMessage(str(text), timeout)
                 return
         except Exception:
             pass
@@ -409,6 +430,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_export_plot.setEnabled(False)
         self.btn_export_data.setEnabled(False)
         self.progress_bar.setValue(0)
+    
+    def safe_save_project(self, save_as=False):
+        """Wrapper for save_project with safety."""
+        try:
+            self.set_status("Saving project...")
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+            success = self.save_project(save_as)
+            if success:
+                self.set_status("Project saved.")
+            else:
+                self.set_status("Save canceled.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save Error", f"Failed to save project:\n{e}")
+            self.set_status("Error saving project.")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def safe_load_project(self):
+        """Wrapper for load_project with safety."""
+        try:
+            self.set_status("Loading project...")
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+            success = self.load_project()
+            if success:
+                self.set_status("Project loaded.")
+            else:
+                self.set_status("Load canceled.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Load Error", f"Failed to load project:\n{e}")
+            self.set_status("Error loading project.")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
 
     def update_workflow_from_files(self):
         basename = self.state.output_basename
@@ -477,9 +530,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "Save Project", start_dir, "Neuron Tracker Project (*.ntp)"
             )
             if not path:
-                return
+                return False
             project_path = path
         
+        # Don't try/catch here, let safe_ wrapper catch it
         try:
             self._sync_state_from_ui()
             state_to_save = {
@@ -495,9 +549,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.state.project_path = project_path
             self.log_message(f"Project saved to {os.path.basename(self.state.project_path)}")
             self.setWindowTitle(f"{os.path.basename(self.state.project_path)} - Neuron Analysis Workspace")
-
+            return True
         except Exception as e:
             self.log_message(f"Error saving project: {e}")
+            raise
 
     def load_project(self):
         start_dir = self._get_last_dir()
@@ -505,11 +560,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self, "Open Project", start_dir, "Neuron Tracker Project (*.ntp)"
         )
         if not path:
-            return
+            return False
         
         self._set_last_dir(path)
         self._reset_state()
         
+        # Don't try/catch here, let safe_ wrapper catch it
         try:
             with open(path, 'r') as f:
                 loaded_state = json.load(f)
@@ -529,9 +585,10 @@ class MainWindow(QtWidgets.QMainWindow):
             base = os.path.dirname(path) if path else os.getcwd()
             self.session_dir = os.path.join(base, "analysis_results")
             os.makedirs(self.session_dir, exist_ok=True)
-
+            return True
         except Exception as e:
             self.log_message(f"Error loading project: {e}")
+            raise
 
     def _update_ui_from_state(self):
         if hasattr(self, 'register_panel'):

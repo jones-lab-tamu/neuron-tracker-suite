@@ -2,7 +2,7 @@ import sys
 import os
 from PyQt5 import QtWidgets, QtCore
 from gui.main_window import MainWindow
-from gui.theme import apply_theme, setup_matplotlib_theme
+from gui.theme import apply_app_style, setup_matplotlib_theme
 
 def main():
     # Enable High DPI display with PyQt5
@@ -18,7 +18,7 @@ def main():
     QtCore.QCoreApplication.setApplicationName("NeuronAnalysis")
 
     # Apply Theme
-    apply_theme(app)
+    apply_app_style(app)
     setup_matplotlib_theme()
 
     win = MainWindow()
