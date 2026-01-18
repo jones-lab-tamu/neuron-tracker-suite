@@ -131,25 +131,18 @@ class WarpedHeatmapViewer:
         self.title = title
 
         self.render_indices = None # Store indices of originally passed data that are rendered
-
         
-
         # Idempotency: Clear figure to remove old axes/colorbars
-
-        self.fig.clf()
-
+        # SAFE CLEAR: Do NOT use self.fig.clf() or self.fig.clear()
+        # This avoids triggering toolbar updates on deleted QActions (crash fix).
+        while self.fig.axes:
+            self.fig.delaxes(self.fig.axes[0])
         
-
         # Setup Axes
-
         gs = self.fig.add_gridspec(1, 2, width_ratios=[20, 1], wspace=0.05)
-
         self.ax = self.fig.add_subplot(gs[0])
-
         self.cax = self.fig.add_subplot(gs[1])
-
         
-
         self._plot()
 
 

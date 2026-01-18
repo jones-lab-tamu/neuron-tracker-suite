@@ -192,19 +192,95 @@ class GroupViewPanel(QtWidgets.QWidget):
         # 5. Register Warped Heatmap Tab immediately
         self._ensure_warped_heatmap_canvas()
 
+    def _qt_is_deleted(self, obj) -> bool:
+        """Helper to check if a Qt object has been deleted (C++ side)."""
+        if obj is None:
+            return False
+        try:
+            import sip
+            return sip.isdeleted(obj)
+        except ImportError:
+            try:
+                from PyQt5 import sip
+                return sip.isdeleted(obj)
+            except Exception:
+                # If sip cannot be imported, we cannot detect deletion. Assume False (safe).
+                return False
+        except Exception:
+            return False
+
+    def _get_canvas_toolbar(self, canvas):
+        """Robustly retrieve toolbar from canvas, handling various backends."""
+        if canvas is None: return None
+        # Try direct attribute
+        tb = getattr(canvas, "toolbar", None)
+        if tb is not None: return tb
+        # Try via manager
+        mgr = getattr(canvas, "manager", None)
+        if mgr is not None:
+            return getattr(mgr, "toolbar", None)
+        return None
+
+    def _canvas_is_attached(self) -> bool:
+        """Check if the warped heatmap canvas is currently in the tab layout."""
+        if not hasattr(self.mw, 'warped_tab') or self.mw.warped_tab is None:
+            return False
+        
+        lay = self.mw.warped_tab.layout()
+        if lay is None:
+            return False
+            
+        if self._warped_heatmap_canvas is None:
+            return False
+            
+        for i in range(lay.count()):
+            item = lay.itemAt(i)
+            # add_mpl_to_tab inserts the returned canvas widget directly into warped_tab.layout()
+            if item and item.widget() == self._warped_heatmap_canvas:
+                return True
+        return False
+
     def _ensure_warped_heatmap_canvas(self):
         # 1. Ensure Tab
         if not hasattr(self.mw, 'warped_tab'):
              self.mw.warped_tab = QtWidgets.QWidget()
              self.mw.vis_tabs.addTab(self.mw.warped_tab, "Warped Heatmap")
         
-        # 2. Ensure Canvas
-        # Check for fig/canvas existence. If broken or missing, recreate.
+        # 2. Ensure Canvas Key Pair
+        # Check for fig/canvas existence AND deletion.
         missing_fig = not hasattr(self, '_warped_heatmap_fig') or self._warped_heatmap_fig is None
         missing_canvas = not hasattr(self, '_warped_heatmap_canvas') or self._warped_heatmap_canvas is None
         
-        if missing_fig or missing_canvas:
-             self._warped_heatmap_fig, self._warped_heatmap_canvas = add_mpl_to_tab(self.mw.warped_tab)
+        # Check deletion
+        deleted_canvas = False
+        detached_canvas = False
+        deleted_toolbar = False
+        
+        if not missing_canvas:
+            deleted_canvas = self._qt_is_deleted(self._warped_heatmap_canvas)
+            if not deleted_canvas:
+                detached_canvas = not self._canvas_is_attached()
+                
+                # Check toolbar
+                tb = self._get_canvas_toolbar(self._warped_heatmap_canvas)
+                deleted_toolbar = (tb is not None) and self._qt_is_deleted(tb)
+
+        if missing_fig or missing_canvas or deleted_canvas or detached_canvas or deleted_toolbar:
+            reasons = []
+            if missing_fig: reasons.append("missing_fig")
+            if missing_canvas: reasons.append("missing_canvas")
+            if deleted_canvas: reasons.append("deleted_canvas")
+            if detached_canvas: reasons.append("detached_canvas")
+            if deleted_toolbar: reasons.append("deleted_toolbar")
+            
+            self.mw.log_message(f"Warped Heatmap: Recreating canvas. Trigger: {', '.join(reasons)}")
+            
+            # Clear old references to be safe
+            self._warped_heatmap_fig = None
+            self._warped_heatmap_canvas = None
+            
+            # Recreate
+            self._warped_heatmap_fig, self._warped_heatmap_canvas = add_mpl_to_tab(self.mw.warped_tab)
 
     def _compute_grid_assignment(self, df, grid_res_str=None, smooth_check=False):
         """
@@ -558,6 +634,18 @@ class GroupViewPanel(QtWidgets.QWidget):
     def _render_warped_heatmap(self):
         self._ensure_warped_heatmap_canvas()
         
+        # HARD GUARD post-ensure
+        if self._warped_heatmap_fig is None or self._warped_heatmap_canvas is None:
+             QtWidgets.QMessageBox.critical(self, "Render Error", "Failed to initialize plot canvas.")
+             return
+        if self._qt_is_deleted(self._warped_heatmap_canvas):
+             QtWidgets.QMessageBox.critical(self, "Render Error", "Plot canvas is in a deleted state.")
+             return
+        tb = self._get_canvas_toolbar(self._warped_heatmap_canvas)
+        if tb is not None and self._qt_is_deleted(tb):
+             QtWidgets.QMessageBox.critical(self, "Render Error", "Plot toolbar is in a deleted state.")
+             return
+
         # Reset export state at start
         self.warped_heatmap_export_payload = None
         if hasattr(self.mw, "btn_export_data"):
@@ -1022,6 +1110,11 @@ class GroupViewPanel(QtWidgets.QWidget):
         lay = tab_widget.layout()
         if lay is not None:
             clear_layout(lay)
+            
+        # 4. Invalidate specific cached figure references if this is a known tab
+        if tab_widget == getattr(self.mw, 'warped_tab', None):
+            self._warped_heatmap_fig = None
+            self._warped_heatmap_canvas = None
 
     def _on_norm_mode_changed(self):
         if not hasattr(self, "_last_master_df") or self._last_master_df is None:
