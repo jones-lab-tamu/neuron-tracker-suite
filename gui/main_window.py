@@ -95,8 +95,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mode_stack = QtWidgets.QStackedWidget()
         self.ctrl_layout.addWidget(self.mode_stack)
         
-        # Execution Box (Shared controls) - Kept in scroll area or pinned to bottom of left?
-        # Let's pin it to the bottom of the scroll content for now.
+        # Execution Box (Shared controls)
         exec_box = QtWidgets.QGroupBox("Global Actions")
         exec_layout = QtWidgets.QVBoxLayout(exec_box)
         
@@ -276,9 +275,7 @@ class MainWindow(QtWidgets.QMainWindow):
             exportable = False
             
             try:
-                # 1. Special Case: Region Stats Tab
-                # The viewer is a child widget, not registered in visualization_widgets in the same way?
-                # Actually group_view registers it, but checking findChild is more robust for composite widgets.
+                # Special Case: Region Stats Tab
                 if current_tab == getattr(self, 'region_tab', None):
                     viewer = current_tab.findChild(RegionResultViewer)
                     if viewer:
@@ -286,7 +283,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         if data is not None and not data.empty:
                             exportable = True
                 else:
-                    # 2. Standard Case: Registered Viewers
+                    # Standard Case: Registered Viewers
                     viewer = self.visualization_widgets.get(current_tab)
                     if viewer and hasattr(viewer, 'get_export_data'):
                         res = viewer.get_export_data()
@@ -347,9 +344,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log_message(f"Error: Unknown mode '{mode_name}'")
 
     def _set_mode_enabled(self, mode_key, enabled: bool):
-        # In the list widget, we can disable items or just visually dim them.
-        # For now, let's just keep them enabled but maybe change icon color if we wanted.
-        # Standard QListWidgetItem doesn't have setEnabled in a way that blocks selection easily without flags.
         for i in range(self.nav_list.count()):
             item = self.nav_list.item(i)
             if item.data(QtCore.Qt.UserRole) == mode_key:

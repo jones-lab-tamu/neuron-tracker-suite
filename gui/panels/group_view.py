@@ -21,7 +21,6 @@ import analysis.cluster_stats as cluster_stats
 from gui.theme import get_icon
 
 def load_and_join_rhythm_and_coords(rhythm_csv_path: str, warped_ids_csv_path: str) -> "Tuple[pd.DataFrame, dict]":
-    # ... (function body unchanged) ...
     rhythm_df = pd.read_csv(rhythm_csv_path)
     warped_df = pd.read_csv(warped_ids_csv_path)
     
@@ -342,7 +341,7 @@ class GroupViewPanel(QtWidgets.QWidget):
 
         df = self._last_master_df.copy()
         
-        # D3. Group Consistency
+        # Group Consistency
         group_counts = df.groupby('Animal')['Group'].nunique()
         inconsistent = group_counts[group_counts > 1]
         if not inconsistent.empty:
@@ -350,7 +349,7 @@ class GroupViewPanel(QtWidgets.QWidget):
             QtWidgets.QMessageBox.critical(self, "Data Error", f"Found animals with multiple group labels: {bad_animals}. Fix input CSVs.")
             return
 
-        # D4. Units Check
+        # Units Check
         valid_phases = df['Rel_Phase'].dropna()
         if not valid_phases.empty:
              abs_max = valid_phases.abs().max()
@@ -364,7 +363,7 @@ class GroupViewPanel(QtWidgets.QWidget):
              QtWidgets.QMessageBox.warning(self, "Missing Groups", "Both 'Control' and 'Experiment' groups are required.")
              return
              
-        # B. Use Shared Grid Logic
+        # Use Shared Grid Logic
         try:
              df_grid, info = self._compute_grid_assignment(df)
         except Exception as e:
@@ -373,7 +372,7 @@ class GroupViewPanel(QtWidgets.QWidget):
              
         n_bins_x, n_bins_y = info['n_bins_x'], info['n_bins_y']
         
-        # 3. Create Lobe Mask
+        # Create Lobe Mask
         lobe_mask = np.zeros((n_bins_y, n_bins_x), dtype=int)
         
         # Center coordinates - using same calc_x_bins as cut
@@ -414,7 +413,7 @@ class GroupViewPanel(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "No Lobes", "No zones with Lobe ID > 0 found. Please define Left (1) / Right (2) lobes in Region setup.")
             return
 
-        # 4. Aggregate Phases & Prepare Stats
+        # Aggregate Phases & Prepare Stats
         grouped_phases_grid = {}
         bin_stats = [] # List of (n_c, n_e) for dialog
         
@@ -457,12 +456,12 @@ class GroupViewPanel(QtWidgets.QWidget):
             if n_c > 0 or n_e > 0:
                  grouped_phases_grid[(by, bx)] = {'Control': c_dict, 'Experiment': e_dict} 
         
-        # 5. Dialog with Dynamic updates
+        # Dialog with Dynamic updates
         dlg = ClusterConfigDialog(self, (n_bins_y, n_bins_x), bin_stats)
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
             
-        # 6. Run Worker
+        # Run Worker
         self.mw.log_message(f"Starting Cluster Analysis: MinN={dlg.min_n}, Perms={dlg.n_perm}, Alpha={dlg.alpha}, Seed={dlg.seed}")
         self.btn_cluster_stats.setEnabled(False)
         self.mw.set_status("Running Cluster Analysis...")
@@ -900,7 +899,7 @@ class GroupViewPanel(QtWidgets.QWidget):
                     idx_min = int(indices.min())
                     idx_max = int(indices.max())
 
-                    # Fix B: Proven 1-based indexing (max == n_cols is impossible in 0-based)
+                    # 1-based indexing (max == n_cols is impossible in 0-based)
                     if (idx_max == n_cols) and (idx_min >= 1):
                         logging.warning(
                             "WarpedHeatmap: Detected 1-based Original_ROI_Index in %s, converting to 0-based.",
@@ -1012,7 +1011,7 @@ class GroupViewPanel(QtWidgets.QWidget):
         final_traces = np.vstack(all_traces)
         final_s = np.array(all_s)
         
-        # 4. Render
+        # Render
         
         self.mw.vis_tabs.setCurrentWidget(self.mw.warped_tab)
         self.mw.vis_tabs.setTabEnabled(self.mw.vis_tabs.indexOf(self.mw.warped_tab), True)
@@ -1090,13 +1089,11 @@ class GroupViewPanel(QtWidgets.QWidget):
         if tab_widget is None:
             return
 
-        # (1) Drop stored viewer for this tab (if present) so it can be GC'd.
-        # IMPORTANT: viewer may not have `.fig`, so do not rely only on viewer.fig.
+
         if hasattr(self.mw, "visualization_widgets") and isinstance(self.mw.visualization_widgets, dict):
             self.mw.visualization_widgets.pop(tab_widget, None)
 
-        # (2) Close + delete ALL FigureCanvasQTAgg under this tab.
-        # This is the REQUIRED hardening: close canvas.figure even if viewer has no `.fig`.
+
         for canvas in tab_widget.findChildren(FigureCanvasQTAgg):
             try:
                 plt.close(canvas.figure)
@@ -1105,8 +1102,7 @@ class GroupViewPanel(QtWidgets.QWidget):
             canvas.setParent(None)
             canvas.deleteLater()
 
-        # (3) Clear ONLY the DIRECT layout on the tab (do NOT recursively clear every child layout).
-        # Reason: recursive clearing can delete non-plot UI elements if present.
+
         lay = tab_widget.layout()
         if lay is not None:
             clear_layout(lay)
@@ -1143,21 +1139,14 @@ class GroupViewPanel(QtWidgets.QWidget):
             df["Rel_Phase"] = df["Rel_Phase_Control"]
             self.mw.log_message("Updated to Control Mean Normalization.")
 
-        # Clear ALL tabs that are plotted into by THIS FILE.
-        # CRITICAL: use the real tab attribute names used in add_mpl_to_tab calls.
-        # Find all occurrences of: add_mpl_to_tab(self.mw.<TABNAME>)
-        # and clear exactly those tabs.
         self._clear_tab_contents(self.mw.group_scatter_tab)
         self._clear_tab_contents(self.mw.group_avg_tab)
         self._clear_tab_contents(getattr(self.mw, 'grad_tab', None))
 
-        # If there is a regional plot tab that uses add_mpl_to_tab, include it too.
-        # DO NOT guess attribute names. Add only if found via the search above.
-
-        # Now regenerate visualizations using df (with df["Rel_Phase"] already selected)
         self._generate_continuous_maps(df)
         self._generate_gradient_analysis(df)
         self._generate_regional_stats(df)
+        
     def assign_group(self, group_name: str):
         selected_items = self.file_list.selectedItems()
         if not selected_items:
@@ -1355,7 +1344,7 @@ class GroupViewPanel(QtWidgets.QWidget):
 
         all_dfs = []
         try:
-            # Iterate assigned entries from UI helper (Source of Truth)
+            # Iterate assigned entries from UI helper
             for roi_path, group in self._get_assigned_group_entries():
                 base = os.path.basename(roi_path).replace('_roi_warped_with_ids.csv', '')
                 
@@ -1414,10 +1403,6 @@ class GroupViewPanel(QtWidgets.QWidget):
             use_animal_norm = (mode == "Normalize: Per-animal mean")
 
             # 1) Control Normalization (Conditional)
-            # Only compute if needed (default mode) or if we want to support switching TO it later?
-            # User req: "Control-mean normalization should only run when needed... If use_animal_norm is True... DO NOT require controls"
-            # BUT for switching, we might want it if controls exist. 
-            # Compromise: Try to compute it if controls exist, but don't error if they don't AND we are in animal mode.
             
             ctrl_phases = master_df[master_df['Group'] == 'Control']['Phase_CT'].dropna().values
             
@@ -1435,9 +1420,7 @@ class GroupViewPanel(QtWidgets.QWidget):
                     return
                 # If using animal norm, we assume Rel_Phase_Control can be missing
             
-            # 2) Per-Animal Normalization (Always compute for robustness or only if needed?)
-            # User Requirement D implies computing it. 
-            # It relies on each animal's own data, so always safe to compute if data exists.
+            # 2) Per-Animal Normalization
             
             animal_means = master_df.groupby('Animal')['Phase_CT'].apply(
                 lambda s: circmean_hours_from_hours(s.to_numpy(dtype=float, copy=False))
@@ -2120,7 +2103,7 @@ class GroupViewPanel(QtWidgets.QWidget):
                  df.to_csv(path, index=False)
                  self.mw.log_message(f"Saved to {path}")
 
-                 # New Feature: Grid Bin Summary Export
+                 # Grid Bin Summary Export
                  # Only trigger if the columns look like grid analysis
                  # Silent detection first
                  
@@ -2188,7 +2171,7 @@ class GroupViewPanel(QtWidgets.QWidget):
         groups = df.groupby(['Group', 'Grid_X_Index', 'Grid_Y_Index'], sort=True)
         rows = []
         
-        # Period is standard 24.0 for this app's "Hours" exports
+        # Period is standard 24.0
         period = 24.0
         min_cells_per_animal = 5
         

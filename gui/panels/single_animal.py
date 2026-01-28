@@ -167,7 +167,7 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         roi_layout.addWidget(self.btn_clear_roi)
         layout.addWidget(self.roi_box)
         
-        # --- 4. Quality Gate Box (Replaces Post-Hoc Filtering) ---
+        # --- 4. Quality Gate Box  ---
         self.quality_gate_box = QtWidgets.QGroupBox("Quality Gate")
         gate_layout = QtWidgets.QGridLayout(self.quality_gate_box)
         
@@ -365,7 +365,7 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             "Separately, the Quality Gate is available only if a valid metrics CSV is loaded."
         )
         
-        # Default to scored pipeline so users get full candidate set, then gate post hoc.
+        # Default to scored pipeline
         idx = self.mode_combo.findData("scored")
         if idx >= 0:
             self.mode_combo.setCurrentIndex(idx)
@@ -567,8 +567,7 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             self.lbl_quality_counts.setText("Passing: - / -")
 
     def _on_preset_changed(self):
-        # Do not apply immediately. Just update UI spinboxes if we are in a mode that allows it.
-        # This gives visual feedback of what "Strict" actually means in numbers.
+
         preset_name = self.quality_preset_combo.currentText()
         if preset_name == "Manual":
             self.chk_quality_manual_override.setChecked(True)
@@ -925,7 +924,7 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         df = self.metrics_df
         def get_col(name):
              if name in df.columns: return pd.to_numeric(df[name], errors='coerce').to_numpy(dtype=float)
-             return np.full(len(df), np.nan) # Fail closed if column missing? No, logic below handles NaN.
+             return np.full(len(df), np.nan)
 
         cov = get_col('detected_fraction')
         jit = get_col('spatial_jitter_detrended')
@@ -1275,9 +1274,6 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         if not phase_args.get("minutes_per_frame"): raise ValueError("Minutes per frame is required.")
         if "trend_window_hours" in phase_args: phase_args["detrend_window_hours"] = phase_args.pop("trend_window_hours")
         
-        # NOTE (tech debt): FFT is currently called twice (once for discovered_period, once for phases/scores).
-        # This is acceptable for now but should be refactored later to avoid redundant work.
-        
         # 1. Discover Period
         _, discovered_period, _ = calculate_phases_fft(self.state.loaded_data["traces"], **phase_args)
         
@@ -1328,13 +1324,9 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         elif "Cosinor" in method:
             self.rhythm_threshold_label.setText("p-value (<=):")
             thresh_edit.setText("0.05")
-            # Only show R2 if in Advanced Mode, or force visibility?
-            # Basic Mode rules say R2 is visible for Cosinor.
-            # So we respect the current mode logic or just show it if Basic?
-            # User requirement: "Show r_squared_threshold widgets" if Cosinor selected.
-            # But check Advanced/Basic toggle.
+
             is_adv = self.chk_advanced_mode.isChecked()
-            # If basic, we still show R2 if Cosinor is picked.
+
             for w in self.rsquared_widgets: w.setVisible(True)
 
     def regenerate_phase_maps(self):

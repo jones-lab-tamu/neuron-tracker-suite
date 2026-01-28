@@ -7,7 +7,7 @@ import neuron_tracker_core as ntc
 def benchmark_tuning():
     # --- CONFIG ---
     # Update this path to your real file
-    path = "D:/SCN_GCaMP/Mus/120525-121025_Mus-Rhabdomys_series4.tif"
+    path = "C:/Folder/Subfolder/filename.tif"
     frames_to_test = 50  # 50 frames is enough to gauge speed
     
     # Params matching your typical workload

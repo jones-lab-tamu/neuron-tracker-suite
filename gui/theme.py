@@ -14,7 +14,7 @@ def apply_app_style(app):
     text_color = QtGui.QColor(33, 33, 33)     # Dark gray for text
     btn_color = QtGui.QColor(240, 240, 240)   # Light gray for buttons
     btn_text = QtGui.QColor(33, 33, 33)
-    accent_color = QtGui.QColor(0, 110, 200)  # Professional Blue
+    accent_color = QtGui.QColor(0, 110, 200)  # Professional blue
     
     palette = QtGui.QPalette()
     
@@ -47,7 +47,7 @@ def apply_app_style(app):
     # Set fonts
     font_db = QtGui.QFontDatabase()
     system_font = font_db.systemFont(QtGui.QFontDatabase.GeneralFont)
-    # Prefer Segoe UI/Roboto/San Francisco if available, else system default
+    # Prefer Segoe UI/Roboto if available, else system default
     preferred_families = ["Segoe UI", "Roboto", "Helvetica Neue", "Arial"]
     found_family = system_font.family()
     for fam in preferred_families:

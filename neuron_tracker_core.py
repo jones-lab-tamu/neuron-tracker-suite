@@ -30,8 +30,8 @@ class TrajectoryMetrics:
     n_detected: int = 0
     
     # Coverage Metrics
-    path_node_fraction: float = 0.0  # Legacy metric (len(path) / T)
-    detected_fraction: float = 0.0   # Scientific metric (n_detected / T)
+    path_node_fraction: float = 0.0  # (len(path) / T)
+    detected_fraction: float = 0.0   # (n_detected / T)
     
     # Spatial Quality
     max_gap: int = 0
@@ -45,7 +45,7 @@ class TrajectoryMetrics:
     # Trace Metrics (Only computed if trace extracted)
     trace_snr_proxy: float = 0.0         # Median / MAD
 
-    # Cellness Metrics (Pass 2B)
+    # Cellness Metrics
     cell_fraction: float = 0.0
     cell_logz_median: float = 0.0
     cell_area_median: float = 0.0
@@ -69,7 +69,7 @@ class TrajectoryCandidate:
     positions: numpy.ndarray             # Shape (T, 2) [y, x]
     detected_mask: numpy.ndarray         # Shape (T,) boolean
     
-    # Intensity Data (Optional, populated in Pass 2)
+    # Intensity Data (Optional)
     trace: Optional[numpy.ndarray] = None # Shape (T,)
     
     # Metrics
@@ -203,8 +203,6 @@ def _build_template(patches: List[numpy.ndarray], method: str = "median") -> num
 def _template_similarity(template_norm: numpy.ndarray, patch_norm: numpy.ndarray, eps: float = 1e-12) -> float:
     """Cosine similarity between two normalized patches."""
     # Cosine sim = (A . B) / (|A| |B|)
-    # Since inputs are mean-subtracted, this is essentially correlation coeff,
-    # but we follow the prompt's formula:
     # num = sum(template_norm * patch_norm)
     # den = sqrt(sum(template_norm^2)) * sqrt(sum(patch_norm^2)) + eps
     
@@ -506,7 +504,7 @@ def extract_and_interpolate_data(
          dt = time.perf_counter() - t0
          progress_callback(f"[Core +{dt:0.2f}s] {msg}")
 
-    # --- PASS 1: SPATIAL ANALYSIS & GATING ---
+    # --- SPATIAL ANALYSIS & GATING ---
     for i, path in enumerate(pruned_subgraphs):
         if i > 0 and len(pruned_subgraphs) > 10 and i % (len(pruned_subgraphs) // 10) == 0:
             progress_callback(f"  Processing trajectory {i+1}/{len(pruned_subgraphs)}")
@@ -573,15 +571,15 @@ def extract_and_interpolate_data(
             detected_mask=detected_mask,
         )
         cand.metrics.n_detected = n_detected
-        cand.metrics.path_node_fraction = len(path) / T # Legacy metric
-        cand.metrics.detected_fraction = n_detected / T # Scientific metric
+        cand.metrics.path_node_fraction = len(path) / T # Legacy
+        cand.metrics.detected_fraction = n_detected / T
         cand.metrics.max_gap = max_gap
         cand.metrics.max_step = max_step
         cand.metrics.boundary_fail = boundary_fail
         cand.metrics.spatial_jitter_raw = spatial_jitter_raw
         cand.metrics.spatial_jitter_detrended = spatial_jitter_detrended
         
-        # 1.4: GATE LOGIC
+        # GATE LOGIC
         
         is_valid = False
 
@@ -618,7 +616,7 @@ def extract_and_interpolate_data(
     log_step(f"Trajectory loop complete ({len(pruned_subgraphs)}/{len(pruned_subgraphs)}). Starting post-loop finalize work.")
 
     log_step("Finalize: Trace Extraction")
-    # --- PASS 2: TRACE EXTRACTION ---
+    # --- TRACE EXTRACTION ---
     for cand in candidates:
         if not cand.is_valid_spatial:
             continue
@@ -645,7 +643,7 @@ def extract_and_interpolate_data(
     log_step("Finalize: Trace Extraction done")
     
     log_step("Finalize: Cellness Metrics")
-    # --- PASS 2B: CELLNESS METRICS ---
+    # --- CELLNESS METRICS ---
     # Run only for spatially valid + extracted candidates
     stride_step = max(1, T // 50)
     patch_half = 15 # for size 31
@@ -699,11 +697,10 @@ def extract_and_interpolate_data(
 
     log_step("Finalize: Cellness Metrics done")
 
-    # --- PASS 2C: IDENTITY RESCUE (OPTIONAL) ---
+    # --- IDENTITY RESCUE (OPTIONAL) ---
     if enable_identity_rescue:
         log_step("Finalize: Identity Rescue")
         # Determine stride for identity pass
-        # "current code uses: stride_step = max(1, T // 50)"
         if identity_stride_frames is not None:
             id_stride = max(1, int(identity_stride_frames))
         else:
@@ -715,7 +712,7 @@ def extract_and_interpolate_data(
                 patch_list = []
                 template_patches_norm = []
                 
-                # B1: Collect info
+                # Collect info
                 for t in range(0, T, id_stride):
                     y, x = cand.positions[t]
                     # Extract patch
@@ -737,13 +734,13 @@ def extract_and_interpolate_data(
                     if confident:
                         template_patches_norm.append(_normalize_patch(patch))
                 
-                # B2: Build template
+                # Build template
                 template_norm = None
                 if len(template_patches_norm) >= identity_min_template_frames:
                     template = _build_template(template_patches_norm, method="median")
                     template_norm = _normalize_patch(template)
                     
-                # B3: Compute similarity
+                # Compute similarity
                 sim_values = []
                 ok_robust_count = 0
                 valid_count = 0
@@ -763,7 +760,7 @@ def extract_and_interpolate_data(
                     if ok_robust:
                         ok_robust_count += 1
                         
-                # B4: Populate metrics
+                # Populate metrics
                 cand.metrics.id_template_n = int(len(template_patches_norm))
                 
                 if valid_count == 0:
@@ -780,7 +777,7 @@ def extract_and_interpolate_data(
         log_step("Finalize: Identity Rescue done")
 
 
-    # --- PASS 3: FINAL ACCEPTANCE ---
+    # --- FINAL ACCEPTANCE ---
     for cand in candidates:
         # In strict mode, acceptance was already decided by the gate.
         # In scored mode, we accept everything that survived extraction (for now).

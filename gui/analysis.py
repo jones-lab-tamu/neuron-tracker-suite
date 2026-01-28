@@ -6,7 +6,7 @@ from neuron_tracker_core import DEFAULT_PERIOD_HOURS
 # Phase calculation
 # ------------------------------------------------------------
 
-RHYTHM_TREND_WINDOW_HOURS = 36.0  # default detrend timescale for circadian work
+RHYTHM_TREND_WINDOW_HOURS = 36.0  # default detrend timescale
 
 def compute_median_window_frames(minutes_per_frame, trend_window_hours, T=None):
     """

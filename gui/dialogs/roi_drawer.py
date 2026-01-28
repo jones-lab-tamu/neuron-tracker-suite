@@ -59,18 +59,13 @@ def compute_projection(frames, mode, max_frames=300):
     t0 = time.time()
     n_total = frames.shape[0]
     
-    # Modes that benefit heavily from subsampling: Median, P95
-    # Mean/Std/Max are generally faster but can also be subsampled if desired.
-    # Per requirements, we apply subsampling to Median/P95.
     
     if "Median" in mode or "P95" in mode:
         indices = select_projection_frames(n_total, max_frames)
         stack_for_proj = frames[indices].astype(np.float32, copy=False)
         n_used = len(indices)
     else:
-        # Use full stack for others, NO astype needed for simple reductions usually,
-        # but to be safe with nans/dtypes we can cast, OR just rely on numpy.
-        # User requested: "For Mean/Std/Max, operate on the original frames array without forcing astype(float32)."
+
         stack_for_proj = frames
         n_used = n_total
 
@@ -131,7 +126,7 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         self.movie_data = movie_data
         
         # --- Init-Safety Defaults ---
-        # update_background() might run early via some event or timer, so defines these NOW.
+
         self.movie_available = False
         self.movie_frames = None
         self.total_frames = 0
@@ -832,8 +827,7 @@ class ROIDrawerDialog(QtWidgets.QDialog):
             try:
                 serializable = []
                 for r in all_rois_to_save:
-                    # Handle Line2D vs Polygon data structures if necessary
-                    # But self.rois usually stores raw dicts, so this is fine.
+
                     serializable.append({
                         "path_vertices": r["path_vertices"], 
                         "mode": r["mode"]
@@ -975,8 +969,6 @@ class ROIDrawerDialog(QtWidgets.QDialog):
         # 1. Validate Mode
         mode = self.bg_mode_combo.currentText()
         
-        # Save setting immediately on selection (so next open uses the last mode),
-        # but note: init sequence will override Median/P95 to Mean on startup.
         if self.movie_available:
              settings = QtCore.QSettings("NeuronTracker", "ROIDrawer")
              settings.setValue("roi_drawer/bg_mode", mode)

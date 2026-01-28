@@ -6,7 +6,7 @@ import neuron_tracker_core as ntc
 def benchmark():
     # 1. Setup
     # Update this path to your real file
-    path = "D:/SCN_GCaMP/Mus/120525-121025_Mus-Rhabdomys_series4.tif"
+    path = "C:/Folder/Subfolder/filename.tif"
     
     print(f"Loading movie from {path}...")
     full_data = skimage.io.imread(path)
@@ -21,14 +21,14 @@ def benchmark():
 
     print(f"\n--- Benchmarking on {len(data)} frames ---")
 
-    # 2. Serial Run (The "Old" Way)
+    # 2. Serial Run
     print("Running Serial Mode (n_processes=1)...")
     t0 = time.time()
     ntc.process_frames(data, n_processes=1, **params)
     t_serial = time.time() - t0
     print(f"Serial Time: {t_serial:.2f} seconds")
 
-    # 3. Parallel Run (The "New" Way)
+    # 3. Parallel Run
     print("Running Parallel Mode (n_processes=Default)...")
     t0 = time.time()
     # Default uses min(cpu_count, 8)

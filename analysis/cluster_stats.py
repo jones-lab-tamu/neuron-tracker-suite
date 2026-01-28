@@ -67,7 +67,7 @@ def _find_clusters(sig_mask: np.ndarray, abs_delta_mu: np.ndarray, lobe_mask: np
     
     
     if allow_cross_lobe:
-        # MODE 2: Global clustering across lobes
+        # Global clustering across lobes
         # Mask: Significant AND in any valid lobe (non-zero)
         valid_mask = sig_mask & (lobe_mask > 0)
         
@@ -108,7 +108,7 @@ def _find_clusters(sig_mask: np.ndarray, abs_delta_mu: np.ndarray, lobe_mask: np
                     'members': json.dumps(members)
                 })
     else:
-        # MODE 1: Per-lobe separation (Original)
+        # Per-lobe separation
         for lobe_id in unique_lobes:
             # Mask for this lobe AND significant bins
             valid_mask = (sig_mask) & (lobe_mask == lobe_id)
@@ -197,14 +197,11 @@ def run_bin_cluster_analysis(
     if connectivity not in (4, 8):
         raise ValueError(f"Connectivity must be 4 or 8, got {connectivity}")
 
-    # Legacy compatibility: if alpha passed but alpha_forming not explicitly set to new value,
-    # assume user meant alpha_forming.
+    # Legacy compatibility
     if alpha is not None:
         alpha_val = float(alpha)
         alpha_forming = alpha_val
         # Map to alpha_sig only if caller didn't explicitly override default (0.05)
-        # Logic: if alpha_sig is 0.05 (default) and alpha is different,
-        # assume legacy single-alpha mode where alpha controls both.
         if alpha_sig == 0.05 and alpha_val != 0.05:
             alpha_sig = alpha_val
          
@@ -214,7 +211,7 @@ def run_bin_cluster_analysis(
     t0_start = time.perf_counter()
     if progress_cb: progress_cb("Init", 0, 1, "setup")
     
-    # 2. Materialize Bin Data (First Pass - Identify Valid Animals)
+    # Materialize Bin Data (First Pass - Identify Valid Animals)
     temp_bin_data = [] # List of (r, c, c_dict, e_dict)
     used_animals_control = set()
     used_animals_experiment = set()
@@ -263,7 +260,7 @@ def run_bin_cluster_analysis(
             'allow_cross_lobe': bool(allow_cross_lobe)
         }
 
-    # 3. Construct Permutation Universe (Restricted)
+    # Construct Permutation Universe (Restricted)
     # Only include animals that appeared in at least one valid bin.
     # This ensures "silent" animals don't dilute the permutation space.
     
@@ -294,7 +291,7 @@ def run_bin_cluster_analysis(
                  f"n_valid_bins={n_valid}, min_n={min_n}, n_perm={n_perm}, alpha_forming={alpha_forming}, alpha_sig={alpha_sig}, seed={seed}")
     logging.info(f"ClusterStats: allow_cross_lobe={allow_cross_lobe}, connectivity={connectivity}, alpha_forming={alpha_forming}, alpha_sig={alpha_sig}, n_perm={n_perm}")
 
-    # 4. Finalize Bin Data with Indices
+    # Finalize Bin Data with Indices
     t1_obs = time.perf_counter()
     if progress_cb: progress_cb("Compute observed maps", 0, 1, "processing bins")
     valid_bins_data = [] # List of dicts
@@ -332,8 +329,7 @@ def run_bin_cluster_analysis(
         valid_bin_ctrl_dicts.append(c_dict)
         valid_bin_exp_dicts.append(e_dict)
         
-    # VALIDATION: Check for data integrity (Part A)
-    # VALIDATION: Check for data integrity (Part A)
+    # VALIDATION: Check for data integrity
     invalid_entries = []
     for i, d in enumerate(valid_bins_data):
         if not isinstance(d, dict) or 'r' not in d or 'c' not in d:
@@ -392,7 +388,7 @@ def run_bin_cluster_analysis(
     
     t2_perm = time.perf_counter()
     
-    # 3. Permutation Loop (Global)
+    # Permutation Loop (Global)
     # Initialize with NaNs to mask invalid perms
     perms_linear = np.full((n_perm, n_valid), np.nan, dtype=np.float32)
     
@@ -454,7 +450,7 @@ def run_bin_cluster_analysis(
     if progress_cb: progress_cb("Permutations", n_perm, n_perm, "done")
     t3_stats = time.perf_counter()
             
-    # 4. Statistics & Clustering
+    # Statistics & Clustering
     
     # Stability Check
     # How many valid permutations per bin?
@@ -468,11 +464,8 @@ def run_bin_cluster_analysis(
     # Strict Guard: valid_per_bin MUST be > 0 (redundant if threshold >=1, but explicit safety)
     has_any_finite = n_valid_per_bin > 0
     is_stable_bin = is_stable_bin_initial & has_any_finite
-    
-    # Log warning if we dropped bins due to the strict >0 check (unlikely but possible if threshold=0)
-    # REPLACE WITH NEW LOGGING
-    
-    # A) ZERO-FINITE WARNING (reachable, directly computed)
+        
+    # ZERO-FINITE WARNING
     zero_finite_idx = np.where(n_valid_per_bin == 0)[0]
     if zero_finite_idx.size > 0:
         sample_coords = []
@@ -484,9 +477,8 @@ def run_bin_cluster_analysis(
             f"Sample: {', '.join(sample_coords)}"
         )
 
-    # B) UNSTABLE-BUT-OBSERVED-INCLUDED WARNING (actionable)
+    # UNSTABLE-BUT-OBSERVED-INCLUDED WARNING
     # Bins that fail stability (~is_stable_bin) but have SOME valid data (n_valid_per_bin > 0).
-    # This prevents overlap with Warning A (0 valid).
     unstable_idx = np.where((~is_stable_bin) & (n_valid_per_bin > 0))[0]
     
     if unstable_idx.size > 0:
@@ -499,7 +491,7 @@ def run_bin_cluster_analysis(
             f"Sample: {', '.join(sample_coords)}"
         )
     
-    # A. Uncorrected P-values (Bin-wise)
+    # Uncorrected P-values (Bin-wise)
     p_unc_linear = np.ones(n_valid) # Default 1.0
     
     for i in range(n_valid):
@@ -512,7 +504,7 @@ def run_bin_cluster_analysis(
             p = (1.0 + n_greater) / (1.0 + len(valid_stats))
             p_unc_linear[i] = p
             
-    # B. Global Cluster-Forming Threshold (T0) (Option A)
+    # Global Cluster-Forming Threshold (T0) (Option A)
     # Pool ALL valid permutation statistics from STABLE bins
     pooled_null = perms_linear[:, is_stable_bin] # Shape (n_perm, n_stable)
     pooled_null = pooled_null[np.isfinite(pooled_null)] # Flatten and remove NaNs
@@ -524,7 +516,7 @@ def run_bin_cluster_analysis(
         # Use alpha_forming for T0
         T0 = np.percentile(pooled_null, 100 * (1.0 - alpha_forming))
                  
-    # C. Max Cluster Mass Distribution (per lobe, per permutation)
+    # Max Cluster Mass Distribution (per lobe, per permutation)
     for k in range(n_perm):
         # Linear mask for this perm: valid AND > T0
         row_vals = perms_linear[k, :]
@@ -571,7 +563,7 @@ def run_bin_cluster_analysis(
             for l in unique_lobes:
                 max_mass_dist[int(l)][k] = current_maxes[int(l)]
             
-    # 5. Observed Clusters
+    # Observed Clusters
     # Reconstruct Maps
     p_unc_map = np.ones((H, W))
     delta_mu_map = np.full((H, W), np.nan)
@@ -586,7 +578,7 @@ def run_bin_cluster_analysis(
         stability_mask[r, c] = is_stable_bin[i]
         
     # Observed Forming Mask: Stable AND > T0
-    # OPTION 1: Apply all masks BEFORE labeling
+    # Apply all masks BEFORE labeling
     # We construct 'final_inclusion' and 'valid_obs_mask' and 'T0' check combined.
     # This forms the 'sig_mask_obs' which is the SINGLE source of truth for labeling.
     final_inclusion = (inclusion_mask & stability_mask)
@@ -596,7 +588,7 @@ def run_bin_cluster_analysis(
     with np.errstate(invalid='ignore'):
          sig_mask_obs = (final_inclusion & valid_obs_mask) & (np.abs(delta_mu_map) > T0)
     
-    # Debug Logging (Part C)
+    # Debug Logging
     unique_lobes_log = sorted(set(int(x) for x in np.unique(lobe_mask) if int(x) != 0))
     for l_id in unique_lobes_log:
         # Check eligibility for this lobe
@@ -642,7 +634,7 @@ def run_bin_cluster_analysis(
         p['p_corr'] = float(p_corr)
         final_clusters.append(p)
         
-    # Part A: Hard Diagnostic Assertion
+    # Hard Diagnostic Assertion
     # Check that each cluster ID in result corresponds to exactly 1 connected component
     structure_check = _structure_from_connectivity(connectivity)
     for clust in final_clusters:
@@ -749,17 +741,17 @@ def plot_cluster_results(results: Dict[str, Any], output_path: str):
     
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     
-    # 1. Delta Mu
+    # Delta Mu
     im1 = axes[0].imshow(delta_mu, cmap='coolwarm', vmin=-np.pi, vmax=np.pi, origin='lower')
     axes[0].set_title('Delta Mu (Exp - Ctrl)')
     plt.colorbar(im1, ax=axes[0])
     
-    # 2. P Uncorrected
+    # P Uncorrected
     im2 = axes[1].imshow(p_unc, cmap='viridis_r', vmin=0, vmax=0.1, origin='lower')
     axes[1].set_title('Uncorrected P-values')
     plt.colorbar(im2, ax=axes[1])
     
-    # 3. Clusters (Significant Only)
+    # Clusters (Significant Only)
     # create custom cmap: 0=bg, others=random or distinct
     # Mask non-sig clusters
     final_cluster_map = np.zeros_like(cluster_map)

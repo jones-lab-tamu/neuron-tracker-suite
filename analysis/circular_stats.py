@@ -98,7 +98,7 @@ def calculate_interaction_stat(df, groups, zones):
     delta_vecs = np.array(delta_vecs) # Shape (n_valid_zones, 2)
     
     if len(delta_vecs) < 1:
-        return 0.0 # Should be caught earlier
+        return 0.0
         
     # Mean delta vector across zones
     mean_delta = np.mean(delta_vecs, axis=0) # Shape (2,)
