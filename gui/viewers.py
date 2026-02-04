@@ -1473,7 +1473,7 @@ class InterpolatedMapViewer:
 
             def _mode_lower(r):
                 m = r.get("mode", "")
-               return m.strip().lower() if isinstance(m, str) else ""
+                return m.strip().lower() if isinstance(m, str) else ""
 
             def _as_path(r):
                 # Prefer prebuilt Path, otherwise build from vertices
