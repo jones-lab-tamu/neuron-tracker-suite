@@ -174,7 +174,16 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         # Row 0: Presets & Override
         gate_layout.addWidget(QtWidgets.QLabel("Preset:"), 0, 0)
         self.quality_preset_combo = QtWidgets.QComboBox()
-        self.quality_preset_combo.addItems(["Recommended", "Lenient", "Strict", "Manual"])
+        # Define presets with (Label, ID)
+        # Order: Recommended v2, Recommended (legacy), Lenient, Strict, Custom
+        self.quality_preset_combo.addItem("Recommended", "recommended_v2")
+        self.quality_preset_combo.addItem("Recommended (legacy)", "Recommended")
+        self.quality_preset_combo.addItem("Lenient", "Lenient")
+        self.quality_preset_combo.addItem("Strict", "Strict")
+        self.quality_preset_combo.addItem("Custom", "manual")
+        
+        # Default to Recommended v2 (index 0)
+        self.quality_preset_combo.setCurrentIndex(0)
         gate_layout.addWidget(self.quality_preset_combo, 0, 1)
         
         self.chk_quality_manual_override = QtWidgets.QCheckBox("Manual Override")
@@ -567,22 +576,53 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             self.lbl_quality_counts.setText("Passing: - / -")
 
     def _on_preset_changed(self):
-
-        preset_name = self.quality_preset_combo.currentText()
-        if preset_name == "Manual":
+        preset_id = self.quality_preset_combo.currentData()
+        
+        if preset_id == "manual":
+            # Rule 1: Manual -> Checkbox=True, Widget=Visible, No thresholds applied
+            blocker = QtCore.QSignalBlocker(self.chk_quality_manual_override)
             self.chk_quality_manual_override.setChecked(True)
+            del blocker
+            self.manual_gate_widget.setVisible(True)
             return
+            
+        # Rule 2: Not Manual -> Checkbox=False, Widget=Hidden, Apply thresholds
+        if self.chk_quality_manual_override.isChecked():
+            blocker = QtCore.QSignalBlocker(self.chk_quality_manual_override)
+            self.chk_quality_manual_override.setChecked(False)
+            del blocker
+        self.manual_gate_widget.setVisible(False)
 
-        vals = self.quality_presets.get(preset_name)
+        vals = self.quality_presets.get(preset_id)
         if vals:
-            self.spin_coverage.setValue(vals.get('cov', 0.0))
-            self.spin_jitter.setValue(vals.get('jit', 50.0))
-            self.spin_snr.setValue(vals.get('snr', 0.0))
+            # Always update the core 3 if present
+            if 'cov' in vals: self.spin_coverage.setValue(vals['cov'])
+            if 'jit' in vals: self.spin_jitter.setValue(vals['jit'])
+            if 'snr' in vals: self.spin_snr.setValue(vals['snr'])
+            
+            # Update extended fields if present (e.g. Recommended v2)
+            # Legacy presets won't have these, so they remain untouched.
+            if 'cell_frac' in vals: self.spin_cell_fraction_min.setValue(vals['cell_frac'])
+            if 'log_z' in vals: self.spin_cell_logz_min.setValue(vals['log_z'])
+            if 'area_min' in vals: self.spin_cell_area_min.setValue(vals['area_min'])
+            if 'area_max' in vals: self.spin_cell_area_max.setValue(vals['area_max'])
+            if 'ecc_max' in vals: self.spin_cell_ecc_max.setValue(vals['ecc_max'])
+            if 'ratio_min' in vals: self.spin_cell_ratio_min.setValue(vals['ratio_min'])
 
     def _on_manual_override_toggled(self, checked):
         self.manual_gate_widget.setVisible(checked)
         if checked:
-            self.quality_preset_combo.setCurrentText("Manual")
+            idx = self.quality_preset_combo.findData("manual")
+            if idx >= 0: 
+                blocker = QtCore.QSignalBlocker(self.quality_preset_combo)
+                self.quality_preset_combo.setCurrentIndex(idx)
+                del blocker
+                    
+            # Ensure checkbox state is consistent (redundant safeguard)
+            if not self.chk_quality_manual_override.isChecked():
+                blocker = QtCore.QSignalBlocker(self.chk_quality_manual_override)
+                self.chk_quality_manual_override.setChecked(True)
+                del blocker
 
     def _compute_quality_presets(self):
         """Derive preset thresholds dynamically from loaded metrics percentiles."""
@@ -601,21 +641,35 @@ class SingleAnimalPanel(QtWidgets.QWidget):
             if len(vals) == 0: return default
             return np.percentile(vals, p)
 
-        # 1. Lenient (Bottom 50% cov, Top 95% jitter, Top 90% SNR)
+        # 1. Recommended v2 (Static)
+        presets["recommended_v2"] = {
+            'cov': 0.01,
+            'cell_frac': 0.05,
+            'log_z': 0.50,
+            'jit': 4.29,
+            'snr': 2.00,
+            'area_min': 6,
+            'area_max': 500,
+            'ecc_max': 0.95,
+            'ratio_min': 1.00
+        }
+
+        # 2. Recommended (Legacy)
+        # Keeps old percentile behavior, only updates cov/jit/snr
+        presets["Recommended"] = {
+            'cov': get_p('detected_fraction', 75, 0.5),
+            'jit': get_p('spatial_jitter_detrended', 75, 5.0),
+            'snr': get_p('trace_snr_proxy', 25, 2.0)
+        }
+
+        # 3. Lenient (Legacy)
         presets["Lenient"] = {
             'cov': get_p('detected_fraction', 50, 0.0),
             'jit': get_p('spatial_jitter_detrended', 95, 50.0),
             'snr': get_p('trace_snr_proxy', 10, 0.0)
         }
         
-        # 2. Recommended (Top 75% cov, Bottom 75% jitter, Top 25% SNR)
-        presets["Recommended"] = {
-            'cov': get_p('detected_fraction', 75, 0.5),
-            'jit': get_p('spatial_jitter_detrended', 75, 5.0),
-            'snr': get_p('trace_snr_proxy', 25, 2.0)
-        }
-        
-        # 3. Strict (Top 90% cov, Bottom 50% jitter, Top 50% SNR)
+        # 4. Strict (Legacy)
         presets["Strict"] = {
             'cov': get_p('detected_fraction', 90, 0.8),
             'jit': get_p('spatial_jitter_detrended', 50, 2.0),
@@ -623,11 +677,18 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         }
         
         self.quality_presets = presets
-        # Update spinboxes to Recommended by default without applying
-        if "Recommended" in presets:
-            self.spin_coverage.setValue(presets["Recommended"]['cov'])
-            self.spin_jitter.setValue(presets["Recommended"]['jit'])
-            self.spin_snr.setValue(presets["Recommended"]['snr'])
+        
+        # If we are currently on a preset, we might need to re-apply it if it's dynamic
+        # But caution: don't overwrite manual edits if we are in 'manual' mode.
+        cur_id = self.quality_preset_combo.currentData()
+        if cur_id and cur_id != "manual" and cur_id in presets:
+            # We re-trigger semantic update only if it's dynamic to keep UI fresh??
+            # Actually, _on_preset_changed will handle lookup. 
+            # We just need to trigger it if we want to auto-refresh dynamic values on load.
+            # But usually reset_state clears things.
+            # For now, let's trust the user selection or explicit apply.
+            # Update: If this is called after metrics load, we probably want to update UI.
+            self._on_preset_changed()
 
     # --- Data Loading & Analysis ---
 
@@ -1132,6 +1193,10 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         data = {name: le.text() for name, (le, _) in self.params.items()}
         mode = self.mode_combo.currentData()
         if mode: data['mode'] = mode
+        
+        # Save Quality Gate Preset ID
+        data['quality_preset_id'] = self.quality_preset_combo.currentData()
+        
         with open(path, "w") as f: json.dump(data, f, indent=4)
         self.mw.log_message(f"Parameters saved to {os.path.basename(path)}")
 
@@ -1148,6 +1213,23 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         if 'mode' in data:
             index = self.mode_combo.findData(data['mode'])
             if index >= 0: self.mode_combo.setCurrentIndex(index)
+            
+        # Restore Quality Gate Preset
+        preset_id = data.get('quality_preset_id')
+        
+        if not preset_id:
+            # Migration: Old configs lack ID but used "Recommended" by default.
+            # Map them to the Legacy Recommended ID to preserve behavior.
+            preset_id = "Recommended"
+            
+        if preset_id:
+            # Direct ID match
+            index = self.quality_preset_combo.findData(preset_id)
+            if index >= 0: 
+                self.quality_preset_combo.setCurrentIndex(index)
+            else:
+                self.mw.log_message(f"Warning: Unknown preset ID '{preset_id}', keeping default.")
+        
         self.mw.log_message(f"Parameters loaded from {os.path.basename(path)}")
 
     # --- Visualization & Interaction ---
