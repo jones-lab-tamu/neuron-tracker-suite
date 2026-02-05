@@ -35,7 +35,7 @@ def main():
     g1.add_argument('--sigma1', type=float, default=3.0, help="Sigma for the smaller Gaussian in DoG filter.")
     g1.add_argument('--sigma2', type=float, default=20.0, help="Sigma for the larger Gaussian in DoG filter.")
     g1.add_argument('--blur_sigma', type=float, default=2.0, help="Sigma for blurring before measuring feature magnitude.")
-    g1.add_argument('--max_features', type=int, default=200, help="Max number of features to detect per frame.")
+    g1.add_argument('--max_features', type=int, default=800, help="Max number of features to detect per frame.")
 
     g2 = parser.add_argument_group('Trajectory Building Parameters')
     g2.add_argument('--search_range', type=int, default=50, help="Number of previous frames to search for a connection.")

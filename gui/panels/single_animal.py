@@ -348,7 +348,7 @@ class SingleAnimalPanel(QtWidgets.QWidget):
         self._add_param_field(det_layout, "sigma1", 3.0, param_tooltips)
         self._add_param_field(det_layout, "sigma2", 20.0, param_tooltips)
         self._add_param_field(det_layout, "blur_sigma", 2.0, param_tooltips)
-        self._add_param_field(det_layout, "max_features", 200, param_tooltips)
+        self._add_param_field(det_layout, "max_features", 800, param_tooltips)
         self.param_tabs.addTab(det_tab, "Detection")
         
         tr_tab = QtWidgets.QWidget()
